@@ -1,4 +1,4 @@
-name: Fork Sync 
+name: Fork Sync
 
 permissions:
     contents: write
@@ -8,6 +8,10 @@ on:
         - cron: "0 0 * * *"  # 每天午夜执行自动同步
     workflow_dispatch:  # 允许在 GitHub Actions 页面手动触发
 
+# 新增这一段：强制所有 JS Actions 使用 Node.js 24 运行，消除警告
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
     sync_with_upstream:
         name: Sync with Upstream
@@ -16,17 +20,19 @@ jobs:
 
         steps:
             - name: Checkout target repo
-              uses: actions/checkout@v4
+              # 这里从 v4 升级到了 v6
+              uses: actions/checkout@v6
               with:
                 token: ${{ secrets.GITHUB_TOKEN }}
 
             - name: Sync Upstream
-              uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+              # 这里我帮你升到了这个插件最新的小版本 v3.4.1
+              uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
               with:
                   target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-                  upstream_sync_repo: axuitomo/CF-EMBY-PROXY-UI # 指定上游仓库
-                  upstream_sync_branch: main                    # 指定上游分支
-                  target_sync_branch: main                      # 指定你当前 Fork 仓库的分支
+                  upstream_sync_repo: axuitomo/CF-EMBY-PROXY-UI
+                  upstream_sync_branch: main
+                  target_sync_branch: main
                   test_mode: false
 
             - name: Check for new commits
