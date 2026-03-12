@@ -1,468 +1,485 @@
-## CF-EMBY-PROXY-UI 最新版本：V18.0 
+ # CF-EMBY-PROXY-UI
 
-## 意见反馈群或者讨论群 https://t.me/+NhDf7qMxH4ZlODY9 
+<p align="center">
+  <strong>基于 Cloudflare Workers 的 Emby/Jellyfin 代理、分流与可视化管理面板</strong>
+</p>
 
-## 描述
+<p align="center">
+  <img alt="version" src="https://img.shields.io/badge/version-V18.0-blue">
+  <img alt="platform" src="https://img.shields.io/badge/platform-Cloudflare%20Workers-orange">
+  <img alt="storage" src="https://img.shields.io/badge/storage-KV%20%2B%20D1-green">
+  <img alt="ui" src="https://img.shields.io/badge/panel-SaaS%20UI-purple">
+</p>
 
-**CF-EMBY-PROXY-UI**  是一个基于 **Cloudflare Workers** 边缘计算平台开发的高性能媒体代理与分流系统。它通过单文件 `worker.js` 实现了多台 Emby 服务器节点的统一管理、隐藏源站 IP 以及访问加速。
-**面向个人，对于家庭来说免费版worker请求数不够用**
+> 一个单文件 `worker.js` 项目：统一多台 Emby 节点入口、隐藏源站 IP、支持直连/反代混合策略、提供 `/admin` 可视化后台，并集成日志、Cloudflare 统计、Telegram 日报与多层缓存优化。
 
-------
-
-**核心架构**：利用 **Cloudflare KV** 持久化配置，结合 **D1 数据库** 实现日志审计与 Telegram 每日报表统计。
-
-**智能流控**：内置静态资源边缘缓存与视频流无损穿透，支持网盘链接自动直连以节省带宽。
-
-**可视化管理**：提供 SaaS 化后台（`/admin`），支持节点测速、配置导入导出及私密路径设置。
-
-**安全兼容**：集成 Emby 授权头双向兼容补丁，解决反向代理环境下的客户端登录难题，并内置 IP/地理防火墙。
-
-<img width="2560" height="1463" alt="图片" src="https://github.com/user-attachments/assets/63f20287-eb64-4691-8931-6414625b3bcb" />
+<img width="2560" height="2497" alt="图片" src="https://github.com/user-attachments/assets/9348e71f-bf9f-47c4-944d-7f94d0d6bdde" />
 
 
+ - 讨论群：https://t.me/+NhDf7qMxH4ZlODY9
+ - 这是一个面向个人的Worker 代理方案，对于家庭来说免费版worker请求数可能不够用
+ - 建议每次新增多个节点后导出 JSON 做本地备份
 
+## 目录
 
----
-
-
-## 原理
-
-**流量转发原理**：客户端通过代理链接发送请求到Worker指定访问EMBY源站，Worker 作为一个中间人，一方面修改请求头并发送请求到EMBY源站，一方面接受源站的数据以流式传输透传给客户端。HTTP(S)协议请求传输，WS协议保持心跳连接等
-
-**IP隐藏原理**：借用Cloudflare 的边缘网络实现隐藏EMBY源站真实IP隐藏，起到隐藏和保护EMBY源站的作用。
-
----
-
-
-
-## 需求前提
-
-**访问EMBY源站直连差【EMBY源站在国外，线路不好】**  利用cloudflare加速访问
-
-**多台服务器想统一入口【多台服务器需要EMBY反代】**，路由分流，URL路径分流。
-
-**不想暴露EMBY源站的真实 IP**
-
-**内网不需要**
-
-**腐竹大概不需要**
-
-**EMBY源站是国内机器/CN2，这类直连线路大概不需要**
+- [项目简介](#项目简介)
+- [核心能力](#核心能力)
+- [架构总览](#架构总览)
+- [功能矩阵](#功能矩阵)
+- [工作原理](#工作原理)
+- [部署前须知](#部署前须知)
+- [环境变量与绑定](#环境变量与绑定)
+- [部署步骤](#部署步骤)
+- [后台功能说明](#后台功能说明)
+- [节点访问方式](#节点访问方式)
+- [缓存与性能设计](#缓存与性能设计)
+- [安全机制](#安全机制)
+- [数据存储说明](#数据存储说明)
+- [请求处理流程图](#请求处理流程图)
+- [常见问题](#常见问题)
 
 ---
 
+## 项目简介
 
+**CF-EMBY-PROXY-UI** 是一个运行在 **Cloudflare Workers** 上的媒体代理系统，适用于：
 
-## **须知前提**
+- 多台 Emby / Jellyfin 服务器统一入口
+- 隐藏源站真实 IP
+- 为海外源站提供 Cloudflare 边缘加速
+- 提供带 UI 的管理后台，而不是纯手改配置
+- 实现“反代 + 直连”混合路由
 
-**腐竹让不让使用cf反代**， 询问腐竹让不让使用cf反代？腐竹禁止国内IP访问，使用该项目可能会让你EMBY账号封禁
-
-**关于请求头或ip**，代码从cf-connecting-ip获取ip赋值给x-real-ip和X-Forwarded-For，正常的话emby正常识别X-Real-IP，X-Forwarded-For，显示的ip为用户ip或代理ip,虽然代码中删除了关于cf标识的请求头，但cfworker会强制追加请求头例如 CDN-Loop CF-Ray CF-Worker。tcp层源ip显示的仍是cf ip，腐竹只要检查请求头就会知道这是cf反代。
-
-**客户端支不支持反代** ，客户端可以选择小幻,hills,vidhub,senplayer,forward,afusekt,yamby 【我测试的hills和yamby没有问题】
-
-**滥用的话cloudflare可能会暂停账号功能或是封号** ，项目已设置 `Cache-Control: no-store` 并禁用了 Cloudflare 对流媒体文件的缓存，符合 Cloudflare 服务条款中关于“非 HTML 内容缓存”的规定。 但请注意：如果您的日均流量过大（如 TB 级别），仍可能因占用过多带宽被 Cloudflare 判定为滥用（Section 2.8）。**建议仅用于个人或家庭分享**。
-
-**请求预热**，可能会生成大量请求,使用该项目可能会让你EMBY账号封禁【须知】
-
-**EMBY服禁用web问题** 客户端都是使用API进行调用不用担心WEB端
-
-**端口要求**，支持任意的EMBY服端口反代，当你使用反代链接你必须使用CF支持的端口，CF支持的加密端口有：443, 2053, 2083, 2087, 2096, 8443 
+项目当前版本在单文件内集成了以下模块：认证、KV/D1 数据管理、代理主链路、日志、可视化控制台、定时任务入口。代码头部也明确将其定义为单文件部署架构。 
 
 ---
 
+## 核心能力
 
-## 域名设置
+### 1) 可视化管理
+- 后台地址：`/admin`
+- 支持节点新增、编辑、删除、导入、导出
+- 支持全局 Ping / 健康检查
+- 支持仪表盘展示请求量、运行状态、流量趋势、资源分类徽章
 
-#### 【可选】**DNS记录**
+### 2) 智能代理与分流
+- 默认由 Worker 透明中继请求与响应
+- 支持同源 30x 继续代理
+- 支持显式“源站直连节点”名单
+- 支持外链强制反代或直接下发 `Location`
+- 内置 `wangpandirect` 关键词匹配，可识别网盘 / 对象存储链接并直连
 
- - 添加一条**CNAME解析** 用作worker加速 [CM大佬教程](https://blog.cmliussss.com/p/BestWorkers/)
+### 3) 媒体场景优化
+- 静态资源、封面、字幕与视频流分开处理
+- 对大视频流强制 `Cache-Control: no-store`
+- 对播放器起播探测请求支持微缓存（Prewarm）
+- 支持 WebSocket 透明转发
+- 支持 Emby 授权头双向兼容与登录补头修复
 
-#### **SSL/TLS** 
-
----概述
-
-- 选择**完全** 【不要选严格】
-
----边缘证书  
-
-- 开启**始终使用 HTTPS**  
-- **最低 TLS 版本**选择TLS1.2 
-- 开启**随机加密**  
-- 开启**TLS 1.3**  
-- 开启**自动 HTTPS 重写**  
-
-#### 速度
-
----设置
-
-- 开启**站点推荐设置** 
-
-
---- Smart Shield
-
-- 开启**Smart Shield** 
-
-#### 缓存
-
----配置
-
-- **浏览器缓存 TTL** 【一天或很久】
-
----Tiered Cache
-
-- 开启**Tiered Cache** 
-
-
-####  网络
-
-- 开启**WebSockets** 
-
+### 4) 安全与可观测性
+- 登录失败次数限制，达到阈值自动锁定 15 分钟
+- 国家/地区白名单、黑名单
+- IP 黑名单
+- 单 IP 请求限速（按分钟）
+- 日志写入 D1、定时清理、Telegram 每日报表
+- 支持 Cloudflare GraphQL 仪表盘统计与本地 D1 兜底统计
 
 ---
 
-## **环境变量一览**
-
-| **变量名**   | **必填** | **作用**                                                     | **示例**              |
-| ------------ | -------- | ------------------------------------------------------------ | --------------------- |
-| `ENI_KV`     | ✅        | **必须在后台绑定 KV Namespace**，代码读写数据的数据库。      | (选择绑定的 KV)       |
-| `ADMIN_PASS` | ✅        | 后台管理界面的登录密码。                                     | `MySuperPass123`      |
-| `JWT_SECRET` | ✅     | 用于加密 Cookie 的盐值。不填则默认等于 `ADMIN_PASS`。修改此项会导致所有已登录用户掉线。 | `ComplexRandomString` |
-|`DB`          | ×| 请求日志记录，日志查询，日志清理，每日报表统计|(选择绑定的 D1)|
-
----
-
-## 温馨提示：
-
-**定期手动备份：利用面板自带的 Export (导出) 功能，每添加几个重要节点就导出一份 JSON 存到本地。 KV 数据库一旦丢失，意味着辛辛苦苦保存的内容都会丢失**
-
-**使用强密码：鉴于脚本没有验证码机制，请确保 ADMIN_PASS 足够复杂，防止被暴力扫描工具撞库。**
-
----
-
-##  部署指南 (Step-by-Step)
-
-### 第一步：创建 KV 命名空间
-
-1. 登录 Cloudflare Dashboard。
-2. 进入 **Workers & Pages** -> **KV**。
-3. 点击 **Create a Namespace**。
-4. 命名为 `EMBY_DATA` (或者任何你喜欢的名字)，点击 Add。
-
-### 第二步：创建 Worker
-
-1. 进入 **Workers & Pages** -> **Overview** -> **Create Application**。
-2. 点击 **Create Worker**，命名建议为 `emby-proxy`，点击 Deploy。
-3. 点击 **Edit code**，将本项目提供的 `worker.js` 代码完整复制进去。
-4. 保存并部署。
-
-### 第三步：绑定 KV 数据库 (关键)
-
-1. 在 Worker 的设置页面，点击 **Settings** -> **Variables**。
-2. 向下滚动到 **KV Namespace Bindings**。
-3. 点击 **Add Binding**。
-4. **Variable name** 填写：`ENI_KV` (**注意：也可以直接使用KV**)。
-5. **KV Namespace** 选择第一步创建的 `EMBY_DATA`。
-6. 点击 **Save and Deploy**。
-
-### 第四步：创建 D1 数据库并绑定worker【可选】
-
-1.在控制台进入：**Storage & Databases → D1**
-2.创建一个新的数据库，例如：`emby_proxy_logs`创建完成后，返回 Worker 页面继续绑定。
-3.再次进入：**Settings → Bindings**
-4.添加一个 **D1 Database** 绑定：- 变量名：`DB`- 绑定目标：选择刚创建的 D1 数据库 **后续需要在UI界面-日志记录初始化DB**
-
-如果你不准备使用日志功能，也可以暂时不绑定 D1；但推荐完整配置，以便后续查看请求记录与使用清理功能。
-
-### 第五步：获取API令牌+zoneID+账户ID 【可选】
-
-#### 先创建一个TXT文件用于保存获取API令牌+zoneID+账户ID
-
-#### 第一部分：获取 Zone ID（区域 ID）与 账户 ID
-
-1. **登录并选择网站：** 登录 Cloudflare 后，在主页点击你要操作的**网站域名**。
-2. **页面下滑：** 进入网站概览（Overview）页面后，一直往下滑动。
-3. **一键复制：** 在页面的**右下角**，你会直接看到 **区域 ID (Zone ID)** 和 **帐户 ID (Account ID)**。点击它们旁边的“点击复制”即可。
-
----
-#### 第二部分：获取 API 令牌 (API Token)
-
-1. **进入个人设置：** 点击页面右上角的**人像图标**，选择 **我的个人资料 (My Profile)**。
-2. **找到令牌选项：** 在左侧菜单栏点击 **API 令牌 (API Tokens)**，然后点击右上角的 **创建令牌 (Create Token)** 按钮。
-3. **套用模板（最简单）：** 找到 **自定义**
-   **设置如图所示**
-
-<img width="1737" height="667" alt="图片" src="https://github.com/user-attachments/assets/f627df96-81dd-4fc8-8110-ea81c76742b5" />
-
-   
-
-4。 **选择你的网站：** 在“区域资源 (Zone Resources)”这一栏的第三个下拉框中，**选择你的域名**。
-5。 **生成令牌：** 直接滑到底部，点击 **继续以显示摘要 (Continue to summary)**，然后再点 **创建令牌 (Create Token)**。
-6. ⚠️ **核心警告：立刻复制并保存页面上出现的那串很长的代码！** 这就是你的 API 令牌。**它只显示这一次**，关掉页面就再也看不到了。
-
----
-
-**你想用这些信息来配置什么功能呢？** 如果你是为了做动态域名解析 (DDNS) 或者申请免费 SSL 证书，我可以继续为你提供极简版的下一步教程！
-
-### 第六步：设置密码
-
-1. 还在 **Settings** -> **Variables** 页面。
-
-2. 在 **Environment Variables** 区域点击 **Add Variable**。
-
-3. **Variable name** 填写：`ADMIN_PASS`。**Value** 填写你的后台登录密码。
-
-4. **Variable name** 填写  `JWT_SECRET`  **Value** 填写随机生成字符串。
-
-5. 点击 **Encrypt** (加密存储)，然后 **Save and Deploy**。
-
-
----
-
-   ## 📖 使用说明
-
-#### 1. 进入管理后台
-
-访问地址：`https://你的Worker域名/admin`
-
-* 输入在环境变量中设置的密码登录。
-* 如果连续输错 5 次，IP 将被锁定 15 分钟。
-
-#### 2. 添加代理节点
-
-在后台左侧面板输入：
-
-* **代理名称**：例如 `hk` 
-* **访问密钥** (可选)：例如 `123`。如果留空，则公开访问。
-* **服务器地址**：Emby 源站地址，例如 `http://1.2.3.4:8096` (不要带结尾的 `/`)
-* **TAG标签**(可选)
-
-点击 **立即部署**。
-
-#### 3. 客户端连接
-
-* **公开节点**：`https://你的Worker域名/HK`
-
-* **加密节点**：`https://你的Worker域名/HK/123`
-
-  只需要把原来的**EMBY源站链接**换成**节点链接**使用
-
-  当客户端端口可以选填时，不用填写端口【默认443端口】
-
-  **端口要求**：443, 2053, 2083, 2087, 2096, 8443 
-
-#### 5. 数据备份
-
-* 点击列表的 **导出** 按钮，可下载 `json` 备份文件。
-* 点击 **导入** 可恢复数据或批量添加节点（支持热更新，缓存立即刷新）。
-* 全局设置-账号与备份-备份与恢复 (全量 KV 数据)
-
----
-
-## **速度**
-
-**Cloudflare 线路质量**：用户本地网络连接到 Cloudflare 边缘节点的优劣（国内移动/联通/电信直连 CF 的效果差异很大）。一般情况下联通延迟最高 ，但是最近
-
-**CF 与 EMBY源站的对等连接**：Cloudflare 美国/香港节点与 Emby 源站服务器链接 
-
-**EMBY源站上行带宽** 无解 
-
-**转码能力**：如果触发转码，取决于服务器 CPU/GPU 性能。
-
----
-
-
-
-## **缓存**
-
-**自动区分**：媒体文件（不缓存）和静态资源（图片、JS、CSS 字幕等缓存）TTL 设为 1 天
-
-Workers Cache API 缓存 KV 读取结果，减少KV读写次数
-
-**三级缓存**：结合内存级 NodeCache、Cloudflare 默认 caches 缓存以及底层的 KV 存储。内存层**拦截了 99% 以上的重复请求**，边缘缓存 (`caches`) 充当了“中间站”，它不随实例销毁而消失，能让新启动的实例快速找回配置。**KV 存储**则作为“最后的防线”，确保即使边缘缓存被清空，数据依然能从持久化磁盘中恢复。
-
-Cloudflare 边缘缓存的强制策略30天
-
-代码会将 KV 中的节点配置缓存到 Cloudflare 的边缘计算缓存中（`caches.default`），有效期 60 秒。
-
-
----
-
-
-
-## **KV空间作用**
-
-#### 1.节点信息持久化
-
-- **节点数据存储**：以 `node:` 为前缀（如 `node:hk`）存储每个代理节点的详细配置，包括目标源站 URL、访问密钥（Secret）、自定义标签（Tag）及备注。
-- **节点索引管理**：存储键名为 `sys:nodes_index:v1` 的 JSON 数组，记录所有已创建节点的名称列表，用于后台列表的快速加载。
-
-#### 2. 全局系统配置
-
-- **设置存储**：通过 `sys:theme` 键位保存所有全局配置，包括 H2/H3 协议开关、安全防火墙规则（IP/地理黑名单）、Telegram 机器人 Token 以及 Cloudflare API 联动信息。
-- **运行时同步**：系统通过 `getRuntimeConfig` 函数定期从 KV 读取这些设置，并利用内存缓存（`ConfigCache`）优化读取性能。
-
-#### 3. 安全防护与登录控制
-
-- **防暴力破解**：使用 `fail:{ip}` 格式的键位记录每个访问 IP 的登录失败次数。
-- **自动锁定机制**：利用 KV 的 `expirationTtl` 特性，当达到最大尝试次数（`MaxLoginAttempts`）时，会自动锁定该 IP 15 分钟（`LoginLockDuration`）。
-
-#### 4. 仪表盘数据缓存
-
-- **统计快照**：存储以 `sys:cf_dash_cache:{zoneId}:{date}` 为键的流量统计快照，包含今日请求数、视频总流量及每小时请求趋势图表数据。
-- **性能优化**：通过缓存 Cloudflare GraphQL 的查询结果，避免管理后台在每次刷新时都产生高延迟的 API 调用。
-
-#### 5. 多级缓存同步
-
-- **状态协调**：当多个 Worker 实例（Isolates）运行时，KV 作为唯一的“真理来源”，确保不同节点或不同地理位置的请求都能读取到一致的最新配置。
-- **配置热更新**：在后台保存配置后，代码会通过 KV 的写入操作触发全网节点的状态更新。
-
----
-
-
-
-## **常见403 Access Denied问题**
-
-1. **路径访问错误**：后台登录 /admin ，直接复制连接访问就好。EMBY自定义路径无解只能修改代码。
-2. **缺少 Secret (密钥)**：你给节点设置了 Secret（例如 `123`），但访问时没有带上。
-   - *正确访问方式：`domain.com/HK/123`*
-   - *错误访问方式：`domain.com/HK`*
-3. **KV 未绑定**：如果没有正确绑定 `ENI_KV`，脚本读取不到节点信息，也会导致找不到节点而拒绝访问（或报 500 错误）。
-
----
-
-# 代码一览概述
-
----
-
-## 核心功能模块
-
-### 1. 重定向管理与修复
-
-- **无限重定向保护**：代码中通过 `while` 循环处理 30x 状态码，并硬编码了 `redirectHop < 8` 的限制，若重定向超过 8 次则强制停止，防止陷入无限循环。
-- **Location 自动重写**：在响应处理阶段，系统通过 `buildProxyPrefix` 函数将后端返回的 `Location` 头进行重构。如果重定向路径是绝对路径或同源路径，它会被加上 `/{节点名}/{密钥}` 前缀，确保后续请求依然通过 Worker 代理。
-
-### 2. WebSocket 实时通讯
-
-- **协议升级识别**：系统通过检查 `Upgrade` 请求头是否为 `websocket` 来识别长连接请求。
-- **透明转发**：对于状态码为 `101` (Switching Protocols) 的响应，Worker 会直接建立双向隧道，支持 Emby 的播放控制和实时通知功能。
-
-### 3. 智能缓存策略 (Smart Caching)
-
-代码通过正则匹配 `proxyPath` 来区分资源类型，并应用差异化缓存：
-
-- **静态资源加速**：针对图片（`EmbyImages`）、静态扩展名（`StaticExt`）及字幕文件，统一设置 `Cache-Control: public, max-age=86400`（即 24 小时）。
-- **视频流防盗链优化**：
-  - **禁用缓存**：对于识别为 `isBigStream`（视频大文件）的请求，强制设置 `Cache-Control: no-store`。
-  - **Referer 剥离**：在构建回源请求时，如果是视频流、分片或播放列表，且未配置自定义 Header，系统会主动删除 `Referer` 头，以绕过源站的防盗链机制。
-- **预热探测缓存**：针对播放器频繁发起的 `Range: bytes=0-1` 探测请求（`isHeadPrewarm`），代码提供了 180 秒的短时间缓存，以减轻源站压力。
-
-### 4. Header 伪装与 IP 注入
-
-- **隐私清洗**：代码定义了 `DropRequestHeaders` 集合，包括 `host`、`cf-connecting-ip`、`cf-ray` 等 Cloudflare 特有或敏感头信息，在回源前会统一删除。
-- **真实 IP 传递**：系统获取 `cf-connecting-ip` 后，会手动注入 `X-Real-IP` 和 `X-Forwarded-For`，确保 Emby 后端能正确识别客户端真实 IP。
-- **协议参数优化**：根据配置，系统会在 Header 中注入 `Connection: keep-alive`，并在必要时禁用 H2/H3 以换取更高的单线程兼容性。
-
-
-
----
-
-## 代码流程图 (请求处理逻辑)
+## 架构总览
 
 ```mermaid
-graph TD
-    %% ================= 1. 请求接入与路由分发 =================
-    Start(用户请求到达 Worker) --> Route{解析 URL 路径}
-    
-    Route -- "/" --> Landing[渲染落地页]
-    Route -- "/admin" (GET) --> AuthCheckUI{JWT 验证}
-    AuthCheckUI -- 通过 --> RenderUI[进入 SaaS 管理面板]
-    AuthCheckUI -- 失败 --> LoginUI[显示登录界面]
-    
-    Route -- "/admin" (POST) --> AuthCheckAPI{JWT 验证}
-    AuthCheckAPI -- 失败 --> Err401[返回 401 未授权]
-    AuthCheckAPI -- 通过 --> AdminAPI[处理管理指令: 增删改查节点/配置/日志]
-    
-    Route -- "/{节点名}/{密钥?}/{路径}" --> NodeFetch[读取节点配置]
-
-    %% ================= 2. 节点代理核心链路 =================
-    subgraph ProxyCore [代理核心逻辑]
-        NodeFetch --> NodeExist{节点是否存在?}
-        NodeExist -- 否 --> Err404[返回 404 Not Found]
-        NodeExist -- 是 --> SecurityLayer[安全防护层]
-        
-        SecurityLayer --> Firewall{防火墙检查}
-        Firewall -- IP/地理黑名单 --> Err403[返回 403 Forbidden]
-        Firewall -- 正常 --> RateLimit{频率限制}
-        RateLimit -- 触发阈值 --> Err429[返回 429 Too Many Requests]
-        
-        RateLimit -- 正常 --> HeaderPatch[请求头补丁]
-        HeaderPatch --> EmbyAuth[双向兼容 Emby 授权头 & 修复登录补头]
-        EmbyAuth --> IPHeaders[注入真实 IP: X-Real-IP / X-Forwarded-For]
-        
-        IPHeaders --> FetchUpstream[回源请求]
-        FetchUpstream --> RetryLogic{异常重试机制}
-        RetryLogic -- "5xx 或 403" --> Fallback[协议降级/剥离报错头并重试一次]
-        RetryLogic -- 正常 --> RedirectHandler{重定向处理}
-        
-        RedirectHandler -- 内部/同源 --> Follow[自动跟随跳转]
-        RedirectHandler -- "外部 (如网盘/直连节点)" --> DirectRedirect[下发 Location 直连]
-        
-        Follow --> RespFinal[处理响应头]
-        RespFinal --> CachePolicy{智能缓存策略}
-        CachePolicy -- 静态资源/图片 --> EdgeCache[边缘缓存 30 天]
-        CachePolicy -- 视频流/API --> NoStore[禁用缓存: no-store]
-    end
-
-    %% ================= 3. 数据持久化与异步处理 =================
-    subgraph DataStorage [数据与日志层]
-        AdminAPI <--> KV[(Cloudflare KV: 配置/节点存储)]
-        AdminAPI <--> D1[(Cloudflare D1: 请求日志数据库)]
-        
-        RespFinal -.-> LogRecord[记录异步日志]
-        LogRecord -.-> D1
-        
-        Scheduled(定时任务) --> Cleanup[D1 旧日志清理]
-        Scheduled --> TGReport[发送 Telegram 每日报表]
-    end
-
-    %% ================= 终点 =================
-    EdgeCache --> Finish(返回响应给用户)
-    NoStore --> Finish
-    DirectRedirect --> Finish
+flowchart LR
+    U[客户端 / 播放器] --> W[Cloudflare Worker]
+    W --> A[/admin SaaS 后台/]
+    W --> P[代理主链路]
+    P --> E[Emby / Jellyfin 源站]
+    P --> X[外部直链 / 网盘 / 对象存储]
+    A --> KV[(Cloudflare KV)]
+    A --> D1[(Cloudflare D1)]
+    W --> KV
+    W --> D1
+    S[scheduled 定时任务] --> D1
+    S --> TG[Telegram 日报]
+    A --> CF[Cloudflare GraphQL Analytics]
 ```
 
 ---
 
-## 技术亮点与细节审查
+## 功能矩阵
 
-* #### 1. 时区感知与本地化优化
-
-  虽然 V18.0 代码中没有直接命名为 `isDaytimeCN()` 的函数，但代码在多个关键逻辑点硬编码了 **UTC+8** 偏移，确保了针对中国用户的精准服务：
-
-  - **日报统计精度**：在 `Database.sendDailyTelegramReport` 中，通过 `now.getTime() + 8 * 3600 * 1000` 强制校准日期，确保报表在每天北京时间 0 点准确切换。
-  - **流量趋势对齐**：在 `fetchCloudflareWorkerUsageMetrics` 中，小时级图表数据使用了 `(dt.getUTCHours() + 8) % 24` 进行对齐，使后台展示的请求趋势图完全符合国内用户的时间轴。
-  - **晚高峰自动切换**：在 `Proxy.handle` 中，代码通过 `const utc8Hour = (new Date().getUTCHours() + 8) % 24` 判断当前是否处于 **20:00 - 24:00** 的晚高峰时段，并据此触发协议降级逻辑以确保稳定性。
-
-  #### 2. 精准流媒体分流与缓存防御
-
-  代码通过严密的正则匹配与条件判断，实现了流媒体的高效直传：
-
-  - **特征识别**：`GLOBALS.Regex.Streaming` 定义了涵盖 `.mkv`、`.mp4`、`.flv` 等主流视频格式的正则。
-  - **大文件拦截**：系统定义了 `isBigStream` 逻辑，排除掉播放列表（m3u8）和微小分片（ts/m4s）后，将真正的视频主体识别为大流。
-  - **强制不缓存**：在响应头处理阶段，一旦命中 `isBigStream`，系统立即执行 `modifiedHeaders.set("Cache-Control", "no-store")`。这不仅保护了 Cloudflare 账户（防止因滥用带宽缓存被封），也避免了大量视频二进制数据挤占边缘节点的内存。
-
-  #### 3. 代码鲁棒性与兼容性设计
-
-  代码在 V18.0 中表现出了极高的灵活性，显著降低了用户的配置门槛：
-
-  - **KV/DB 命名全兼容**：`Auth.getKV` 能够自动识别 `ENI_KV`、`KV`、`EMBY_KV` 或 `EMBY_PROXY`；`Database.getDB` 则兼容 `DB`、`D1` 或 `PROXY_LOGS`。这种设计避免了因环境变量命名微调导致的系统崩溃。
-  - **双向授权头处理**：针对 Emby 的特殊认证机制，代码实现了 `X-Emby-Authorization` 与标准 `Authorization` 的双向自动兼容。无论客户端发送哪种头，系统都会补全另一方，极大提升了对不同版本 Emby 客户端的适配能力。
-  - **登录防御补丁**：代码特别针对 `/users/authenticatebyname` 接口注入了 `Emby Client` 设备信息的 Mock 补丁，从协议层面解决了反代环境下某些客户端登录报“401 未授权”的顽疾。
-
-## 安全建议
-
-1. **JWT_SECRET**：确保在环境变量中设置了高强度的 `JWT_SECRET`。
-2. **KV 绑定**：部署时必须手动绑定一个 KV 命名空间到 Worker，否则管理面板将无法保存任何节点信息。
+| 模块 | 说明 |
+|---|---|
+| 后台认证 | JWT 登录态，密码错误累计锁定 |
+| 节点管理 | 节点增删改查、导入导出、备注/标签/密钥 |
+| 路由模式 | 透明反代、同源跳转继续代理、源站直连节点 |
+| 外链策略 | 强制反代外部链接 / 直接下发 Location |
+| 网盘直连 | `wangpandirect` 关键词模糊匹配 |
+| 缓存 | 静态资源缓存、视频 no-store、预热微缓存 |
+| 安全 | Geo 白名单/黑名单、IP 黑名单、单 IP 限速 |
+| 兼容补丁 | `X-Emby-Authorization` / `Authorization` 双向兼容 |
+| 协议优化 | H1/H2/H3 开关、晚高峰自动降级、403 重试 |
+| 日志监控 | D1 请求日志、清理任务、Telegram 日报 |
+| 仪表盘 | Cloudflare GraphQL 聚合 + D1 本地兜底 |
+| 连接能力 | HTTP(S) + WebSocket |
 
 ---
+
+## 工作原理
+
+### 请求转发原理
+客户端请求先到 Worker，Worker 根据 URL 中的节点名读取 KV 中的节点配置，再构造回源请求发送到 Emby 源站；源站响应由 Worker 流式回传给客户端。对普通 API、静态资源、视频流、重定向、WebSocket，会分别走不同的处理分支。
+
+### IP 隐藏原理
+Worker 作为公网入口，外部只能看到 Cloudflare 边缘节点，而不是你的 Emby 源站真实 IP。需要注意的是，这种“隐藏”是网络入口层面的隐藏，不等于完全匿名：Cloudflare 仍会追加自身请求头，源站 TCP 层看到的也仍然是 Cloudflare 网络。
+
+### 直连 / 反代混合原理
+本项目不是“全量一刀切反代”。它支持：
+
+- 节点默认走 Worker 中继
+- 同源 30x 跳转继续代理
+- 某些节点被显式标记为“源站直连节点”后，源站 2xx 可直接下发给客户端
+- 命中网盘关键词或外链策略时，可直接把目标地址返回给客户端
+
+这意味着它既能保留 Worker 统一入口，也能在带宽敏感场景下降低 Worker 中继成本。
+
+---
+
+## 部署前须知
+
+### 适合什么场景
+- Emby 源站在海外，直连线路差
+- 多台服务器希望统一访问域名
+- 不想暴露源站真实 IP
+- 需要可视化后台维护节点
+
+### 不太适合什么场景
+- 局域网 / 内网直连环境
+- 源站本身就在国内优质线路（如 CN2）
+- 大规模公共分享、超大带宽分发
+
+### 使用风险提醒
+- 腐竹如果明确禁止 CF 反代，使用该方案可能导致账号受限
+- Cloudflare 可能识别高流量滥用，建议仅用于个人或家庭分享
+- Worker 并不能抹除所有 CF 痕迹，请求头和源 IP 识别仍有暴露反代特征的可能
+
+---
+
+## 环境变量与绑定
+
+### 必需项
+
+| 名称 | 必填 | 说明 |
+|---|---:|---|
+| `ENI_KV` | ✅ | KV Namespace 绑定；项目主配置、节点、失败计数、仪表盘缓存都依赖它 |
+| `ADMIN_PASS` | ✅ | 后台登录密码 |
+| `JWT_SECRET` | ✅ | JWT 签名密钥；未配置会导致后台认证不可用 |
+
+### 可选项
+
+| 名称 | 必填 | 说明 |
+|---|---:|---|
+| `DB` | 可选 | D1 绑定，用于请求日志、日志清理、日报统计 |
+| `KV` / `EMBY_KV` / `EMBY_PROXY` | 兼容 | 代码兼容多种 KV 命名 |
+| `D1` / `PROXY_LOGS` | 兼容 | 代码兼容多种 D1 命名 |
+
+> 建议正式部署时仍统一使用 `ENI_KV` 和 `DB`，便于 README、面板和脚本保持一致。
+
+### Worker 控制台变量配置示例
+
+以下配置适合首次部署时直接对照填写：
+
+| 变量名 | 必填 | 类型 | 作用 | 示例/说明 |
+| --- | --- | --- | --- | --- |
+| **`ENI_KV`** | ✅ | KV 绑定 | **核心存储**。用于持久化存储节点信息、系统配置和登录锁定状态。 | 绑定您创建的 KV 命名空间（如 `EMBY_DATA`）。 |
+| **`ADMIN_PASS`** | ✅ | 加密变量 | **后台密码**。用于进入 `/admin` 管理面板。 | `MyStrongPassword123` |
+| **`JWT_SECRET`** | ✅ | 加密变量 | **安全密钥**。用于生成登录状态的 JWT 校验，防止越权访问。 | 建议填入一段随机长字符串。 |
+| **`DB`** | ❌ | D1 绑定 | **日志数据库**。开启请求日志审计、流量统计及日报功能的必要前提。 | 绑定您创建的 D1 数据库。 |
+
+### SaaS UI 后台可选进阶参数
+
+这些参数通常在 `/admin` 后台的“全局设置”中配置，最终存储在 KV 中：
+
+| 参数名 | 建议 | 作用 | 说明 |
+| --- | --- | --- | --- |
+| **`cfApiToken`** | 💡 | **Cloudflare API 令牌** | 用于实现一键清理缓存、GraphQL 流量统计等联动功能。 |
+| **`cfZoneId`** | 💡 | **区域 ID** | 对应您域名所在的 Zone ID。 |
+| **`cfAccountId`** | 💡 | **账户 ID** | 对应您的 Cloudflare 账户 ID。 |
+| **`tgBotToken`** | ❌ | **Telegram 机器人 Token** | 用于发送每日报表通知。 |
+| **`tgChatId`** | ❌ | **Telegram 会话 ID** | 接收报表的个人或群组 ID。 |
+
+### Cloudflare API Token 权限建议
+
+若你希望启用 Cloudflare GraphQL 统计、缓存清理等完整能力，建议创建的 API Token 至少包含以下权限：
+
+- **账户（Account）**：`Account Analytics`（Read）
+- **账户（Account）**：`Workers Scripts`（Read）
+- **区域（Zone）**：`Workers Routes`（Read）
+- **区域（Zone）**：`Cache Purge`（Purge）
+- **区域（Zone）**：`Analytics`（Read）
+
+> 如果你只打算使用基础代理与节点管理能力，而不需要仪表盘增强统计或一键清缓存，可以先不配置 `cfApiToken`。
+
+---
+
+## 部署步骤
+
+### 第一步：创建 KV
+1. 打开 Cloudflare Dashboard
+2. 进入 **Workers & Pages -> KV**
+3. 创建一个 Namespace，例如：`EMBY_DATA`
+
+### 第二步：创建 Worker
+1. 进入 **Workers & Pages -> Create Application -> Create Worker**
+2. 创建后进入 **Edit code**
+3. 将 `worker.js` 全量替换进去并部署
+
+### 第三步：绑定 KV
+1. 打开 Worker 的 **Settings -> Variables / Bindings**
+2. 添加 KV Namespace Binding
+3. 变量名填：`ENI_KV`
+4. 绑定到你刚创建的 KV
+
+### 第四步：绑定 D1（可选但推荐）
+1. 打开 **Storage & Databases -> D1**
+2. 创建数据库，例如：`emby_proxy_logs`
+3. 回到 Worker 设置页，添加 D1 Binding
+4. 变量名填：`DB`
+5. 后续在后台“日志记录”页面执行初始化 DB
+
+### 第五步：设置环境变量
+在 Worker 的 Variables 中新增：
+
+- `ADMIN_PASS`：后台密码
+- `JWT_SECRET`：随机高强度字符串
+
+### 第六步：绑定域名并配置 Cloudflare
+推荐设置：
+
+- SSL/TLS：**Full**
+- 开启 **Always Use HTTPS**
+- 开启 **TLS 1.3**
+- 开启 **WebSockets**
+- 可按需开启 **Tiered Cache**
+
+> 反代访问端口需使用 Cloudflare 支持的 HTTPS 端口，例如 `443 / 2053 / 2083 / 2087 / 2096 / 8443`。
+
+---
+
+## 后台功能说明
+
+后台路径：
+
+```text
+https://你的域名/admin
+```
+
+### 后台主要页面
+- **仪表盘**：展示请求量、流量趋势、资源类别、运行状态、定时任务状态
+- **节点管理**：搜索节点、导入/导出配置、全局 Ping
+- **日志管理**：查询请求记录、初始化 DB、手动清理
+- **设置页**：代理网络、安全策略、日志监控、账号备份
+
+### 设置页中可直接配置的能力
+
+#### 代理网络
+- HTTP/2 开关
+- HTTP/3 QUIC 开关
+- 晚高峰自动降级到 HTTP/1.1
+- 403 重试与协议回退
+- 起播预热拦截（Prewarm）
+- 预热微缓存时长
+- 同源跳转代理
+- 强制反代外部链接
+- `wangpandirect` 模糊关键词
+- 源站直连节点名单
+- Ping 超时时间
+
+#### 安全防护
+- 国家/地区白名单
+- 国家/地区黑名单
+- IP 黑名单
+- 全局单 IP 限速（请求/分钟）
+- 图片海报缓存时长
+- CORS 白名单
+
+#### 日志与监控
+- 日志保存天数
+- 日志延迟写入分钟数
+- 队列提前落盘阈值
+- Telegram Bot Token
+- Telegram Chat ID
+- 测试通知
+- 手动发送日报
+
+---
+
+## 节点访问方式
+
+### 后台新增节点时需要填写
+- **代理名称**：例如 `hk`
+- **访问密钥**：例如 `123`，为空则公开
+- **服务器地址**：例如 `http://1.2.3.4:8096`
+- **标签 / 备注**：可选
+
+### 访问格式
+
+公开节点：
+
+```text
+https://你的域名/hk
+```
+
+加密节点：
+
+```text
+https://你的域名/hk/123
+```
+
+客户端只需要把原本的 Emby 源站地址替换成节点地址即可。
+
+---
+
+## 缓存与性能设计
+
+### 1. 多级缓存
+项目同时使用：
+
+- **内存缓存**：`NodeCache / ConfigCache / NodesIndexCache`
+- **Cloudflare Cache API**：作为边缘缓存层
+- **KV**：持久化配置与快照，作为最终真相源
+
+### 2. 资源分类缓存策略
+- **图片 / 静态资源 / 字幕**：允许缓存
+- **大视频流**：强制 `no-store`
+- **起播探测请求**：短时微缓存，减轻源站压力
+
+### 3. 直连与省流
+通过 `wangpandirect` 与“源站直连节点”，可以让不适合 Worker 中继的数据直接回到客户端，避免无意义的带宽绕行。
+
+---
+
+## 安全机制
+
+### 登录防暴力破解
+后台登录失败次数会按访问者 IP 计数；达到上限后会自动锁定，默认锁定 **15 分钟**。
+
+### 访问控制
+支持以下控制方式：
+
+- Geo 白名单
+- Geo 黑名单
+- IP 黑名单
+- 单 IP 请求限速
+- CORS 限制
+
+### 认证兼容修复
+项目对 Emby 认证头做了兼容处理：
+
+- 自动桥接 `X-Emby-Authorization` 与 `Authorization`
+- 对 `/Users/AuthenticateByName` 登录请求自动补充设备信息
+- 在特定 403 / 协议异常场景下做一次安全回退重试
+
+---
+
+## 数据存储说明
+
+### KV 中的主要键位
+
+| 键位 | 用途 |
+|---|---|
+| `node:*` | 节点配置 |
+| `sys:nodes_index:v1` | 节点索引 |
+| `sys:theme` | 全局配置 |
+| `sys:ops_status:v1` | 运行状态面板数据 |
+| `sys:cf_dash_cache:{zoneId}:{date}` | Cloudflare 仪表盘缓存 |
+| `fail:{ip}` | 登录失败次数 / 锁定控制 |
+
+### D1 中的用途
+- 请求日志写入
+- 日志查询
+- 日志过期清理
+- Telegram 每日报表统计
+- 仪表盘本地统计兜底
+
+---
+
+## 请求处理流程图
+
+```mermaid
+graph TD
+    Start(用户请求到达 Worker) --> Route{解析 URL 路径}
+
+    Route -- "/" --> Landing[渲染落地页]
+    Route -- "/admin" GET --> AuthCheckUI{JWT 验证}
+    AuthCheckUI -- 通过 --> RenderUI[进入 SaaS 管理面板]
+    AuthCheckUI -- 失败 --> LoginUI[显示登录页]
+
+    Route -- "/admin" POST --> AuthCheckAPI{JWT 验证}
+    AuthCheckAPI -- 失败 --> Err401[401 未授权]
+    AuthCheckAPI -- 通过 --> AdminAPI[增删改查节点 / 设置 / 日志]
+
+    Route -- "/{节点名}/{密钥?}/{路径}" --> LoadNode[从 KV 读取节点配置]
+    LoadNode --> Exists{节点是否存在}
+    Exists -- 否 --> Err404[404 Not Found]
+    Exists -- 是 --> Firewall[Geo / IP / 限速检查]
+
+    Firewall --> HeaderPatch[请求头整理与 Emby 授权补丁]
+    HeaderPatch --> Upstream[发起回源请求]
+    Upstream --> Retry{403 / 协议异常?}
+    Retry -- 是 --> Fallback[剥离可疑头并重试一次]
+    Retry -- 否 --> Redirect{是否发生重定向}
+
+    Fallback --> Redirect
+    Redirect -- 同源 --> Follow[继续代理跳转]
+    Redirect -- 外部直链 --> Direct[下发 Location]
+    Redirect -- 无 --> Resp[处理响应头]
+
+    Follow --> Resp
+    Resp --> Cache{分类缓存策略}
+    Cache -- 静态资源 --> StaticCache[边缘缓存]
+    Cache -- 视频流 --> NoStore[no-store]
+
+    StaticCache --> Finish[返回客户端]
+    NoStore --> Finish
+    Direct --> Finish
+```
+
+---
+
+## 常见问题
+
+### 1. 为什么报 403 / Access Denied？
+常见原因：
+
+1. 节点路径写错
+2. 节点设置了密钥，但访问 URL 没带密钥
+3. `ENI_KV` 没绑定，导致读取不到节点配置
+4. 命中了国家/地区或 IP 防火墙
+5. 单 IP 限速已触发
+
+### 2. 为什么登录后台失败？
+- `JWT_SECRET` 未配置
+- `ADMIN_PASS` 错误
+- 连续输错过多次，IP 被锁定 15 分钟
+
+### 3. 为什么有些视频走直连？
+这通常是以下原因之一：
+
+- 节点被加入“源站直连名单”
+- 外链强制反代关闭
+- 命中了 `wangpandirect` 关键词
+- 上游返回的是外部存储地址
+
+### 4. 为什么仪表盘没有 Cloudflare 统计？
+需要在设置中填入：
+
+- `Zone ID`
+- `API Token`
+- `Account ID`
+
+如果 GraphQL 查询失败，面板会回退到本地 D1 日志口径。
+
+### 5. Web 端禁用怎么办？
+本项目主要面向客户端 API 调用场景；如果服本身禁 Web，不影响多数播放器通过 API 使用。
+
