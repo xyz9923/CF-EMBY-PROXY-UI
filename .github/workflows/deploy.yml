@@ -1,0 +1,35 @@
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches:
+      - main  # 只要修改代码并推送到 main 分支，就会自动部署
+  workflow_dispatch: # 允许手动点击部署
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 替换 wrangler.toml 中的占位符为真实的 ID
+        run: |
+          sed -i "s/REPLACE_ME_KV_ID/${{ secrets.KV_ID }}/g" wrangler.toml
+          sed -i "s/REPLACE_ME_D1_NAME/${{ secrets.D1_NAME }}/g" wrangler.toml
+          sed -i "s/REPLACE_ME_D1_ID/${{ secrets.D1_ID }}/g" wrangler.toml
+
+      - name: 部署到 Cloudflare 并注入密码环境变量
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # 告诉 Wrangler 需要将以下两个变量作为加密 Secrets 注入到 Worker 中
+          secrets: |
+            ADMIN_PASS
+            JWT_SECRET
+        env:
+          # 从 GitHub Secrets 中读取密码，传给上面的步骤
+          ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
