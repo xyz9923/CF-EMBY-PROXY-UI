@@ -15,6 +15,7 @@
 
 <img width="2560" height="2497" alt="图片" src="https://github.com/user-attachments/assets/9348e71f-bf9f-47c4-944d-7f94d0d6bdde" />
 
+>图片仅供参考
 
  - 讨论群：https://t.me/+NhDf7qMxH4ZlODY9
  - 这是一个面向个人的Worker 代理方案，对于家庭来说免费版worker请求数可能不够用
