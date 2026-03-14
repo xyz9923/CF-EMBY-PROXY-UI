@@ -1,8 +1,5 @@
-// EMBY-PROXY-UI V18.0 (SaaS UI Optimized - Ultimate Fix + Emby Auth Patch)
-// 终极修复：彻底解决 POST 导致 WAF/Emby 报错，拔除所有视频节流冗余代码，无损 URL 穿透
-// 补丁集成：Emby 授权头双向兼容、登录 API 补头、轻量 403 重试、协议 Fallback
-// 数据面板升级：支持 Cloudflare Analytics 聚合、时间锥、以及全场景“资源类别”徽章解析
-//
+// EMBY-PROXY-UI V18.1 (SaaS UI Optimized - Ultimate Fix + Emby Auth Patch)
+
 // 单文件导航图（保持单文件部署，不做物理解耦）：
 // 0. 全局状态与通用工具
 // 1. Auth：管理员认证与 JWT
@@ -23,6 +20,57 @@
 // - smoke：高频快速验收回归，只覆盖核心链路；full：包含 smoke + 扩展运维状态验证。
 // - thin dispatcher：只做解析、归一、派发，不承载业务复杂度的入口层，例如 `handleApi`。
 
+/**
+ * @typedef {{
+ *   get(key: string, options?: { type?: string }): Promise<any>,
+ *   put(key: string, value: string): Promise<void>,
+ *   delete(key: string): Promise<void>,
+ *   list(options?: { prefix?: string }): Promise<{ keys: Array<{ name: string }> }>
+ * }} KVNamespaceLike
+ *
+ * @typedef {{ waitUntil(promise: Promise<any>): void }} ExecutionContextLike
+ *
+ * @typedef {{
+ *   success?: boolean,
+ *   ok?: boolean,
+ *   description?: string,
+ *   errors?: Array<{ message?: string }>,
+ *   result?: any,
+ *   result_info?: { total_pages?: number, totalPages?: number },
+ *   data?: {
+ *     viewer?: {
+ *       zones?: any[],
+ *       accounts?: any[]
+ *     }
+ *   }
+ * }} JsonApiEnvelope
+ *
+ * @typedef {{
+ *   reason?: string,
+ *   section?: string,
+ *   actor?: string,
+ *   source?: string,
+ *   note?: string
+ * }} ConfigSnapshotMeta
+ *
+ * @typedef {{
+ *   kv?: KVNamespaceLike | null,
+ *   ctx?: ExecutionContextLike | null,
+ *   invalidateList?: boolean
+ * }} PersistNodesIndexOptions
+ *
+ * @typedef {{
+ *   env?: any,
+ *   kv?: KVNamespaceLike | null,
+ *   ctx?: ExecutionContextLike | null,
+ *   snapshotMeta?: ConfigSnapshotMeta
+ * }} PersistRuntimeConfigOptions
+ *
+ * @typedef {RequestInit & { cf?: { cacheEverything: boolean, cacheTtl: number } }} WorkerRequestInit
+ * @typedef {Response & { webSocket?: unknown }} UpgradeableResponse
+ * @typedef {Error & { code?: string, status?: number }} AppError
+ */
+
 // ============================================================================
 // 0. 全局配置与状态 (GLOBAL CONFIG & STATE)
 // ============================================================================
@@ -36,13 +84,29 @@ const Config = {
     CryptoKeyCacheMax: 100,         
     NodeCacheMax: 5000,             
     NodesReadConcurrency: 12,       
+    LogRetentionDays: 7,
+    LogRetentionDaysMax: 365,
     LogFlushDelayMinutes: 20,
     LogFlushCountThreshold: 50,
     LogBatchChunkSize: 50,
+    LogBatchRetryCount: 2,
+    LogBatchRetryBackoffMs: 75,
+    ScheduledLeaseMinMs: 30 * 1000,
+    ScheduledLeaseMs: 5 * 60 * 1000,
+    DashboardAutoRefreshEnabled: false,
+    DashboardAutoRefreshSeconds: 30,
+    TgAlertDroppedBatchThreshold: 0,
+    TgAlertFlushRetryThreshold: 0,
+    TgAlertCooldownMinutes: 30,
+    TgAlertOnScheduledFailure: false,
+    UpstreamTimeoutMs: 0,
+    UpstreamRetryAttempts: 0,
+    PrewarmPrefetchBytes: 4 * 1024 * 1024,
+    ConfigSnapshotLimit: 12,
     CleanupBudgetMs: 1,             
     CleanupChunkSize: 64,           
-    AssetHash: "v18.0",           
-    Version: "18.0"                 
+    AssetHash: "v18.1",           
+    Version: "18.1"                 
   }
 };
 
@@ -58,6 +122,7 @@ const GLOBALS = {
   RateLimitCache: new Map(),
   LogFlushPending: false,
   LogLastFlushAt: 0,
+  OpsStatusWriteChain: Promise.resolve(),
   Regex: {
     StaticExt: /\.(?:jpg|jpeg|gif|png|svg|ico|webp|js|css|woff2?|ttf|otf|map|webmanifest|json)$/i,
     SubtitleExt: /\.(?:srt|ass|vtt|sub)$/i,
@@ -294,6 +359,7 @@ async function fetchCloudflareApiJson(url, apiToken) {
     headers: { "Authorization": `Bearer ${apiToken}`, "Content-Type": "application/json" }
   });
   if (!res.ok) throw new Error(`cf_api_http_${res.status}`);
+  /** @type {JsonApiEnvelope} */
   const payload = await res.json();
   if (payload?.success === false) {
     const msg = Array.isArray(payload?.errors) ? payload.errors.map(item => item?.message).filter(Boolean).join("; ") : "";
@@ -312,6 +378,7 @@ async function fetchCloudflareGraphQL(apiToken, query, variables) {
     body: JSON.stringify(body)
   });
   if (!cfRes.ok) throw new Error(`cf_graphql_http_${cfRes.status}`);
+  /** @type {JsonApiEnvelope} */
   const cfData = await cfRes.json();
   if (Array.isArray(cfData?.errors) && cfData.errors.length) {
     throw new Error(cfData.errors.map(item => item?.message).filter(Boolean).join("; ") || "cf_graphql_error");
@@ -468,18 +535,30 @@ async function resolveCloudflareBoundHostname({ cfAccountId, cfZoneId, cfApiToke
 }
 
 function sanitizeRuntimeConfig(input = {}) {
-  const config = input && typeof input === "object" ? { ...input } : {};
-  const trimFields = ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "wangpandirect"];
-  for (const key of trimFields) {
-    if (config[key] === undefined || config[key] === null) continue;
-    config[key] = String(config[key]).trim();
+  return sanitizeConfigWithRules(input, CONFIG_SANITIZE_RULES, { normalizeNodeNameList });
+}
+
+function serializeConfigValue(value) {
+  if (Array.isArray(value)) return JSON.stringify(value);
+  if (isPlainObject(value)) return JSON.stringify(value);
+  if (value === undefined) return "";
+  return JSON.stringify(value);
+}
+
+function getConfigDiffEntries(prevConfig = {}, nextConfig = {}) {
+  const prev = sanitizeRuntimeConfig(prevConfig);
+  const next = sanitizeRuntimeConfig(nextConfig);
+  const keys = [...new Set([...Object.keys(prev), ...Object.keys(next)])].sort();
+  const entries = [];
+  for (const key of keys) {
+    if (serializeConfigValue(prev[key]) === serializeConfigValue(next[key])) continue;
+    entries.push({
+      key,
+      previousValue: prev[key],
+      nextValue: next[key]
+    });
   }
-  if (Array.isArray(config.sourceDirectNodes)) config.sourceDirectNodes = normalizeNodeNameList(config.sourceDirectNodes);
-  const logDelayMinutes = Number(config.logWriteDelayMinutes);
-  config.logWriteDelayMinutes = Number.isFinite(logDelayMinutes) ? Math.max(0, logDelayMinutes) : Config.Defaults.LogFlushDelayMinutes;
-  const logFlushCountThreshold = Number(config.logFlushCountThreshold);
-  config.logFlushCountThreshold = Number.isFinite(logFlushCountThreshold) ? Math.max(1, Math.floor(logFlushCountThreshold)) : Config.Defaults.LogFlushCountThreshold;
-  return config;
+  return entries;
 }
 
 function classifyCloudflareAnalyticsError(message, options = {}) {
@@ -642,6 +721,81 @@ async function normalizeJsonApiResponse(response) {
 }
 
 const nowMs = () => Date.now();
+const sleepMs = (ms) => new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+
+function clampIntegerConfig(value, fallback, min, max) {
+  let num;
+  if (typeof value === "number") num = value;
+  else if (typeof value === "string") {
+    const normalized = value.trim();
+    if (!/^-?\d+$/.test(normalized)) return fallback;
+    num = Number(normalized);
+  } else {
+    return fallback;
+  }
+  if (!Number.isFinite(num)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(num)));
+}
+
+function clampNumberConfig(value, fallback, min, max) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.min(max, Math.max(min, num));
+}
+
+const CONFIG_SANITIZE_RULES = {
+  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "wangpandirect"],
+  arrayNormalizers: {
+    sourceDirectNodes: "nodeNameList"
+  },
+  integerFields: {
+    logRetentionDays: { fallback: Config.Defaults.LogRetentionDays, min: 1, max: Config.Defaults.LogRetentionDaysMax },
+    logFlushCountThreshold: { fallback: Config.Defaults.LogFlushCountThreshold, min: 1, max: 5000 },
+    logBatchChunkSize: { fallback: Config.Defaults.LogBatchChunkSize, min: 1, max: 500 },
+    logBatchRetryCount: { fallback: Config.Defaults.LogBatchRetryCount, min: 0, max: 5 },
+    logBatchRetryBackoffMs: { fallback: Config.Defaults.LogBatchRetryBackoffMs, min: 0, max: 5000 },
+    scheduledLeaseMs: { fallback: Config.Defaults.ScheduledLeaseMs, min: Config.Defaults.ScheduledLeaseMinMs, max: 30 * 60 * 1000 },
+    dashboardAutoRefreshSeconds: { fallback: Config.Defaults.DashboardAutoRefreshSeconds, min: 5, max: 3600 },
+    tgAlertDroppedBatchThreshold: { fallback: Config.Defaults.TgAlertDroppedBatchThreshold, min: 0, max: 5000 },
+    tgAlertFlushRetryThreshold: { fallback: Config.Defaults.TgAlertFlushRetryThreshold, min: 0, max: 10 },
+    tgAlertCooldownMinutes: { fallback: Config.Defaults.TgAlertCooldownMinutes, min: 1, max: 1440 },
+    upstreamTimeoutMs: { fallback: Config.Defaults.UpstreamTimeoutMs, min: 0, max: 180000 },
+    upstreamRetryAttempts: { fallback: Config.Defaults.UpstreamRetryAttempts, min: 0, max: 3 },
+    prewarmPrefetchBytes: { fallback: Config.Defaults.PrewarmPrefetchBytes, min: 0, max: 64 * 1024 * 1024 }
+  },
+  numberFields: {
+    logWriteDelayMinutes: { fallback: Config.Defaults.LogFlushDelayMinutes, min: 0, max: 1440 }
+  },
+  booleanTrueFields: [],
+  booleanFalseFields: ["dashboardAutoRefreshEnabled", "tgAlertOnScheduledFailure"]
+};
+
+function sanitizeConfigWithRules(input = {}, rules = CONFIG_SANITIZE_RULES, helpers = {}) {
+  const config = input && typeof input === "object" ? { ...input } : {};
+  for (const key of rules.trimFields || []) {
+    if (config[key] === undefined || config[key] === null) continue;
+    config[key] = String(config[key]).trim();
+  }
+  for (const [key, normalizerName] of Object.entries(rules.arrayNormalizers || {})) {
+    if (!Array.isArray(config[key])) continue;
+    if (normalizerName === "nodeNameList" && typeof helpers.normalizeNodeNameList === "function") {
+      config[key] = helpers.normalizeNodeNameList(config[key]);
+    }
+  }
+  for (const [key, rule] of Object.entries(rules.integerFields || {})) {
+    config[key] = clampIntegerConfig(config[key], rule.fallback, rule.min, rule.max);
+  }
+  for (const [key, rule] of Object.entries(rules.numberFields || {})) {
+    config[key] = clampNumberConfig(config[key], rule.fallback, rule.min, rule.max);
+  }
+  for (const key of rules.booleanTrueFields || []) {
+    config[key] = config[key] !== false;
+  }
+  for (const key of rules.booleanFalseFields || []) {
+    config[key] = config[key] === true;
+  }
+  return config;
+}
 
 async function runWithConcurrency(items, limit, worker) {
   const results = [], executing = [];
@@ -819,22 +973,144 @@ const CacheManager = {
 
 const Database = {
   PREFIX: "node:", CONFIG_KEY: "sys:theme", NODES_INDEX_KEY: "sys:nodes_index:v1", OPS_STATUS_KEY: "sys:ops_status:v1",
+  SCHEDULED_LOCK_KEY: "sys:scheduled_lock:v1",
+  CONFIG_SNAPSHOTS_KEY: "sys:config_snapshots:v1",
+  TELEGRAM_ALERT_STATE_KEY: "sys:telegram_alert_state:v1",
+  OPS_STATUS_SECTION_KEYS: {
+    log: "sys:ops_status:log:v1",
+    scheduled: "sys:ops_status:scheduled:v1"
+  },
   getKV(env) { return Auth.getKV(env); },
   getDB(env) { return env.DB || env.D1 || env.PROXY_LOGS; },
-  async getOpsStatus(kv) {
+  getOpsStatusSectionEntries() {
+    return Object.entries(this.OPS_STATUS_SECTION_KEYS);
+  },
+  async getOpsStatusRoot(kv) {
     if (!kv) return {};
     try { return await kv.get(this.OPS_STATUS_KEY, { type: "json" }) || {}; } catch { return {}; }
+  },
+  async getOpsStatusSection(kv, sectionName) {
+    if (!kv || !sectionName) return {};
+    const sectionKey = this.OPS_STATUS_SECTION_KEYS[sectionName];
+    const [root, sectionValue] = await Promise.all([
+      this.getOpsStatusRoot(kv),
+      sectionKey ? kv.get(sectionKey, { type: "json" }).catch(() => null) : Promise.resolve(null)
+    ]);
+    const rootSection = root && typeof root[sectionName] === "object" ? root[sectionName] : {};
+    return mergeStatusPatch(rootSection, sectionValue && typeof sectionValue === "object" ? sectionValue : {});
+  },
+  async getOpsStatus(kv) {
+    if (!kv) return {};
+    const root = await this.getOpsStatusRoot(kv);
+    const status = root && typeof root === "object" ? { ...root } : {};
+    let latestUpdatedAt = typeof status.updatedAt === "string" ? status.updatedAt : "";
+    const sectionEntries = await Promise.all(this.getOpsStatusSectionEntries().map(async ([sectionName, key]) => {
+      try {
+        const sectionValue = await kv.get(key, { type: "json" });
+        return [sectionName, sectionValue];
+      } catch {
+        return [sectionName, null];
+      }
+    }));
+    for (const [sectionName, sectionValue] of sectionEntries) {
+      if (!sectionValue || typeof sectionValue !== "object") continue;
+      status[sectionName] = mergeStatusPatch(status[sectionName], sectionValue);
+      if (typeof sectionValue.updatedAt === "string" && sectionValue.updatedAt > latestUpdatedAt) latestUpdatedAt = sectionValue.updatedAt;
+    }
+    if (latestUpdatedAt) status.updatedAt = latestUpdatedAt;
+    return status;
   },
   async patchOpsStatus(envOrKv, patch, ctx = null) {
     const kv = envOrKv && typeof envOrKv.get === "function" ? envOrKv : this.getKV(envOrKv);
     if (!kv) return {};
-    const current = await this.getOpsStatus(kv);
-    const next = mergeStatusPatch(current, patch);
-    next.updatedAt = new Date().toISOString();
-    const task = kv.put(this.OPS_STATUS_KEY, JSON.stringify(next));
+    const patchObject = patch && typeof patch === "object" ? patch : {};
+    const sectionPatches = [];
+    const rootPatch = {};
+    for (const [key, value] of Object.entries(patchObject)) {
+      if (this.OPS_STATUS_SECTION_KEYS[key]) sectionPatches.push([key, value]);
+      else rootPatch[key] = value;
+    }
+    const runPatch = async () => {
+      const nowIso = new Date().toISOString();
+      if (Object.keys(rootPatch).length > 0) {
+        const currentRoot = await this.getOpsStatusRoot(kv);
+        const nextRoot = mergeStatusPatch(currentRoot, rootPatch);
+        nextRoot.updatedAt = nowIso;
+        await kv.put(this.OPS_STATUS_KEY, JSON.stringify(nextRoot));
+      }
+      for (const [sectionName, sectionPatch] of sectionPatches) {
+        const currentSection = await this.getOpsStatusSection(kv, sectionName);
+        const nextSection = mergeStatusPatch(currentSection, sectionPatch);
+        nextSection.updatedAt = nowIso;
+        await kv.put(this.OPS_STATUS_SECTION_KEYS[sectionName], JSON.stringify(nextSection));
+      }
+      return this.getOpsStatus(kv);
+    };
+    const task = Promise.resolve(GLOBALS.OpsStatusWriteChain)
+      .catch(() => {})
+      .then(runPatch);
+    GLOBALS.OpsStatusWriteChain = task.catch(() => {});
     if (ctx) ctx.waitUntil(task);
     else await task;
-    return next;
+    return task;
+  },
+  async tryAcquireScheduledLease(kv, options = {}) {
+    if (!kv) return { acquired: false, reason: "kv_unavailable" };
+    const now = nowMs();
+    const leaseMs = Math.max(Config.Defaults.ScheduledLeaseMinMs, Number(options.leaseMs) || Config.Defaults.ScheduledLeaseMs);
+    const token = String(options.token || `${now}-${Math.random().toString(36).slice(2, 10)}`);
+    const owner = String(options.owner || "scheduled");
+    let current = null;
+    try {
+      current = await kv.get(this.SCHEDULED_LOCK_KEY, { type: "json" });
+    } catch {}
+    if (current && Number(current.expiresAt) > now) {
+      return { acquired: false, reason: "lease_held", lock: current };
+    }
+    const nextLock = {
+      token,
+      owner,
+      acquiredAt: new Date(now).toISOString(),
+      expiresAt: now + leaseMs
+    };
+    await kv.put(this.SCHEDULED_LOCK_KEY, JSON.stringify(nextLock));
+    let confirmed = null;
+    try {
+      confirmed = await kv.get(this.SCHEDULED_LOCK_KEY, { type: "json" });
+    } catch {}
+    if (confirmed && confirmed.token === token) return { acquired: true, leaseMs, lock: confirmed };
+    return { acquired: false, reason: "lease_contended", lock: confirmed };
+  },
+  async renewScheduledLease(kv, token, leaseMs, options = {}) {
+    if (!kv || !token) return null;
+    const now = nowMs();
+    const safeLeaseMs = Math.max(Config.Defaults.ScheduledLeaseMinMs, Number(leaseMs) || Config.Defaults.ScheduledLeaseMs);
+    try {
+      const current = await kv.get(this.SCHEDULED_LOCK_KEY, { type: "json" });
+      if (!current || current.token !== token) return null;
+      const nextLock = {
+        ...current,
+        owner: String(options.owner || current.owner || "scheduled"),
+        renewedAt: new Date(now).toISOString(),
+        expiresAt: now + safeLeaseMs
+      };
+      await kv.put(this.SCHEDULED_LOCK_KEY, JSON.stringify(nextLock));
+      const confirmed = await kv.get(this.SCHEDULED_LOCK_KEY, { type: "json" });
+      return confirmed && confirmed.token === token ? confirmed : null;
+    } catch {
+      return null;
+    }
+  },
+  async releaseScheduledLease(kv, token) {
+    if (!kv || !token) return false;
+    try {
+      const current = await kv.get(this.SCHEDULED_LOCK_KEY, { type: "json" });
+      if (!current || current.token !== token) return false;
+      await kv.delete(this.SCHEDULED_LOCK_KEY);
+      return true;
+    } catch {
+      return false;
+    }
   },
   normalizeNodeIndex(index = []) {
     return [...new Set((Array.isArray(index) ? index : []).map(name => String(name || "").toLowerCase().trim()).filter(Boolean))];
@@ -848,6 +1124,10 @@ const Database = {
     GLOBALS.NodesIndexCache = { data: index, exp: nowMs() + 60000 };
     return [...index];
   },
+  /**
+   * @param {string | string[]} [nodeNames=[]]
+   * @param {{ invalidateList?: boolean }} [options={}]
+   */
   invalidateNodeCaches(nodeNames = [], options = {}) {
     for (const rawName of Array.isArray(nodeNames) ? nodeNames : [nodeNames]) {
       const name = String(rawName || "").toLowerCase().trim();
@@ -856,7 +1136,12 @@ const Database = {
     }
     if (options.invalidateList) GLOBALS.NodesListCache = null;
   },
-  async persistNodesIndex(index, { kv, ctx, invalidateList = false } = {}) {
+  /**
+   * @param {string[]} index
+   * @param {PersistNodesIndexOptions} [options={}]
+   */
+  async persistNodesIndex(index, options = {}) {
+    const { kv, ctx, invalidateList = false } = options;
     const normalizedIndex = this.normalizeNodeIndex(index);
     GLOBALS.NodesIndexCache = { data: normalizedIndex, exp: nowMs() + 60000 };
     if (invalidateList) GLOBALS.NodesListCache = null;
@@ -879,12 +1164,80 @@ const Database = {
     }
     return [...staleKeys].filter(Boolean);
   },
-  async persistRuntimeConfig(rawConfig, { env, kv, ctx } = {}) {
+  /**
+   * @param {ConfigSnapshotMeta} [meta={}]
+   */
+  normalizeConfigSnapshotMeta(meta = {}) {
+    /** @type {ConfigSnapshotMeta} */
+    const input = meta && typeof meta === "object" ? meta : {};
+    return {
+      reason: String(input.reason || "save_config").trim() || "save_config",
+      section: String(input.section || "all").trim() || "all",
+      actor: String(input.actor || "admin").trim() || "admin",
+      source: String(input.source || "ui").trim() || "ui",
+      note: String(input.note || "").trim()
+    };
+  },
+  async getConfigSnapshots(kv, options = {}) {
+    if (!kv) return [];
+    let rawSnapshots = [];
+    try {
+      const stored = await kv.get(this.CONFIG_SNAPSHOTS_KEY, { type: "json" });
+      rawSnapshots = Array.isArray(stored) ? stored : [];
+    } catch {}
+    const includeConfig = options.withConfig === true;
+    return rawSnapshots
+      .filter(item => item && typeof item === "object" && Array.isArray(item.changedKeys) && item.createdAt)
+      .map(item => includeConfig ? { ...item } : {
+        id: item.id,
+        createdAt: item.createdAt,
+        reason: item.reason,
+        section: item.section,
+        actor: item.actor,
+        source: item.source,
+        note: item.note || "",
+        changedKeys: [...item.changedKeys],
+        changeCount: Number(item.changeCount) || item.changedKeys.length || 0
+      });
+  },
+  async getConfigSnapshotById(kv, snapshotId) {
+    const snapshots = await this.getConfigSnapshots(kv, { withConfig: true });
+    return snapshots.find(item => item.id === snapshotId) || null;
+  },
+  async recordConfigSnapshot(kv, prevConfig, nextConfig, meta = {}) {
+    if (!kv) return null;
+    const diffEntries = getConfigDiffEntries(prevConfig, nextConfig);
+    if (!diffEntries.length) return null;
+    const snapshotMeta = this.normalizeConfigSnapshotMeta(meta);
+    const currentSnapshots = await this.getConfigSnapshots(kv, { withConfig: true });
+    const snapshot = {
+      id: `cfg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      createdAt: new Date().toISOString(),
+      reason: snapshotMeta.reason,
+      section: snapshotMeta.section,
+      actor: snapshotMeta.actor,
+      source: snapshotMeta.source,
+      note: snapshotMeta.note,
+      changedKeys: diffEntries.map(item => item.key),
+      changeCount: diffEntries.length,
+      config: sanitizeRuntimeConfig(prevConfig)
+    };
+    const nextSnapshots = [snapshot, ...currentSnapshots].slice(0, Config.Defaults.ConfigSnapshotLimit);
+    await kv.put(this.CONFIG_SNAPSHOTS_KEY, JSON.stringify(nextSnapshots));
+    return snapshot;
+  },
+  /**
+   * @param {any} rawConfig
+   * @param {PersistRuntimeConfigOptions} [options={}]
+   */
+  async persistRuntimeConfig(rawConfig, options = {}) {
+    const { env, kv, ctx, snapshotMeta } = options;
     if (!kv) return sanitizeRuntimeConfig(rawConfig);
     const prevConfig = env
       ? await getRuntimeConfig(env)
       : sanitizeRuntimeConfig(await kv.get(this.CONFIG_KEY, { type: "json" }) || {});
     const nextConfig = sanitizeRuntimeConfig(rawConfig);
+    await this.recordConfigSnapshot(kv, prevConfig, nextConfig, snapshotMeta);
     await kv.put(this.CONFIG_KEY, JSON.stringify(nextConfig));
     GLOBALS.ConfigCache = null;
     const deleteTasks = this.buildConfigCacheKeys(prevConfig, nextConfig).map(key => kv.delete(key));
@@ -893,6 +1246,21 @@ const Database = {
       else await Promise.all(deleteTasks);
     }
     return nextConfig;
+  },
+  async sendTelegramMessage({ tgBotToken, tgChatId, text }) {
+      const botToken = String(tgBotToken || "").trim();
+      const chatId = String(tgChatId || "").trim();
+      if (!botToken || !chatId) throw new Error("请先完善 Telegram Bot Token 和 Chat ID 配置");
+      const tgUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
+      const res = await fetch(tgUrl, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ chat_id: chatId, text: String(text || "") })
+      });
+      /** @type {JsonApiEnvelope} */
+      const tgData = await res.json();
+      if (!tgData.ok) throw new Error(tgData.description || "Telegram API 返回错误");
+      return tgData;
   },
   
   async sendDailyTelegramReport(env) {
@@ -958,15 +1326,88 @@ const Database = {
       let accStr = `${accHrs}小时${accMins}分钟${accRemSecs}秒`;
 
       const msgText = `📊 Cloudflare Zone 每日报表 (UTC+8)\n域名: ${domainName}\n\n📅 今天 (${todayStr})\n请求数: ${reqStr}\n视频流量 (CF 总计): ${cfTrafficStatus}\n请求: 播放请求 ${playCount} 次 | 获取播放信息 ${infoCount} 次\n\n🚀 共加速时长: ${accStr}\n#Cloudflare #Emby #日报`;
-      const tgUrl = `https://api.telegram.org/bot${tgBotToken}/sendMessage`;
-      const res = await fetch(tgUrl, {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({ chat_id: tgChatId, text: msgText })
-      });
-      const tgData = await res.json();
-      if (!tgData.ok) throw new Error(tgData.description || "Telegram API 返回错误");
+      await this.sendTelegramMessage({ tgBotToken, tgChatId, text: msgText });
       return true;
+  },
+  async maybeSendRuntimeAlerts(env, scheduledState = null) {
+      const kv = this.getKV(env);
+      if (!kv) return { sent: false, reason: "kv_unavailable" };
+      const config = sanitizeRuntimeConfig(await getRuntimeConfig(env));
+      const tgBotToken = String(config.tgBotToken || "").trim();
+      const tgChatId = String(config.tgChatId || "").trim();
+      if (!tgBotToken || !tgChatId) return { sent: false, reason: "telegram_not_configured" };
+
+      const droppedThreshold = clampIntegerConfig(config.tgAlertDroppedBatchThreshold, Config.Defaults.TgAlertDroppedBatchThreshold, 0, 5000);
+      const retryThreshold = clampIntegerConfig(config.tgAlertFlushRetryThreshold, Config.Defaults.TgAlertFlushRetryThreshold, 0, 10);
+      const cooldownMinutes = clampIntegerConfig(config.tgAlertCooldownMinutes, Config.Defaults.TgAlertCooldownMinutes, 1, 1440);
+      const alertOnScheduledFailure = config.tgAlertOnScheduledFailure === true;
+      if (droppedThreshold <= 0 && retryThreshold <= 0 && !alertOnScheduledFailure) {
+        return { sent: false, reason: "thresholds_disabled" };
+      }
+
+      const opsStatus = await this.getOpsStatus(kv);
+      const log = opsStatus && typeof opsStatus.log === "object" ? opsStatus.log : {};
+      const scheduled = scheduledState && typeof scheduledState === "object" && Object.keys(scheduledState).length
+        ? scheduledState
+        : (opsStatus && typeof opsStatus.scheduled === "object" ? opsStatus.scheduled : {});
+      const issues = [];
+
+      const droppedCount = Number(log.lastDroppedBatchSize) || 0;
+      if (droppedThreshold > 0 && droppedCount >= droppedThreshold) {
+        issues.push({
+          code: "log_drop",
+          message: `日志刷盘疑似丢弃批次：${droppedCount} 条（阈值 ${droppedThreshold}）`,
+          eventAt: log.lastFlushErrorAt || log.lastOverflowAt || log.updatedAt || opsStatus.updatedAt || ""
+        });
+      }
+
+      const retryCount = Number(log.lastFlushRetryCount) || 0;
+      if (retryThreshold > 0 && retryCount >= retryThreshold) {
+        issues.push({
+          code: "log_retry",
+          message: `D1 写入重试次数偏高：${retryCount} 次（阈值 ${retryThreshold}）`,
+          eventAt: log.lastFlushAt || log.lastFlushErrorAt || log.updatedAt || opsStatus.updatedAt || ""
+        });
+      }
+
+      const scheduledStatus = String(scheduled.status || "").toLowerCase();
+      if (alertOnScheduledFailure && (scheduledStatus === "failed" || scheduledStatus === "partial_failure")) {
+        issues.push({
+          code: "scheduled_failure",
+          message: `定时任务状态异常：${scheduled.status}${scheduled.lastError ? `，错误：${scheduled.lastError}` : ""}`,
+          eventAt: scheduled.lastFinishedAt || scheduled.lastErrorAt || scheduled.updatedAt || opsStatus.updatedAt || ""
+        });
+      }
+
+      if (!issues.length) return { sent: false, reason: "no_alerts" };
+
+      const signature = JSON.stringify(issues.map(item => ({ code: item.code, eventAt: item.eventAt, message: item.message })));
+      let lastAlertState = null;
+      try {
+        lastAlertState = await kv.get(this.TELEGRAM_ALERT_STATE_KEY, { type: "json" });
+      } catch {}
+      const now = Date.now();
+      const cooldownMs = cooldownMinutes * 60 * 1000;
+      if (lastAlertState && lastAlertState.signature === signature && Number(lastAlertState.sentAtMs) > 0 && (now - Number(lastAlertState.sentAtMs)) < cooldownMs) {
+        return { sent: false, reason: "cooldown_active" };
+      }
+
+      const lines = [
+        "⚠️ Emby Proxy 运行时异常告警",
+        "",
+        ...issues.map(item => `- ${item.message}`),
+        "",
+        `时间：${new Date().toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" })}`,
+        "#Emby #Alert"
+      ];
+      await this.sendTelegramMessage({ tgBotToken, tgChatId, text: lines.join("\n") });
+      await kv.put(this.TELEGRAM_ALERT_STATE_KEY, JSON.stringify({
+        signature,
+        sentAt: new Date(now).toISOString(),
+        sentAtMs: now,
+        issues
+      }));
+      return { sent: true, issueCount: issues.length };
   },
 
   sanitizeHeaders(input) {
@@ -1060,7 +1501,7 @@ const Database = {
   // 管理 API 动作表 (ADMIN ACTION MAP)
   // 读取导航：
   // - 面板统计 / 运行状态：getDashboardStats / getRuntimeStatus
-  // - 配置与备份：loadConfig / saveConfig / exportConfig / importFull
+  // - 配置与备份：loadConfig / previewConfig / saveConfig / exportConfig / importFull
   // - 节点治理：list / saveOrImport / delete / pingNode
   // - 运维动作：getLogs / clearLogs / initLogsDb / purgeCache / testTelegram / sendDailyReport
   // 设计意图：
@@ -1219,15 +1660,32 @@ const Database = {
       return new Response(JSON.stringify({ config: await getRuntimeConfig(env) }), { headers: { ...corsHeaders } });
     },
 
+    async previewConfig(data) {
+      const rawConfig = data?.config && typeof data.config === "object" && !Array.isArray(data.config)
+        ? data.config
+        : {};
+      return jsonResponse({ config: sanitizeRuntimeConfig(rawConfig) });
+    },
+
     async getRuntimeStatus(data, { kv }) {
       return jsonResponse({ status: await Database.getOpsStatus(kv) });
     },
 
-    async saveConfig(data, { env, ctx, kv }) {
-      if (data.config) {
-          await Database.persistRuntimeConfig(data.config, { env, kv, ctx });
-      }
-      return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
+    async saveConfig(data, { env, ctx, kv, meta }) {
+      const savedConfig = data.config
+        ? await Database.persistRuntimeConfig(data.config, {
+            env,
+            kv,
+            ctx,
+            snapshotMeta: {
+              reason: "save_config",
+              section: String(meta?.section || "all"),
+              source: String(meta?.source || "ui"),
+              actor: "admin"
+            }
+          })
+        : await getRuntimeConfig(env);
+      return jsonResponse({ success: true, config: savedConfig });
     },
 
     async exportConfig(data, { env, ctx }) {
@@ -1237,6 +1695,58 @@ const Database = {
         nodes: (await CacheManager.getNodesList(env, ctx)).filter(Boolean), 
         config: await getRuntimeConfig(env) 
       }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    },
+
+    async exportSettings(data, { env }) {
+      return jsonResponse({
+        version: Config.Defaults.Version,
+        type: "settings-only",
+        exportTime: new Date().toISOString(),
+        config: await getRuntimeConfig(env)
+      });
+    },
+
+    async importSettings(data, { env, ctx, kv, meta }) {
+      const importedConfig = data?.config && typeof data.config === "object" && !Array.isArray(data.config)
+        ? data.config
+        : (data?.settings && typeof data.settings === "object" && !Array.isArray(data.settings) ? data.settings : null);
+      if (!importedConfig) return jsonError("INVALID_SETTINGS_BACKUP", "设置备份文件无效，缺少 config/settings 对象");
+      const savedConfig = await Database.persistRuntimeConfig(importedConfig, {
+        env,
+        kv,
+        ctx,
+        snapshotMeta: {
+          reason: "import_settings",
+          section: "all",
+          source: String(meta?.source || "settings_backup"),
+          actor: "admin"
+        }
+      });
+      return jsonResponse({ success: true, config: savedConfig });
+    },
+
+    async getConfigSnapshots(data, { kv }) {
+      return jsonResponse({ snapshots: await Database.getConfigSnapshots(kv) });
+    },
+
+    async restoreConfigSnapshot(data, { env, ctx, kv }) {
+      const snapshotId = String(data?.id || "").trim();
+      if (!snapshotId) return jsonError("SNAPSHOT_ID_REQUIRED", "请提供要恢复的快照 ID");
+      const snapshot = await Database.getConfigSnapshotById(kv, snapshotId);
+      if (!snapshot) return jsonError("SNAPSHOT_NOT_FOUND", "指定的配置快照不存在", 404);
+      const savedConfig = await Database.persistRuntimeConfig(snapshot.config || {}, {
+        env,
+        kv,
+        ctx,
+        snapshotMeta: {
+          reason: "restore_snapshot",
+          section: "all",
+          source: "snapshot",
+          actor: "admin",
+          note: snapshotId
+        }
+      });
+      return jsonResponse({ success: true, config: savedConfig, restoredSnapshotId: snapshotId });
     },
 
     async list(data, { env, ctx }) {
@@ -1284,7 +1794,20 @@ const Database = {
     },
 
     async importFull(data, { env, ctx, kv }) {
-      if (data.config) await Database.persistRuntimeConfig(data.config, { env, kv, ctx });
+      let savedConfig = null;
+      if (data.config) {
+        savedConfig = await Database.persistRuntimeConfig(data.config, {
+          env,
+          kv,
+          ctx,
+          snapshotMeta: {
+            reason: "import_full",
+            section: "all",
+            source: "full_backup",
+            actor: "admin"
+          }
+        });
+      }
       if (data.nodes && Array.isArray(data.nodes)) {
           const savedNodes = [];
           let index = await Database.getNodesIndex(kv);
@@ -1304,7 +1827,7 @@ const Database = {
             await Database.persistNodesIndex(index, { kv, ctx, invalidateList: true });
           }
       }
-      return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
+      return jsonResponse({ success: true, config: savedConfig || await getRuntimeConfig(env) });
     },
 
     async delete(data, { ctx, kv }) {
@@ -1336,16 +1859,9 @@ const Database = {
         const { tgBotToken, tgChatId } = data;
         if (!tgBotToken || !tgChatId) return jsonError("MISSING_PARAMS", "请先填写 Bot Token 和 Chat ID");
         try {
-            const tgUrl = `https://api.telegram.org/bot${tgBotToken}/sendMessage`;
             const msgText = "✅ Emby Proxy: Telegram 机器人测试通知成功！\n如果您能看到这条消息，说明您的通知配置完全正确。";
-            const tgRes = await fetch(tgUrl, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ chat_id: tgChatId, text: msgText })
-            });
-            const tgData = await tgRes.json();
-            if (tgData.ok) return jsonResponse({ success: true });
-            return jsonError("TG_API_ERROR", tgData.description || "Telegram API 返回错误，请检查 Token/ChatID");
+            await Database.sendTelegramMessage({ tgBotToken, tgChatId, text: msgText });
+            return jsonResponse({ success: true });
         } catch (e) {
             return jsonError("NETWORK_ERROR", e.message);
         }
@@ -1516,7 +2032,7 @@ const Proxy = {
     const rangeHeader = request.headers.get("Range");
     const enablePrewarm = currentConfig.enablePrewarm !== false;
     const prewarmCacheTtl = parseInt(currentConfig.prewarmCacheTtl) || 180;
-    const prewarmPrefetchBytes = Math.max(0, parseInt(currentConfig.prewarmPrefetchBytes) || (4 * 1024 * 1024));
+    const prewarmPrefetchBytes = clampIntegerConfig(currentConfig.prewarmPrefetchBytes, Config.Defaults.PrewarmPrefetchBytes, 0, 64 * 1024 * 1024);
     const isHeadPrewarm =
       enablePrewarm &&
       (request.method === "GET" || request.method === "HEAD") &&
@@ -1746,8 +2262,28 @@ const Proxy = {
     const finalUrl = new URL(proxyPath, targetBase);
     finalUrl.search = requestUrl.search;
     const fetchOptions = await buildFetchOptions(finalUrl, options);
-    const response = await fetch(finalUrl.toString(), fetchOptions);
-    return { response, targetBase, finalUrl };
+    const timeoutMs = Math.max(0, Number(options.timeoutMs) || 0);
+    let timeoutId = null;
+    let controller = null;
+    if (timeoutMs > 0) {
+      controller = new AbortController();
+      fetchOptions.signal = controller.signal;
+      timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    }
+    try {
+      const response = await fetch(finalUrl.toString(), fetchOptions);
+      return { response, targetBase, finalUrl };
+    } catch (error) {
+      if (timeoutMs > 0 && (error?.name === "AbortError" || String(error?.message || "").toLowerCase().includes("abort"))) {
+        /** @type {AppError} */
+        const timeoutError = new Error(`upstream_timeout_${timeoutMs}ms`);
+        timeoutError.code = "UPSTREAM_TIMEOUT";
+        throw timeoutError;
+      }
+      throw error;
+    } finally {
+      if (timeoutId !== null) clearTimeout(timeoutId);
+    }
   },
   async fetchUpstreamWithRetryLoop(state) {
     let lastError = null;
@@ -1756,34 +2292,45 @@ const Proxy = {
     let lastFinalUrl = new URL(state.proxyPath, lastBase);
     lastFinalUrl.search = state.requestUrl.search;
 
-    for (let index = 0; index < state.retryTargets.length; index++) {
-      const targetBase = state.retryTargets[index];
-      lastBase = targetBase;
-      try {
-        const upstream = await this.performUpstreamFetch(targetBase, state.proxyPath, state.requestUrl, state.buildFetchOptions, { isRetry: state.isRetry });
-        lastFinalUrl = upstream.finalUrl;
-        const response = upstream.response;
+    const totalPasses = Math.max(1, clampIntegerConfig(state.maxExtraAttempts, Config.Defaults.UpstreamRetryAttempts, 0, 3) + 1);
+    for (let pass = 0; pass < totalPasses; pass++) {
+      for (let index = 0; index < state.retryTargets.length; index++) {
+        const targetBase = state.retryTargets[index];
+        lastBase = targetBase;
+        const effectiveRetry = state.isRetry === true || pass > 0;
+        try {
+          const upstream = await this.performUpstreamFetch(targetBase, state.proxyPath, state.requestUrl, state.buildFetchOptions, {
+            isRetry: effectiveRetry,
+            timeoutMs: state.upstreamTimeoutMs
+          });
+          lastFinalUrl = upstream.finalUrl;
+          const response = upstream.response;
 
-        if (response.status === 101) {
-          return upstream;
-        }
+          if (response.status === 101) {
+            return upstream;
+          }
 
-        if (this.shouldRetryWithProtocolFallback(response, state)) {
-          try { response.body?.cancel?.(); } catch {}
-          return await this.fetchUpstreamWithRetryLoop({ ...state, isRetry: true });
-        }
+          if (this.shouldRetryWithProtocolFallback(response, { ...state, isRetry: effectiveRetry })) {
+            try { response.body?.cancel?.(); } catch {}
+            return await this.fetchUpstreamWithRetryLoop({ ...state, isRetry: true });
+          }
 
-        if (!state.retryableStatuses.has(response.status) || index === state.retryTargets.length - 1) {
-          return upstream;
-        }
+          const isLastTarget = index === state.retryTargets.length - 1;
+          const isLastPass = pass === totalPasses - 1;
+          if (!state.retryableStatuses.has(response.status) || (isLastTarget && isLastPass)) {
+            return upstream;
+          }
 
-        if (lastResponse) {
-          try { lastResponse.body?.cancel?.(); } catch {}
+          if (lastResponse) {
+            try { lastResponse.body?.cancel?.(); } catch {}
+          }
+          lastResponse = response;
+        } catch (error) {
+          lastError = error;
+          const isLastTarget = index === state.retryTargets.length - 1;
+          const isLastPass = pass === totalPasses - 1;
+          if (isLastTarget && isLastPass) throw error;
         }
-        lastResponse = response;
-      } catch (error) {
-        lastError = error;
-        if (index === state.retryTargets.length - 1) throw error;
       }
     }
 
@@ -1831,6 +2378,8 @@ const Proxy = {
     const enableH3 = currentConfig.enableH3 === true;
     const peakDowngrade = currentConfig.peakDowngrade !== false;
     const protocolFallback = currentConfig.protocolFallback !== false; 
+    const upstreamTimeoutMs = clampIntegerConfig(currentConfig.upstreamTimeoutMs, Config.Defaults.UpstreamTimeoutMs, 0, 180000);
+    const upstreamRetryAttempts = clampIntegerConfig(currentConfig.upstreamRetryAttempts, Config.Defaults.UpstreamRetryAttempts, 0, 3);
     const utc8Hour = (new Date().getUTCHours() + 8) % 24;
     const isPeakHour = utc8Hour >= 20 && utc8Hour < 24;
     const forceH1 = (peakDowngrade && isPeakHour) || (!enableH2 && !enableH3);
@@ -1890,6 +2439,7 @@ const Proxy = {
       }
 
       // [预热修复] 3. 当命中预热探测时，真正命令 Cloudflare 边缘节点进行缓存
+      /** @type {WorkerRequestInit} */
       const fetchOptions = { 
         method: effectiveMethod, 
         headers, 
@@ -1921,6 +2471,8 @@ const Proxy = {
         retryableStatuses,
         protocolFallback,
         preparedBodyMode,
+        upstreamTimeoutMs,
+        maxExtraAttempts: preparedBodyMode === "stream" ? 0 : upstreamRetryAttempts,
         isRetry: false
       });
       response = upstream.response;
@@ -2033,11 +2585,13 @@ const Proxy = {
 
                 const prefetchRange = `bytes=${prefetchStart}-${prefetchEnd}`;
                 const prefetchOptions = await buildFetchOptions(finalUrl, { method: "GET" });
-                prefetchOptions.headers.set("Range", prefetchRange);
+                const prefetchHeaders = new Headers(prefetchOptions.headers);
+                prefetchOptions.headers = prefetchHeaders;
+                prefetchHeaders.set("Range", prefetchRange);
                 // 去掉可能影响缓存/命中的条件请求头
-                prefetchOptions.headers.delete("If-Modified-Since");
-                prefetchOptions.headers.delete("If-None-Match");
-                prefetchOptions.headers.set("X-Prewarm-Prefetch", "1");
+                prefetchHeaders.delete("If-Modified-Since");
+                prefetchHeaders.delete("If-None-Match");
+                prefetchHeaders.set("X-Prewarm-Prefetch", "1");
 
                 const prefetchRes = await fetch(finalUrl.toString(), prefetchOptions);
                 try {
@@ -2054,13 +2608,17 @@ const Proxy = {
 
       const finalStatus = directRedirectStatus || response.status;
       const finalStatusText = directRedirectStatus ? "Temporary Redirect" : response.statusText;
-      if (!directRedirectStatus && response.status === 101 && response.webSocket) {
-        return new Response(null, {
+      /** @type {UpgradeableResponse} */
+      const upgradeResponse = response;
+      if (!directRedirectStatus && response.status === 101 && upgradeResponse.webSocket) {
+        /** @type {ResponseInit & { webSocket?: unknown }} */
+        const upgradeInit = {
           status: 101,
           statusText: response.statusText,
           headers: modifiedHeaders,
-          webSocket: response.webSocket
-        });
+          webSocket: upgradeResponse.webSocket
+        };
+        return new Response(null, upgradeInit);
       }
       return new Response(directRedirectStatus ? null : response.body, {
         status: finalStatus,
@@ -2183,23 +2741,52 @@ const Logger = {
   async flush(env) {
     const db = Database.getDB(env);
     if (!db || GLOBALS.LogQueue.length === 0) return;
-    const batchLogs = GLOBALS.LogQueue.splice(0, GLOBALS.LogQueue.length);
-    const chunkSize = Math.max(1, parseInt(Config.Defaults.LogBatchChunkSize, 10) || 50);
+    const configuredChunkSize = Number(GLOBALS.ConfigCache?.data?.logBatchChunkSize);
+    const configuredRetryCount = Number(GLOBALS.ConfigCache?.data?.logBatchRetryCount);
+    const configuredRetryBackoffMs = Number(GLOBALS.ConfigCache?.data?.logBatchRetryBackoffMs);
+    const chunkSize = clampIntegerConfig(configuredChunkSize, Config.Defaults.LogBatchChunkSize, 1, 500);
+    const maxRetryCount = clampIntegerConfig(configuredRetryCount, Config.Defaults.LogBatchRetryCount, 0, 5);
+    const retryBackoffMs = clampIntegerConfig(configuredRetryBackoffMs, Config.Defaults.LogBatchRetryBackoffMs, 0, 5000);
     let writtenCount = 0;
+    let retryCount = 0;
+    let activeBatchSize = 0;
+    let activeBatchWrittenCount = 0;
     try {
-      for (let index = 0; index < batchLogs.length; index += chunkSize) {
-        const chunk = batchLogs.slice(index, index + chunkSize);
-        const statements = chunk.map(item => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, user_agent, referer, category, error_detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.userAgent, item.referer, item.category, item.errorDetail, item.createdAt));
-        await db.batch(statements);
-        writtenCount += chunk.length;
+      // 同一次 flush 持续排空期间新增的日志，避免首批写完后尾批滞留到下一次请求。
+      while (GLOBALS.LogQueue.length > 0) {
+        const batchLogs = GLOBALS.LogQueue.splice(0, GLOBALS.LogQueue.length);
+        activeBatchSize = batchLogs.length;
+        activeBatchWrittenCount = 0;
+        for (let index = 0; index < batchLogs.length; index += chunkSize) {
+          const chunk = batchLogs.slice(index, index + chunkSize);
+          const statements = chunk.map(item => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, user_agent, referer, category, error_detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.userAgent, item.referer, item.category, item.errorDetail, item.createdAt));
+          let attempt = 0;
+          while (true) {
+            try {
+              await db.batch(statements);
+              break;
+            } catch (error) {
+              if (attempt >= maxRetryCount) throw error;
+              attempt += 1;
+              retryCount += 1;
+              if (retryBackoffMs > 0) await sleepMs(retryBackoffMs * attempt);
+            }
+          }
+          writtenCount += chunk.length;
+          activeBatchWrittenCount += chunk.length;
+        }
       }
       await Database.patchOpsStatus(env, {
         log: {
           lastFlushAt: new Date().toISOString(),
           lastFlushCount: writtenCount,
           lastFlushStatus: "success",
+          lastFlushRetryCount: retryCount,
           queueLengthAfterFlush: GLOBALS.LogQueue.length,
-          lastFlushError: null
+          lastFlushError: null,
+          lastFlushErrorAt: null,
+          lastDroppedBatchSize: 0,
+          lastFlushWrittenBeforeError: 0
         }
       });
     } catch (e) {
@@ -2209,7 +2796,8 @@ const Logger = {
           lastFlushErrorAt: new Date().toISOString(),
           lastFlushStatus: "failed",
           lastFlushError: e?.message || String(e),
-          lastDroppedBatchSize: Math.max(0, batchLogs.length - writtenCount),
+          lastFlushRetryCount: retryCount,
+          lastDroppedBatchSize: Math.max(0, activeBatchSize - activeBatchWrittenCount),
           lastFlushWrittenBeforeError: writtenCount,
           queueLengthAfterFlush: GLOBALS.LogQueue.length
         }
@@ -2227,7 +2815,7 @@ const UI_HTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <title>Emby Proxy V18.0 - SaaS Dashboard</title>
+  <title>Emby Proxy V18.1 - SaaS Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/lucide@latest"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -2255,7 +2843,7 @@ const UI_HTML = `<!DOCTYPE html>
       <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-500 to-indigo-600 flex items-center justify-center text-white font-bold text-lg flex-shrink-0">E</div>
       <h1 class="ml-3 font-semibold tracking-tight text-lg flex items-center gap-2">
         Emby Proxy 
-        <span class="px-1.5 py-0.5 rounded bg-brand-100 text-brand-600 dark:bg-brand-500/20 dark:text-brand-400 text-[10px] font-bold mt-0.5">V18.0</span>
+        <span class="px-1.5 py-0.5 rounded bg-brand-100 text-brand-600 dark:bg-brand-500/20 dark:text-brand-400 text-[10px] font-bold mt-0.5">V18.1</span>
       </h1>
     </div>
     <nav class="flex-1 overflow-y-auto py-4 px-3 space-y-1">
@@ -2325,6 +2913,7 @@ const UI_HTML = `<!DOCTYPE html>
             <button onclick="App.forceHealthCheck(event)" class="w-full sm:w-auto px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm font-medium hover:bg-emerald-700 flex items-center justify-center transition"><i data-lucide="activity" class="w-4 h-4 mr-2"></i> 全局 Ping</button>
             <input type="file" id="import-nodes-file" class="hidden" accept=".json" onchange="App.importNodes(event)">
             <input type="file" id="import-full-file" class="hidden" accept=".json" onchange="App.importFull(event)">
+            <input type="file" id="import-settings-file" class="hidden" accept=".json" onchange="App.importSettings(event)">
           </div>
         </div>
         <div id="nodes-grid" class="grid gap-6 grid-cols-[repeat(auto-fill,minmax(340px,1fr))]"></div>
@@ -2361,18 +2950,26 @@ const UI_HTML = `<!DOCTYPE html>
 
       <div id="view-settings" class="view-section max-w-4xl mx-auto space-y-6">
         <div class="glass-card rounded-3xl p-6 flex flex-col md:flex-row gap-6">
-           <div class="w-full md:w-48 flex flex-row md:flex-col gap-2 md:gap-0 md:space-y-1 border-b md:border-b-0 md:border-r border-slate-200 dark:border-slate-800 pb-4 md:pb-0 pr-0 md:pr-4 overflow-x-auto whitespace-nowrap">
-              <button class="set-tab flex-shrink-0 text-left px-3 py-2 rounded-lg bg-brand-50 text-brand-600 dark:bg-brand-500/10 dark:text-brand-400 text-sm font-medium" onclick="App.switchSetTab(event, 'ui')">系统 UI</button>
-              <button class="set-tab flex-shrink-0 text-left px-3 py-2 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 text-sm font-medium" onclick="App.switchSetTab(event, 'proxy')">代理与网络</button>
-              <button class="set-tab flex-shrink-0 text-left px-3 py-2 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 text-sm font-medium" onclick="App.switchSetTab(event, 'security')">缓存与安全</button>
-              <button class="set-tab flex-shrink-0 text-left px-3 py-2 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 text-sm font-medium" onclick="App.switchSetTab(event, 'logs')">日志与监控</button>
-              <button class="set-tab flex-shrink-0 text-left px-3 py-2 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 text-sm font-medium" onclick="App.switchSetTab(event, 'account')">账号与备份</button>
+           <div class="w-full md:w-48 flex flex-row md:flex-col gap-2 md:gap-0 md:space-y-1 border-b md:border-b-0 md:border-r border-slate-200 dark:border-slate-800 pb-4 md:pb-0 pr-0 md:pr-4 overflow-x-auto whitespace-nowrap md:whitespace-normal">
+              <button class="set-tab flex-shrink-0 text-left px-3 py-2 md:py-3 rounded-lg bg-brand-50 text-brand-600 dark:bg-brand-500/10 dark:text-brand-400 text-sm font-medium" onclick="App.switchSetTab(event, 'ui')"><span class="block">系统 UI</span><span class="hidden md:block mt-1 text-[11px] leading-4 font-normal opacity-80">仪表盘刷新与后台体验</span></button>
+              <button class="set-tab flex-shrink-0 text-left px-3 py-2 md:py-3 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 text-sm font-medium" onclick="App.switchSetTab(event, 'proxy')"><span class="block">代理与网络</span><span class="hidden md:block mt-1 text-[11px] leading-4 font-normal opacity-80">播放稳定性与链路策略</span></button>
+              <button class="set-tab flex-shrink-0 text-left px-3 py-2 md:py-3 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 text-sm font-medium" onclick="App.switchSetTab(event, 'security')"><span class="block">缓存与安全</span><span class="hidden md:block mt-1 text-[11px] leading-4 font-normal opacity-80">访问控制、限速与跨域</span></button>
+              <button class="set-tab flex-shrink-0 text-left px-3 py-2 md:py-3 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 text-sm font-medium" onclick="App.switchSetTab(event, 'logs')"><span class="block">日志与监控</span><span class="hidden md:block mt-1 text-[11px] leading-4 font-normal opacity-80">日志写入、告警与日报</span></button>
+              <button class="set-tab flex-shrink-0 text-left px-3 py-2 md:py-3 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 text-sm font-medium" onclick="App.switchSetTab(event, 'account')"><span class="block">账号与备份</span><span class="hidden md:block mt-1 text-[11px] leading-4 font-normal opacity-80">Cloudflare 联动与恢复保底</span></button>
            </div>
            <div class="flex-1" id="settings-forms">
               
               <div id="set-ui" class="block">
                 <h3 class="font-bold mb-4 text-slate-900 dark:text-white">UI 外观偏好</h3>
-                <p class="text-sm text-slate-500 mb-4">外观偏好直接保存在本地浏览器缓存中。点击右上角太阳/月亮图标即可切换深浅模式。</p>
+                <p class="text-sm text-slate-500 mb-4">深浅模式仍然只保存在当前浏览器；下面这组 Dashboard 刷新策略则会保存到 Worker 全局配置，所有管理员界面共享。</p>
+                <div class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-4 mb-4">
+                  <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-dashboard-auto-refresh" class="mr-2 w-4 h-4 rounded"> 开启 Dashboard 自动刷新</label>
+                  <p class="text-xs text-slate-500 mb-3 ml-6">启用后，仪表盘会按设定周期自动重拉“统计面板 + 运行状态”。适合值班看板；如果你的 cron 很少跑，建议把周期设得保守一些。</p>
+                  <label class="block text-sm text-slate-500 mb-1 ml-6">自动刷新周期（秒）</label>
+                  <input type="number" min="5" step="5" id="cfg-dashboard-auto-refresh-seconds" class="w-[calc(100%-1.5rem)] md:w-1/2 p-2 ml-6 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="30">
+                  <p class="text-xs text-slate-500 ml-6">推荐 30 到 60 秒；过短会放大控制台请求频率。</p>
+                </div>
+                <button onclick="App.saveSettings('ui')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存 UI 策略</button>
               </div>
               
               <div id="set-proxy" class="hidden">
@@ -2390,7 +2987,10 @@ const UI_HTML = `<!DOCTYPE html>
                 <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-enable-prewarm" class="mr-2 w-4 h-4 rounded" checked> 开启视频起播预热拦截</label>
                 <p class="text-xs text-slate-500 mb-3 ml-6">精准拦截播放器起播时的探测请求，利用 Cloudflare 边缘节点进行微型缓存，极大提升起播速度并保护源站。</p>
                 <label class="block text-sm text-slate-500 mb-1 ml-6">预热微缓存时长 (秒)</label>
-                <input type="number" id="cfg-prewarm-ttl" class="w-full md:w-1/2 p-2 ml-6 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" value="180">
+                <input type="number" id="cfg-prewarm-ttl" class="w-[calc(100%-1.5rem)] md:w-1/2 p-2 ml-6 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" value="180">
+                <label class="block text-sm text-slate-500 mb-1 ml-6">预热旁路预取字节数</label>
+                <input type="number" min="0" step="65536" id="cfg-prewarm-prefetch-bytes" class="w-[calc(100%-1.5rem)] md:w-1/2 p-2 ml-6 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="4194304">
+                <p class="text-xs text-slate-500 mb-4 ml-6">控制命中起播探测后，后台额外预取多少后续 Range 数据。填 0 表示仅做首个探测缓存，不做旁路预取。</p>
                 <h3 class="font-bold mb-2 mt-6 text-slate-900 dark:text-white">跳转代理开关</h3>
                 <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-source-same-origin-proxy" class="mr-2 w-4 h-4 rounded" checked> 默认开启：源站和同源跳转代理</label>
                 <p class="text-xs text-slate-500 mb-3">开启时既包含源站 2xx 的 Worker 透明拉流，也包含同源 30x 的继续代理跳转；仅当节点被显式标记为直连时，源站 2xx 才会改为直连源站。关闭后，同源 30x 直接下发 Location。</p>
@@ -2409,11 +3009,23 @@ const UI_HTML = `<!DOCTYPE html>
                 <h3 class="font-bold mb-2 mt-6 text-slate-900 dark:text-white">健康检查探测</h3>
                 <label class="block text-sm text-slate-500 mb-1">Ping 超时时间 (毫秒)</label>
                 <input type="number" id="cfg-ping-timeout" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" value="5000">
-                <button onclick="App.saveSettings('proxy')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存代理网络</button>
-              </div>
 
+                <h3 class="font-bold mb-2 mt-6 text-slate-900 dark:text-white">上游请求防挂死保护</h3>
+                <label class="block text-sm text-slate-500 mb-1">上游握手超时（毫秒，0 为关闭）</label>
+                <input type="number" min="0" step="500" id="cfg-upstream-timeout-ms" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" value="0">
+                <label class="block text-sm text-slate-500 mb-1">额外重试轮次（仅 GET / HEAD 等安全请求）</label>
+                <input type="number" min="0" step="1" id="cfg-upstream-retry-attempts" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="0">
+                <p class="text-xs text-slate-500 mb-4">每一轮都会重新遍历节点目标地址与可重试状态码。带流式请求体的非幂等请求不会启用额外重试，避免副作用放大。</p>
+
+                <div class="flex flex-wrap gap-2">
+                  <button onclick="App.applyRecommendedSettings('proxy')" class="px-4 py-2 border border-emerald-200 text-emerald-600 rounded-xl text-sm transition hover:bg-emerald-50 dark:border-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/20">恢复推荐值</button>
+                  <button onclick="App.saveSettings('proxy')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存代理网络</button>
+                </div>
+              </div>
+              
               <div id="set-security" class="hidden">
                 <h3 class="font-bold mb-4 text-slate-900 dark:text-white">安全防火墙与缓存引擎</h3>
+                <p class="text-sm text-slate-500 mb-4">这一栏主要决定“谁可以访问”和“图片等静态资源缓存多久”。如果你不确定某条限制会不会误伤正常用户，建议先留空或保持默认值。</p>
                 <label class="block text-sm text-slate-500 mb-1">国家/地区白名单 (留空不限制，如: CN,HK)</label>
                 <p class="text-xs text-slate-500 mb-2">仅允许这些国家/地区的访客源 IP 访问；识别依据是 Cloudflare 看到的用户公网 IP 所属地区，不是你的源站位置。</p>
                 <input type="text" id="cfg-geo-allow" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" placeholder="例如: CN,HK">
@@ -2443,13 +3055,46 @@ const UI_HTML = `<!DOCTYPE html>
               
               <div id="set-logs" class="hidden">
                 <h3 class="font-bold mb-4 text-slate-900 dark:text-white">监控与日志配置</h3>
+                <p class="text-sm text-slate-500 mb-4">这一栏决定日志如何写入、多久保留，以及 Telegram 如何通知你。小白通常只需要关心“日志保存天数”和“测试通知能不能收到”。</p>
                 <label class="block text-sm text-slate-500 mb-1">日志保存天数 (超过将由系统自动清理)</label>
                 <input type="number" id="cfg-log-days" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" value="7">
                 <label class="block text-sm text-slate-500 mb-1">日志写入延迟（分钟）</label>
                 <input type="number" min="0" step="0.5" id="cfg-log-delay" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" value="20">
                 <label class="block text-sm text-slate-500 mb-1">日志提前写入条数阈值</label>
                 <input type="number" min="1" step="1" id="cfg-log-flush-count" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="50">
-                <p class="text-xs text-slate-500 mb-4">内存日志队列满足“达到延迟分钟”或“累计达到条数阈值”任一条件即写入 D1。默认 20 分钟 / 50 条；设延迟为 0 表示尽快写入。</p>
+                <label class="block text-sm text-slate-500 mb-1">D1 单批写入切片大小</label>
+                <input type="number" min="1" step="1" id="cfg-log-batch-size" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" value="50">
+                <label class="block text-sm text-slate-500 mb-1">D1 失败重试次数</label>
+                <input type="number" min="0" step="1" id="cfg-log-retry-count" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" value="2">
+                <label class="block text-sm text-slate-500 mb-1">D1 重试退避（毫秒）</label>
+                <input type="number" min="0" step="25" id="cfg-log-retry-backoff" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" value="75">
+                <label class="block text-sm text-slate-500 mb-1">定时任务租约时长（毫秒）</label>
+                <input type="number" min="30000" step="1000" id="cfg-scheduled-lease-ms" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="300000">
+                <p class="text-xs text-slate-500 mb-4">内存日志队列满足“达到延迟分钟”或“累计达到条数阈值”任一条件即写入 D1。这里还可以调优单批切片、失败重试与定时任务租约，系统会自动钳制到安全边界。</p>
+
+                <div class="grid gap-3 md:grid-cols-2 mb-4">
+                  <div class="rounded-2xl border border-emerald-200/80 bg-emerald-50/80 dark:border-emerald-900/40 dark:bg-emerald-950/30 p-4">
+                    <div class="text-sm font-semibold text-emerald-700 dark:text-emerald-300 mb-2">推荐生产值</div>
+                    <div class="text-xs leading-6 text-emerald-800/90 dark:text-emerald-100/80">
+                      日志保存天数：7 到 14 天<br>
+                      写入延迟：5 到 20 分钟<br>
+                      提前写入阈值：50 到 200 条<br>
+                      单批切片：50 到 100 条<br>
+                      重试次数：1 到 2 次，退避 75 到 200 毫秒<br>
+                      定时任务租约：300000 到 600000 毫秒
+                    </div>
+                  </div>
+                  <div class="rounded-2xl border border-amber-200/80 bg-amber-50/80 dark:border-amber-900/40 dark:bg-amber-950/30 p-4">
+                    <div class="text-sm font-semibold text-amber-700 dark:text-amber-300 mb-2">异常调优指引</div>
+                    <div class="text-xs leading-6 text-amber-900/85 dark:text-amber-100/80">
+                      D1 写入失败增多：先提高重试次数或退避，再观察 lastFlushRetryCount。<br>
+                      队列长期堆积：降低写入延迟或下调提前写入阈值。<br>
+                      单次刷盘过慢：降低单批切片大小。<br>
+                      定时任务频繁重入：适当增大租约时长，但不要超过实际任务耗时太多。<br>
+                      只想快速止血：优先保留默认值，再逐项小步调整。
+                    </div>
+                  </div>
+                </div>
                 
                 <h3 class="font-bold mb-4 mt-6 text-slate-900 dark:text-white border-t border-slate-200 dark:border-slate-800 pt-4">Telegram 每日报表与告警机器人</h3>
                 
@@ -2458,8 +3103,19 @@ const UI_HTML = `<!DOCTYPE html>
                 
                 <label class="block text-sm text-slate-500 mb-1">Telegram Chat ID (接收人ID)</label>
                 <input type="text" id="cfg-tg-chatid" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" placeholder="如: 123456789">
+
+                <h3 class="font-bold mb-2 mt-6 text-slate-900 dark:text-white">Telegram 异常告警阈值</h3>
+                <label class="block text-sm text-slate-500 mb-1">日志丢弃批次阈值（0 为关闭）</label>
+                <input type="number" min="0" step="1" id="cfg-tg-alert-drop-threshold" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" value="0">
+                <label class="block text-sm text-slate-500 mb-1">D1 写入重试阈值（0 为关闭）</label>
+                <input type="number" min="0" step="1" id="cfg-tg-alert-retry-threshold" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" value="0">
+                <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-tg-alert-scheduled-failure" class="mr-2 w-4 h-4 rounded"> 定时任务进入 failed / partial_failure 时告警</label>
+                <label class="block text-sm text-slate-500 mb-1">同类告警冷却时间（分钟）</label>
+                <input type="number" min="1" step="1" id="cfg-tg-alert-cooldown-minutes" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="30">
+                <p class="text-xs text-slate-500 mb-4">告警由定时任务在后台判断并发送。建议先完成 Bot Token 与 Chat ID 测试，再启用阈值。</p>
                 
                 <div class="flex flex-wrap gap-2">
+                    <button onclick="App.applyRecommendedSettings('logs')" class="px-4 py-2 border border-emerald-200 text-emerald-600 rounded-xl text-sm transition hover:bg-emerald-50 dark:border-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/20">恢复推荐值</button>
                     <button onclick="App.saveSettings('logs')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存监控设置</button>
                     <button onclick="App.testTelegram()" class="px-4 py-2 border border-blue-200 text-blue-600 rounded-xl text-sm transition hover:bg-blue-50 dark:border-blue-900/30 dark:text-blue-400 dark:hover:bg-blue-900/20 flex items-center justify-center"><i data-lucide="send" class="w-4 h-4 mr-1"></i> 发送测试通知</button>
                     <button onclick="App.sendDailyReport()" class="px-4 py-2 border border-emerald-200 text-emerald-600 rounded-xl text-sm transition hover:bg-emerald-50 dark:border-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/20 flex items-center justify-center"><i data-lucide="file-bar-chart" class="w-4 h-4 mr-1"></i> 手动发送日报</button>
@@ -2468,10 +3124,12 @@ const UI_HTML = `<!DOCTYPE html>
               
               <div id="set-account" class="hidden">
                 <h3 class="font-bold mb-4 text-slate-900 dark:text-white">系统账号与安全</h3>
+                <p class="text-sm text-slate-500 mb-4">这一栏主要管理后台登录有效期、Cloudflare 联动参数，以及备份/导入/快照恢复。准备做大改动前，建议先导出一份完整备份。</p>
                 <label class="block text-sm text-slate-500 mb-1">免密登录有效天数 (管理员 JWT)</label>
                 <input type="number" id="cfg-jwt-days" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" value="30">
                 
                 <h3 class="font-bold mb-4 border-t border-slate-200 dark:border-slate-800 pt-4 text-slate-900 dark:text-white">Cloudflare 联动</h3>
+                <p class="text-sm text-slate-500 mb-4">这些参数主要用于仪表盘增强统计和一键清理缓存。没填时基础代理仍可用，只是部分联动能力会缺失。</p>
                 <label class="block text-sm text-slate-500 mb-1">Cloudflare 账号 ID</label>
                 <input type="text" id="cfg-cf-account" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white">
                 <label class="block text-sm text-slate-500 mb-1">Cloudflare Zone ID (区域ID，用于面板数据与清理缓存)</label>
@@ -2485,10 +3143,24 @@ const UI_HTML = `<!DOCTYPE html>
 
                 <h3 class="font-bold mb-4 border-t border-slate-200 dark:border-slate-800 pt-4 text-slate-900 dark:text-white">备份与恢复 (全量 KV 数据)</h3>
                 <p class="text-sm text-slate-500 mb-4">导出或导入系统内的所有节点以及全局设置数据（单文件）。</p>
-                <div class="flex gap-4">
+                <div class="flex gap-4 flex-wrap">
                   <button onclick="document.getElementById('import-full-file').click()" class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm transition font-medium"><i data-lucide="upload" class="w-4 h-4 inline mr-1"></i> 导入完整备份</button>
                   <button onclick="App.exportFull()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition font-medium"><i data-lucide="download" class="w-4 h-4 inline mr-1"></i> 导出完整备份</button>
                 </div>
+
+                <h3 class="font-bold mb-4 border-t border-slate-200 dark:border-slate-800 pt-4 text-slate-900 dark:text-white">全局设置专用迁移</h3>
+                <p class="text-sm text-slate-500 mb-4">只导出 / 导入 settings，不包含节点清单。适合多环境同步代理、监控、账号与 Dashboard 策略。</p>
+                <div class="flex gap-4 flex-wrap mb-6">
+                  <button onclick="document.getElementById('import-settings-file').click()" class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm transition font-medium"><i data-lucide="upload-cloud" class="w-4 h-4 inline mr-1"></i> 导入全局设置</button>
+                  <button onclick="App.exportSettings()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition font-medium"><i data-lucide="download-cloud" class="w-4 h-4 inline mr-1"></i> 导出全局设置</button>
+                </div>
+
+                <h3 class="font-bold mb-4 border-t border-slate-200 dark:border-slate-800 pt-4 text-slate-900 dark:text-white">设置变更快照</h3>
+                <p class="text-sm text-slate-500 mb-3">系统会保留最近的全局设置变更快照。恢复快照时，会先把当前配置再记一份快照，确保你始终有回退余地。</p>
+                <div class="flex gap-2 mb-4">
+                  <button onclick="App.loadConfigSnapshots()" class="px-4 py-2 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 rounded-xl text-sm transition hover:bg-slate-50 dark:hover:bg-slate-800"><i data-lucide="refresh-cw" class="w-4 h-4 inline mr-1"></i> 刷新快照</button>
+                </div>
+                <div id="cfg-snapshots-list" class="space-y-3"></div>
               </div>
               
            </div>
@@ -2528,6 +3200,169 @@ const UI_HTML = `<!DOCTYPE html>
   </dialog>
 
   <script>
+    const UI_DEFAULTS = {
+      dashboardAutoRefreshEnabled: false,
+      dashboardAutoRefreshSeconds: 30,
+      prewarmCacheTtl: 180,
+      prewarmPrefetchBytes: 4194304,
+      pingTimeout: 5000,
+      upstreamTimeoutMs: 0,
+      upstreamRetryAttempts: 0,
+      logRetentionDays: 7,
+      logWriteDelayMinutes: 20,
+      logFlushCountThreshold: 50,
+      logBatchChunkSize: 50,
+      logBatchRetryCount: 2,
+      logBatchRetryBackoffMs: 75,
+      scheduledLeaseMs: 300000,
+      tgAlertDroppedBatchThreshold: 0,
+      tgAlertFlushRetryThreshold: 0,
+      tgAlertCooldownMinutes: 30,
+      tgAlertOnScheduledFailure: false
+    };
+
+    const CONFIG_PREVIEW_SANITIZE_RULES = ${JSON.stringify(CONFIG_SANITIZE_RULES)};
+
+    const CONFIG_FORM_BINDINGS = {
+      ui: [
+        { key: 'dashboardAutoRefreshEnabled', id: 'cfg-dashboard-auto-refresh', kind: 'checkbox', checkboxMode: 'strictTrue' },
+        { key: 'dashboardAutoRefreshSeconds', id: 'cfg-dashboard-auto-refresh-seconds', kind: 'int-finite', defaultValue: UI_DEFAULTS.dashboardAutoRefreshSeconds }
+      ],
+      proxy: [
+        { key: 'enableH2', id: 'cfg-enable-h2', kind: 'checkbox', checkboxMode: 'truthy' },
+        { key: 'enableH3', id: 'cfg-enable-h3', kind: 'checkbox', checkboxMode: 'truthy' },
+        { key: 'peakDowngrade', id: 'cfg-peak-downgrade', kind: 'checkbox', checkboxMode: 'defaultTrue' },
+        { key: 'protocolFallback', id: 'cfg-protocol-fallback', kind: 'checkbox', checkboxMode: 'defaultTrue' },
+        { key: 'enablePrewarm', id: 'cfg-enable-prewarm', kind: 'checkbox', checkboxMode: 'defaultTrue' },
+        { key: 'prewarmCacheTtl', id: 'cfg-prewarm-ttl', kind: 'int-or-default', loadMode: 'number-finite', defaultValue: UI_DEFAULTS.prewarmCacheTtl },
+        { key: 'prewarmPrefetchBytes', id: 'cfg-prewarm-prefetch-bytes', kind: 'int-finite', defaultValue: UI_DEFAULTS.prewarmPrefetchBytes },
+        { key: 'sourceSameOriginProxy', id: 'cfg-source-same-origin-proxy', kind: 'checkbox', checkboxMode: 'defaultTrue' },
+        { key: 'forceExternalProxy', id: 'cfg-force-external-proxy', kind: 'checkbox', checkboxMode: 'defaultTrue' },
+        { key: 'wangpandirect', id: 'cfg-wangpandirect', kind: 'trim', loadMode: 'or-default', defaultValue: '${DEFAULT_WANGPAN_DIRECT_TEXT}' },
+        { key: 'pingTimeout', id: 'cfg-ping-timeout', kind: 'int-or-default', loadMode: 'number-finite', defaultValue: UI_DEFAULTS.pingTimeout },
+        { key: 'upstreamTimeoutMs', id: 'cfg-upstream-timeout-ms', kind: 'int-finite', defaultValue: UI_DEFAULTS.upstreamTimeoutMs },
+        { key: 'upstreamRetryAttempts', id: 'cfg-upstream-retry-attempts', kind: 'int-finite', defaultValue: UI_DEFAULTS.upstreamRetryAttempts }
+      ],
+      security: [
+        { key: 'geoAllowlist', id: 'cfg-geo-allow', kind: 'text', defaultValue: '' },
+        { key: 'geoBlocklist', id: 'cfg-geo-block', kind: 'text', defaultValue: '' },
+        { key: 'ipBlacklist', id: 'cfg-ip-black', kind: 'text', defaultValue: '' },
+        { key: 'rateLimitRpm', id: 'cfg-rate-limit', kind: 'int-or-default', loadMode: 'or-default', defaultValue: 0, loadDefaultValue: '' },
+        { key: 'cacheTtlImages', id: 'cfg-cache-ttl', kind: 'int-or-default', defaultValue: 30 },
+        { key: 'corsOrigins', id: 'cfg-cors', kind: 'text', defaultValue: '' }
+      ],
+      logs: [
+        { key: 'logRetentionDays', id: 'cfg-log-days', kind: 'int-finite', defaultValue: UI_DEFAULTS.logRetentionDays },
+        { key: 'logWriteDelayMinutes', id: 'cfg-log-delay', kind: 'float-finite', defaultValue: UI_DEFAULTS.logWriteDelayMinutes },
+        { key: 'logFlushCountThreshold', id: 'cfg-log-flush-count', kind: 'int-finite', defaultValue: UI_DEFAULTS.logFlushCountThreshold },
+        { key: 'logBatchChunkSize', id: 'cfg-log-batch-size', kind: 'int-finite', defaultValue: UI_DEFAULTS.logBatchChunkSize },
+        { key: 'logBatchRetryCount', id: 'cfg-log-retry-count', kind: 'int-finite', defaultValue: UI_DEFAULTS.logBatchRetryCount },
+        { key: 'logBatchRetryBackoffMs', id: 'cfg-log-retry-backoff', kind: 'int-finite', defaultValue: UI_DEFAULTS.logBatchRetryBackoffMs },
+        { key: 'scheduledLeaseMs', id: 'cfg-scheduled-lease-ms', kind: 'int-finite', defaultValue: UI_DEFAULTS.scheduledLeaseMs },
+        { key: 'tgBotToken', id: 'cfg-tg-token', kind: 'trim', defaultValue: '' },
+        { key: 'tgChatId', id: 'cfg-tg-chatid', kind: 'trim', defaultValue: '' },
+        { key: 'tgAlertDroppedBatchThreshold', id: 'cfg-tg-alert-drop-threshold', kind: 'int-finite', defaultValue: UI_DEFAULTS.tgAlertDroppedBatchThreshold },
+        { key: 'tgAlertFlushRetryThreshold', id: 'cfg-tg-alert-retry-threshold', kind: 'int-finite', defaultValue: UI_DEFAULTS.tgAlertFlushRetryThreshold },
+        { key: 'tgAlertOnScheduledFailure', id: 'cfg-tg-alert-scheduled-failure', kind: 'checkbox', checkboxMode: 'strictTrue' },
+        { key: 'tgAlertCooldownMinutes', id: 'cfg-tg-alert-cooldown-minutes', kind: 'int-finite', defaultValue: UI_DEFAULTS.tgAlertCooldownMinutes }
+      ],
+      account: [
+        { key: 'jwtExpiryDays', id: 'cfg-jwt-days', kind: 'int-or-default', defaultValue: 30 },
+        { key: 'cfAccountId', id: 'cfg-cf-account', kind: 'trim', defaultValue: '' },
+        { key: 'cfZoneId', id: 'cfg-cf-zone', kind: 'trim', defaultValue: '' },
+        { key: 'cfApiToken', id: 'cfg-cf-token', kind: 'trim', defaultValue: '' }
+      ]
+    };
+
+    const CONFIG_SECTION_FIELDS = {
+      ui: CONFIG_FORM_BINDINGS.ui.map(item => item.key),
+      proxy: [...CONFIG_FORM_BINDINGS.proxy.map(item => item.key), 'sourceDirectNodes'],
+      security: CONFIG_FORM_BINDINGS.security.map(item => item.key),
+      logs: CONFIG_FORM_BINDINGS.logs.map(item => item.key),
+      account: CONFIG_FORM_BINDINGS.account.map(item => item.key)
+    };
+
+    const CONFIG_FIELD_LABELS = {
+      dashboardAutoRefreshEnabled: 'Dashboard 自动刷新',
+      dashboardAutoRefreshSeconds: 'Dashboard 自动刷新周期（秒）',
+      enableH2: 'HTTP/2',
+      enableH3: 'HTTP/3',
+      peakDowngrade: '晚高峰降级兜底',
+      protocolFallback: '协议回退与 403 重试',
+      enablePrewarm: '起播预热',
+      prewarmCacheTtl: '预热微缓存时长',
+      prewarmPrefetchBytes: '预热旁路预取字节数',
+      sourceSameOriginProxy: '源站同源代理',
+      forceExternalProxy: '外链强制反代',
+      wangpandirect: 'wangpandirect 关键词',
+      sourceDirectNodes: '源站直连节点名单',
+      pingTimeout: 'Ping 超时',
+      upstreamTimeoutMs: '上游握手超时',
+      upstreamRetryAttempts: '额外重试轮次',
+      geoAllowlist: '国家/地区白名单',
+      geoBlocklist: '国家/地区黑名单',
+      ipBlacklist: 'IP 黑名单',
+      rateLimitRpm: '单 IP 限速',
+      cacheTtlImages: '图片缓存时长',
+      corsOrigins: 'CORS 白名单',
+      logRetentionDays: '日志保存天数',
+      logWriteDelayMinutes: '日志写入延迟',
+      logFlushCountThreshold: '日志提前写入阈值',
+      logBatchChunkSize: 'D1 切片大小',
+      logBatchRetryCount: 'D1 重试次数',
+      logBatchRetryBackoffMs: 'D1 退避毫秒',
+      scheduledLeaseMs: '定时任务租约时长',
+      tgBotToken: 'Telegram Bot Token',
+      tgChatId: 'Telegram Chat ID',
+      tgAlertDroppedBatchThreshold: '日志丢弃批次阈值',
+      tgAlertFlushRetryThreshold: '日志写入重试阈值',
+      tgAlertOnScheduledFailure: '定时任务失败告警',
+      tgAlertCooldownMinutes: '告警冷却时间',
+      jwtExpiryDays: 'JWT 有效天数',
+      cfAccountId: 'Cloudflare 账号 ID',
+      cfZoneId: 'Cloudflare Zone ID',
+      cfApiToken: 'Cloudflare API 令牌'
+    };
+
+    const CONFIG_SENSITIVE_FIELDS = new Set(['tgBotToken', 'cfApiToken']);
+
+    const SNAPSHOT_REASON_LABELS = {
+      save_config: '手动保存设置',
+      import_settings: '导入全局设置',
+      import_full: '导入完整备份',
+      restore_snapshot: '恢复历史快照'
+    };
+
+    const RECOMMENDED_SECTION_VALUES = {
+      proxy: {
+        enableH2: false,
+        enableH3: true,
+        peakDowngrade: true,
+        protocolFallback: true,
+        enablePrewarm: true,
+        prewarmCacheTtl: 180,
+        prewarmPrefetchBytes: 4194304,
+        sourceSameOriginProxy: true,
+        forceExternalProxy: true,
+        pingTimeout: 5000,
+        upstreamTimeoutMs: 30000,
+        upstreamRetryAttempts: 1
+      },
+      logs: {
+        logRetentionDays: 7,
+        logWriteDelayMinutes: 20,
+        logFlushCountThreshold: 50,
+        logBatchChunkSize: 50,
+        logBatchRetryCount: 2,
+        logBatchRetryBackoffMs: 75,
+        scheduledLeaseMs: 300000,
+        tgAlertDroppedBatchThreshold: 1,
+        tgAlertFlushRetryThreshold: 2,
+        tgAlertOnScheduledFailure: true,
+        tgAlertCooldownMinutes: 30
+      }
+    };
+
     const App = {
       nodes: [],
       settingsSourceDirectNodes: [],
@@ -2538,6 +3373,10 @@ const UI_HTML = `<!DOCTYPE html>
       logTotalPages: 1,
       dashboardSeries: [],
       dashboardLoadSeq: 0,
+      dashboardRefreshTimer: null,
+      dashboardRefreshMs: 0,
+      runtimeConfig: {},
+      configSnapshots: [],
       runtimeStatus: {},
       loginPromise: null,
       chart: null,
@@ -2546,6 +3385,309 @@ const UI_HTML = `<!DOCTYPE html>
           if (typeof window.lucide !== 'undefined') {
               window.lucide.createIcons(opts);
           }
+      },
+
+      applyRuntimeConfig(cfg) {
+        this.runtimeConfig = cfg && typeof cfg === 'object' ? { ...cfg } : {};
+        this.syncDashboardAutoRefresh();
+      },
+
+      syncDashboardAutoRefresh() {
+        const currentHash = window.location.hash || '#dashboard';
+        const enabled = this.runtimeConfig?.dashboardAutoRefreshEnabled === true;
+        const refreshSeconds = Math.max(5, Number(this.runtimeConfig?.dashboardAutoRefreshSeconds) || UI_DEFAULTS.dashboardAutoRefreshSeconds);
+        const refreshMs = refreshSeconds * 1000;
+        if (!enabled || currentHash !== '#dashboard') {
+          if (this.dashboardRefreshTimer) clearInterval(this.dashboardRefreshTimer);
+          this.dashboardRefreshTimer = null;
+          this.dashboardRefreshMs = 0;
+          return;
+        }
+        if (this.dashboardRefreshTimer && this.dashboardRefreshMs === refreshMs) return;
+        if (this.dashboardRefreshTimer) clearInterval(this.dashboardRefreshTimer);
+        this.dashboardRefreshMs = refreshMs;
+        this.dashboardRefreshTimer = setInterval(() => {
+          if ((window.location.hash || '#dashboard') !== '#dashboard') return;
+          this.loadDashboard();
+        }, refreshMs);
+      },
+
+      getSettingsSectionLabel(section) {
+        const labels = {
+          ui: '系统 UI',
+          proxy: '代理与网络',
+          security: '缓存与安全',
+          logs: '日志与监控',
+          account: '账号与备份',
+          all: '全部分区'
+        };
+        return labels[section] || section || '未知分区';
+      },
+
+      getConfigFieldLabel(key) {
+        return CONFIG_FIELD_LABELS[key] || key;
+      },
+
+      getConfigFormBindings(section) {
+        return CONFIG_FORM_BINDINGS[section] || [];
+      },
+
+      getConfigBindingDefaultValue(binding, phase = 'save') {
+        if (phase === 'load' && Object.prototype.hasOwnProperty.call(binding || {}, 'loadDefaultValue')) {
+          return binding.loadDefaultValue;
+        }
+        return Object.prototype.hasOwnProperty.call(binding || {}, 'defaultValue') ? binding.defaultValue : '';
+      },
+
+      getConfigBindingMode(binding, phase = 'save') {
+        if (phase === 'load' && binding?.loadMode) return binding.loadMode;
+        if (phase === 'save' && binding?.saveMode) return binding.saveMode;
+        return binding?.kind || 'text';
+      },
+
+      resolveConfigBindingInputValue(binding, source = {}) {
+        const rawValue = source?.[binding.key];
+        const mode = this.getConfigBindingMode(binding, 'load');
+        const fallback = this.getConfigBindingDefaultValue(binding, 'load');
+        if (mode === 'checkbox') {
+          if (binding.checkboxMode === 'defaultTrue') return rawValue !== false;
+          if (binding.checkboxMode === 'truthy') return !!rawValue;
+          return rawValue === true;
+        }
+        if (mode === 'or-default') return rawValue || fallback;
+        if (mode === 'int-or-default') {
+          const num = parseInt(rawValue, 10);
+          return num || fallback;
+        }
+        if (mode === 'int-finite' || mode === 'number-finite') {
+          const num = Number(rawValue);
+          return Number.isFinite(num) ? num : fallback;
+        }
+        if (mode === 'float-finite') {
+          const num = Number(rawValue);
+          return Number.isFinite(num) ? num : fallback;
+        }
+        if (rawValue === undefined || rawValue === null) return fallback;
+        return String(rawValue);
+      },
+
+      applyConfigSectionToForm(section, source = {}, options = {}) {
+        const onlyPresent = options.onlyPresent === true;
+        this.getConfigFormBindings(section).forEach(binding => {
+          if (onlyPresent && !Object.prototype.hasOwnProperty.call(source || {}, binding.key)) return;
+          const element = document.getElementById(binding.id);
+          if (!element) return;
+          const nextValue = this.resolveConfigBindingInputValue(binding, source);
+          if (binding.kind === 'checkbox') element.checked = nextValue === true;
+          else element.value = nextValue;
+        });
+      },
+
+      readConfigBindingFromForm(binding) {
+        const element = document.getElementById(binding.id);
+        if (!element) return undefined;
+        const mode = this.getConfigBindingMode(binding, 'save');
+        const fallback = this.getConfigBindingDefaultValue(binding, 'save');
+        if (mode === 'checkbox') return element.checked === true;
+        if (mode === 'int-or-default') {
+          const num = parseInt(element.value, 10);
+          return num || fallback;
+        }
+        if (mode === 'int-finite' || mode === 'number-finite') {
+          const num = parseInt(element.value, 10);
+          return Number.isFinite(num) ? num : fallback;
+        }
+        if (mode === 'float-finite') {
+          const num = parseFloat(element.value);
+          return Number.isFinite(num) ? num : fallback;
+        }
+        if (mode === 'trim') return String(element.value || '').trim();
+        return element.value || '';
+      },
+
+      collectConfigSectionFromForm(section) {
+        return this.getConfigFormBindings(section).reduce((acc, binding) => {
+          const value = this.readConfigBindingFromForm(binding);
+          if (value !== undefined) acc[binding.key] = value;
+          return acc;
+        }, {});
+      },
+
+      formatConfigPreviewValue(key, value) {
+        if (CONFIG_SENSITIVE_FIELDS.has(key)) {
+          const raw = String(value || '').trim();
+          if (!raw) return '空';
+          if (raw.length <= 8) return '已设置';
+          return raw.slice(0, 4) + '***' + raw.slice(-2);
+        }
+        if (Array.isArray(value)) return value.length ? value.join(', ') : '空';
+        if (typeof value === 'boolean') return value ? '开启' : '关闭';
+        if (value === undefined || value === null || value === '') return '空';
+        return String(value);
+      },
+
+      getSettingsRiskHints(section, nextConfig) {
+        const hints = [];
+        if ((section === 'ui' || section === 'all') && nextConfig.dashboardAutoRefreshEnabled === true && Number(nextConfig.dashboardAutoRefreshSeconds) < 15) {
+          hints.push('Dashboard 自动刷新低于 15 秒，会显著提高控制台请求频率。');
+        }
+        if ((section === 'proxy' || section === 'all') && nextConfig.enableH2 === true && nextConfig.enableH3 === true && nextConfig.peakDowngrade === false) {
+          hints.push('H2/H3 同时开启且关闭晚高峰降级，在复杂链路下更容易放大协议抖动。');
+        }
+        if ((section === 'proxy' || section === 'all') && Number(nextConfig.upstreamTimeoutMs) > 0 && Number(nextConfig.upstreamTimeoutMs) < 5000) {
+          hints.push('上游握手超时低于 5000 毫秒，慢源或弱网容易被过早判定失败。');
+        }
+        if ((section === 'logs' || section === 'all') && Number(nextConfig.logBatchRetryCount) === 0) {
+          hints.push('D1 重试次数为 0，瞬时抖动时会直接丢弃日志批次。');
+        }
+        if ((section === 'logs' || section === 'all') && Number(nextConfig.scheduledLeaseMs) > 0 && Number(nextConfig.scheduledLeaseMs) < 60000) {
+          hints.push('定时任务租约低于 60 秒，慢清理或网络抖动时更容易出现并发重入。');
+        }
+        if ((section === 'logs' || section === 'all') && nextConfig.tgAlertOnScheduledFailure === true && (!String(nextConfig.tgBotToken || '').trim() || !String(nextConfig.tgChatId || '').trim())) {
+          hints.push('已启用 Telegram 异常告警，但 Bot Token / Chat ID 还未完整配置。');
+        }
+        return hints;
+      },
+
+      buildConfigChangePreview(section, prevConfig, nextConfig) {
+        const fields = CONFIG_SECTION_FIELDS[section] || [...new Set([...Object.keys(prevConfig || {}), ...Object.keys(nextConfig || {})])];
+        const diffLines = [];
+        fields.forEach(key => {
+          const before = JSON.stringify(prevConfig?.[key]);
+          const after = JSON.stringify(nextConfig?.[key]);
+          if (before === after) return;
+          diffLines.push('• ' + this.getConfigFieldLabel(key) + ': ' + this.formatConfigPreviewValue(key, prevConfig?.[key]) + ' -> ' + this.formatConfigPreviewValue(key, nextConfig?.[key]));
+        });
+        if (!diffLines.length) {
+          return {
+            hasChanges: false,
+            message: '当前分区没有检测到变更，无需保存。'
+          };
+        }
+        const riskHints = this.getSettingsRiskHints(section, nextConfig);
+        let message = '即将保存「' + this.getSettingsSectionLabel(section) + '」以下变更：\\n\\n' + diffLines.join('\\n');
+        if (riskHints.length) {
+          message += '\\n\\n风险提示：\\n' + riskHints.map(item => '• ' + item).join('\\n');
+        }
+        message += '\\n\\n是否继续？';
+        return { hasChanges: true, message, riskHints };
+      },
+
+      clampPreviewValue(value, fallback, min, max, integer = false) {
+        let next = Number.isFinite(Number(value)) ? Number(value) : Number(fallback);
+        if (integer) next = Math.trunc(next);
+        if (Number.isFinite(min)) next = Math.max(min, next);
+        if (Number.isFinite(max)) next = Math.min(max, next);
+        return next;
+      },
+
+      sanitizeConfigByRules(input, rules) {
+        const config = input && typeof input === 'object' && !Array.isArray(input) ? { ...input } : {};
+        (rules?.trimFields || []).forEach(key => {
+          if (config[key] === undefined || config[key] === null) return;
+          config[key] = String(config[key]).trim();
+        });
+        Object.entries(rules?.arrayNormalizers || {}).forEach(([key, normalizerName]) => {
+          if (!Array.isArray(config[key])) return;
+          if (normalizerName === 'nodeNameList') config[key] = this.normalizeNodeNameList(config[key]);
+        });
+        Object.entries(rules?.integerFields || {}).forEach(([key, rule]) => {
+          config[key] = this.clampPreviewValue(config[key], rule.fallback, rule.min, rule.max, true);
+        });
+        Object.entries(rules?.numberFields || {}).forEach(([key, rule]) => {
+          config[key] = this.clampPreviewValue(config[key], rule.fallback, rule.min, rule.max, false);
+        });
+        (rules?.booleanTrueFields || []).forEach(key => {
+          config[key] = config[key] !== false;
+        });
+        (rules?.booleanFalseFields || []).forEach(key => {
+          config[key] = config[key] === true;
+        });
+        return config;
+      },
+
+      sanitizeConfigPreviewCompat(input) {
+        return this.sanitizeConfigByRules(input, CONFIG_PREVIEW_SANITIZE_RULES);
+      },
+
+      async finalizePersistedSettings(savedConfig, options = {}) {
+        const appliedConfig = savedConfig && typeof savedConfig === 'object' && !Array.isArray(savedConfig) ? savedConfig : {};
+        this.applyRuntimeConfig(appliedConfig);
+        try {
+          await this.loadSettings();
+          alert(options.successMessage || '设置已保存，立即生效');
+        } catch (err) {
+          console.error(options.refreshErrorLog || 'reload settings after persist failed', err);
+          alert((options.partialSuccessPrefix || '设置已保存，但设置面板刷新失败: ') + (err?.message || '未知错误'));
+        }
+      },
+
+      async prepareConfigChangePreview(section, prevConfig, rawNextConfig) {
+        let sanitizedConfig;
+        try {
+          const previewRes = await this.apiCall('previewConfig', { config: rawNextConfig });
+          if (!previewRes?.config || typeof previewRes.config !== 'object' || Array.isArray(previewRes.config)) {
+            throw new Error('配置预览返回格式无效');
+          }
+          sanitizedConfig = previewRes.config;
+        } catch (err) {
+          if (err?.code === 'INVALID_ACTION' && err?.status === 400) {
+            sanitizedConfig = this.sanitizeConfigPreviewCompat(rawNextConfig);
+          } else {
+            const detail = String(err?.message || '未知错误');
+            throw new Error(detail.startsWith('配置预览失败') ? detail : ('配置预览失败: ' + detail));
+          }
+        }
+        return {
+          sanitizedConfig,
+          preview: this.buildConfigChangePreview(section, prevConfig, sanitizedConfig)
+        };
+      },
+
+      formatSnapshotReason(snapshot) {
+        const reasonLabel = SNAPSHOT_REASON_LABELS[snapshot?.reason] || (snapshot?.reason || '未知来源');
+        const section = String(snapshot?.section || 'all');
+        return section && section !== 'all'
+          ? (reasonLabel + ' · ' + this.getSettingsSectionLabel(section))
+          : reasonLabel;
+      },
+
+      renderConfigSnapshots(snapshots) {
+        this.configSnapshots = Array.isArray(snapshots) ? snapshots : [];
+        const container = document.getElementById('cfg-snapshots-list');
+        if (!container) return;
+        if (!this.configSnapshots.length) {
+          container.innerHTML = '<div class="rounded-2xl border border-dashed border-slate-200 dark:border-slate-700 p-4 text-sm text-slate-500">暂无设置快照。保存、导入或恢复全局设置后，这里会出现最近的历史版本。</div>';
+          return;
+        }
+        container.innerHTML = this.configSnapshots.map(snapshot => {
+          const changedKeys = Array.isArray(snapshot.changedKeys) ? snapshot.changedKeys.slice(0, 4).map(key => this.getConfigFieldLabel(key)).join(' / ') : '';
+          const overflow = Array.isArray(snapshot.changedKeys) && snapshot.changedKeys.length > 4 ? (' +' + (snapshot.changedKeys.length - 4) + ' 项') : '';
+          return '<div class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-4">'
+            + '<div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3">'
+            + '<div class="min-w-0">'
+            + '<div class="text-sm font-semibold text-slate-900 dark:text-white break-all">' + this.escapeHtml(this.formatSnapshotReason(snapshot)) + '</div>'
+            + '<div class="text-xs text-slate-500 mt-1">创建时间：' + this.escapeHtml(this.formatLocalDateTime(snapshot.createdAt)) + '</div>'
+            + '<div class="text-xs text-slate-500 mt-1">变更字段：' + this.escapeHtml(changedKeys || '未记录') + this.escapeHtml(overflow) + '</div>'
+            + '</div>'
+            + '<button data-snapshot-id="' + this.escapeHtml(String(snapshot.id || '')) + '" onclick="App.restoreConfigSnapshot(this.dataset.snapshotId)" class="px-3 py-2 border border-brand-200 text-brand-600 rounded-xl text-sm transition hover:bg-brand-50 dark:border-brand-900/30 dark:text-brand-400 dark:hover:bg-brand-900/20 whitespace-nowrap">恢复此快照</button>'
+            + '</div>'
+            + '</div>';
+        }).join('');
+      },
+
+      async loadConfigSnapshots() {
+        const res = await this.apiCall('getConfigSnapshots');
+        this.renderConfigSnapshots(res.snapshots || []);
+      },
+
+      async restoreConfigSnapshot(snapshotId) {
+        if (!snapshotId) return;
+        if (!confirm('恢复该快照后，当前全局设置会立即被替换。系统会先自动记录当前配置，是否继续？')) return;
+        const res = await this.apiCall('restoreConfigSnapshot', { id: snapshotId });
+        this.applyRuntimeConfig(res.config || {});
+        await this.loadSettings();
+        alert('配置快照已恢复并立即生效。');
       },
 
       simpleHash(str) {
@@ -2885,15 +4027,17 @@ const UI_HTML = `<!DOCTYPE html>
         const scheduled = status.scheduled && typeof status.scheduled === 'object' ? status.scheduled : {};
         const cleanup = scheduled.cleanup && typeof scheduled.cleanup === 'object' ? scheduled.cleanup : {};
         const report = scheduled.report && typeof scheduled.report === 'object' ? scheduled.report : {};
+        const alerts = scheduled.alerts && typeof scheduled.alerts === 'object' ? scheduled.alerts : {};
         const scheduledSummary = this.summarizeRuntimeTimestamp(scheduled.lastFinishedAt || scheduled.lastStartedAt || scheduled.lastErrorAt, '最近调度：');
         const scheduledLines = [
           scheduled.lastStartedAt ? ('最近开始：' + this.formatLocalDateTime(scheduled.lastStartedAt)) : '',
           scheduled.lastFinishedAt ? ('最近结束：' + this.formatLocalDateTime(scheduled.lastFinishedAt)) : '',
           cleanup.status ? ('日志清理：' + this.formatRuntimeStateText(cleanup.status) + (cleanup.lastSuccessAt ? '（' + this.formatLocalDateTime(cleanup.lastSuccessAt) + '）' : cleanup.lastSkippedAt ? '（' + this.formatLocalDateTime(cleanup.lastSkippedAt) + '）' : cleanup.lastErrorAt ? '（' + this.formatLocalDateTime(cleanup.lastErrorAt) + '）' : '')) : '',
-          report.status ? ('日报发送：' + this.formatRuntimeStateText(report.status) + (report.lastSuccessAt ? '（' + this.formatLocalDateTime(report.lastSuccessAt) + '）' : report.lastSkippedAt ? '（' + this.formatLocalDateTime(report.lastSkippedAt) + '）' : report.lastErrorAt ? '（' + this.formatLocalDateTime(report.lastErrorAt) + '）' : '')) : ''
+          report.status ? ('日报发送：' + this.formatRuntimeStateText(report.status) + (report.lastSuccessAt ? '（' + this.formatLocalDateTime(report.lastSuccessAt) + '）' : report.lastSkippedAt ? '（' + this.formatLocalDateTime(report.lastSkippedAt) + '）' : report.lastErrorAt ? '（' + this.formatLocalDateTime(report.lastErrorAt) + '）' : '')) : '',
+          alerts.status ? ('异常告警：' + this.formatRuntimeStateText(alerts.status) + (alerts.lastSuccessAt ? '（' + this.formatLocalDateTime(alerts.lastSuccessAt) + '）' : alerts.lastSkippedAt ? '（' + this.formatLocalDateTime(alerts.lastSkippedAt) + '）' : alerts.lastErrorAt ? '（' + this.formatLocalDateTime(alerts.lastErrorAt) + '）' : '')) : ''
         ].filter(Boolean);
-        const scheduledDetail = scheduled.lastError || cleanup.lastError || report.lastError
-          ? ('最近调度错误：' + (scheduled.lastError || cleanup.lastError || report.lastError))
+        const scheduledDetail = scheduled.lastError || cleanup.lastError || report.lastError || alerts.lastError
+          ? ('最近调度错误：' + (scheduled.lastError || cleanup.lastError || report.lastError || alerts.lastError))
           : '';
         const scheduledCard = document.getElementById('dash-runtime-scheduled-card');
         if (scheduledCard) {
@@ -2928,7 +4072,12 @@ const UI_HTML = `<!DOCTYPE html>
               res = await fetch('/admin', requestInit);
           }
           const data = await res.json().catch(() => ({}));
-          if (!res.ok) throw new Error(data.error?.message || ('HTTP ' + res.status));
+          if (!res.ok) {
+              const error = new Error(data.error?.message || ('HTTP ' + res.status));
+              error.code = data.error?.code || null;
+              error.status = res.status;
+              throw error;
+          }
           return data;
       },
 
@@ -2964,6 +4113,7 @@ const UI_HTML = `<!DOCTYPE html>
         if (hash === '#nodes') this.loadNodes();
         if (hash === '#logs') this.loadLogs(1);
         if (hash === '#settings') this.loadSettings();
+        this.syncDashboardAutoRefresh();
       },
 
       switchSetTab(event, id) {
@@ -3096,86 +4246,64 @@ const UI_HTML = `<!DOCTYPE html>
       },
 
       async loadSettings() {
-          const [configRes, nodesRes] = await Promise.all([
+          const [configRes, nodesRes, snapshotRes] = await Promise.all([
               this.apiCall('loadConfig'),
-              this.apiCall('list').catch(() => ({ nodes: this.nodes || [] }))
+              this.apiCall('list').catch(() => ({ nodes: this.nodes || [] })),
+              this.apiCall('getConfigSnapshots').catch(() => ({ snapshots: this.configSnapshots || [] }))
           ]);
           const cfg = configRes.config || { enableH2: false, enableH3: false, peakDowngrade: true, protocolFallback: true, sourceSameOriginProxy: true, forceExternalProxy: true };
+          this.applyRuntimeConfig(cfg);
           if (Array.isArray(nodesRes.nodes)) this.nodes = nodesRes.nodes;
-          
-          document.getElementById('cfg-enable-h2').checked = !!cfg.enableH2;
-          document.getElementById('cfg-enable-h3').checked = !!cfg.enableH3;
-          document.getElementById('cfg-peak-downgrade').checked = cfg.peakDowngrade !== false; 
-          document.getElementById('cfg-protocol-fallback').checked = cfg.protocolFallback !== false; 
-          document.getElementById('cfg-source-same-origin-proxy').checked = cfg.sourceSameOriginProxy !== false;
-          document.getElementById('cfg-enable-prewarm').checked = cfg.enablePrewarm !== false;
-          document.getElementById('cfg-prewarm-ttl').value = cfg.prewarmCacheTtl || 180;
-          document.getElementById('cfg-force-external-proxy').checked = cfg.forceExternalProxy !== false;
-          document.getElementById('cfg-wangpandirect').value = cfg.wangpandirect || '${DEFAULT_WANGPAN_DIRECT_TEXT}';
+          this.renderConfigSnapshots(snapshotRes.snapshots || []);
+
+          this.applyConfigSectionToForm('ui', cfg);
+          this.applyConfigSectionToForm('proxy', cfg);
           document.getElementById('cfg-direct-node-search').value = '';
           this.settingsSourceDirectNodes = this.normalizeNodeNameList(cfg.sourceDirectNodes || cfg.directSourceNodes || cfg.nodeDirectList || []);
           this.renderSourceDirectNodesPicker(this.settingsSourceDirectNodes);
-          document.getElementById('cfg-ping-timeout').value = cfg.pingTimeout || 5000;
-          
-          document.getElementById('cfg-geo-allow').value = cfg.geoAllowlist || '';
-          document.getElementById('cfg-geo-block').value = cfg.geoBlocklist || '';
-          document.getElementById('cfg-ip-black').value = cfg.ipBlacklist || '';
-          document.getElementById('cfg-rate-limit').value = cfg.rateLimitRpm || '';
-          document.getElementById('cfg-cache-ttl').value = cfg.cacheTtlImages || 30;
-          document.getElementById('cfg-cors').value = cfg.corsOrigins || '';
-          
-          document.getElementById('cfg-log-days').value = cfg.logRetentionDays || 7;
-          document.getElementById('cfg-log-delay').value = Number.isFinite(Number(cfg.logWriteDelayMinutes)) ? Number(cfg.logWriteDelayMinutes) : 20;
-          document.getElementById('cfg-log-flush-count').value = Number.isFinite(Number(cfg.logFlushCountThreshold)) ? Number(cfg.logFlushCountThreshold) : 50;
-          document.getElementById('cfg-tg-token').value = cfg.tgBotToken || '';
-          document.getElementById('cfg-tg-chatid').value = cfg.tgChatId || '';
-          
-          document.getElementById('cfg-jwt-days').value = cfg.jwtExpiryDays || 30;
-          document.getElementById('cfg-cf-account').value = cfg.cfAccountId || '';
-          document.getElementById('cfg-cf-zone').value = cfg.cfZoneId || '';
-          document.getElementById('cfg-cf-token').value = cfg.cfApiToken || '';
+          this.applyConfigSectionToForm('security', cfg);
+          this.applyConfigSectionToForm('logs', cfg);
+          this.applyConfigSectionToForm('account', cfg);
+          return cfg;
+      },
+
+      applyRecommendedSettings(section) {
+          const recommended = RECOMMENDED_SECTION_VALUES[section];
+          if (!recommended) return;
+          this.applyConfigSectionToForm(section, recommended, { onlyPresent: true });
+          alert('推荐生产值已回填到表单，请确认后再点击保存。');
       },
 
       async saveSettings(section) {
-          const res = await this.apiCall('loadConfig');
-          let newConfig = res.config || {};
-          
-          if(section === 'proxy') {
-              newConfig.enableH2 = document.getElementById('cfg-enable-h2').checked;
-              newConfig.enableH3 = document.getElementById('cfg-enable-h3').checked;
-              newConfig.peakDowngrade = document.getElementById('cfg-peak-downgrade').checked;
-              newConfig.protocolFallback = document.getElementById('cfg-protocol-fallback').checked;
-              newConfig.enablePrewarm = document.getElementById('cfg-enable-prewarm').checked;
-              newConfig.prewarmCacheTtl = parseInt(document.getElementById('cfg-prewarm-ttl').value) || 180;
-              newConfig.sourceSameOriginProxy = document.getElementById('cfg-source-same-origin-proxy').checked;
-              newConfig.forceExternalProxy = document.getElementById('cfg-force-external-proxy').checked;
-              newConfig.wangpandirect = document.getElementById('cfg-wangpandirect').value.trim();
-              newConfig.sourceDirectNodes = this.normalizeNodeNameList(this.settingsSourceDirectNodes);
-              newConfig.pingTimeout = parseInt(document.getElementById('cfg-ping-timeout').value) || 5000;
-          } else if(section === 'security') {
-              newConfig.geoAllowlist = document.getElementById('cfg-geo-allow').value;
-              newConfig.geoBlocklist = document.getElementById('cfg-geo-block').value;
-              newConfig.ipBlacklist = document.getElementById('cfg-ip-black').value;
-              newConfig.rateLimitRpm = parseInt(document.getElementById('cfg-rate-limit').value) || 0;
-              newConfig.cacheTtlImages = parseInt(document.getElementById('cfg-cache-ttl').value) || 30;
-              newConfig.corsOrigins = document.getElementById('cfg-cors').value;
-          } else if(section === 'logs') {
-              newConfig.logRetentionDays = parseInt(document.getElementById('cfg-log-days').value) || 7;
-              const logDelayMinutes = parseFloat(document.getElementById('cfg-log-delay').value);
-              const logFlushCountThreshold = parseInt(document.getElementById('cfg-log-flush-count').value, 10);
-              newConfig.logWriteDelayMinutes = Number.isFinite(logDelayMinutes) ? Math.max(0, logDelayMinutes) : 20;
-              newConfig.logFlushCountThreshold = Number.isFinite(logFlushCountThreshold) ? Math.max(1, logFlushCountThreshold) : 50;
-              newConfig.tgBotToken = document.getElementById('cfg-tg-token').value.trim();
-              newConfig.tgChatId = document.getElementById('cfg-tg-chatid').value.trim();
-          } else if(section === 'account') {
-              newConfig.jwtExpiryDays = parseInt(document.getElementById('cfg-jwt-days').value) || 30;
-              newConfig.cfAccountId = document.getElementById('cfg-cf-account').value.trim();
-              newConfig.cfZoneId = document.getElementById('cfg-cf-zone').value.trim();
-              newConfig.cfApiToken = document.getElementById('cfg-cf-token').value.trim();
+          try {
+              const res = await this.apiCall('loadConfig');
+              const currentConfig = res.config || {};
+              let newConfig = { ...currentConfig };
+              
+              if (CONFIG_FORM_BINDINGS[section]) {
+                  newConfig = { ...newConfig, ...this.collectConfigSectionFromForm(section) };
+                  if (section === 'proxy') {
+                      newConfig.sourceDirectNodes = this.normalizeNodeNameList(this.settingsSourceDirectNodes);
+                  }
+              }
+
+              const { sanitizedConfig, preview } = await this.prepareConfigChangePreview(section, currentConfig, newConfig);
+              if (!preview.hasChanges) {
+                  alert(preview.message);
+                  return;
+              }
+              if (!confirm(preview.message)) return;
+
+              const saveRes = await this.apiCall('saveConfig', { config: sanitizedConfig, meta: { section, source: 'ui' } });
+              await this.finalizePersistedSettings(saveRes.config || sanitizedConfig, {
+                  successMessage: '设置已保存，立即生效',
+                  partialSuccessPrefix: '设置已保存，但设置面板刷新失败: ',
+                  refreshErrorLog: 'loadSettings after saveConfig failed'
+              });
+          } catch (err) {
+              console.error('saveSettings failed', err);
+              alert('设置保存失败: ' + (err?.message || '未知错误'));
           }
-          
-          await this.apiCall('saveConfig', { config: newConfig });
-          alert("设置已保存，立即生效");
       },
       
       async testTelegram() {
@@ -3821,6 +4949,45 @@ const UI_HTML = `<!DOCTYPE html>
           if(res) this.downloadJson(res, \`emby_proxy_full_backup_\${new Date().getTime()}.json\`);
       },
 
+      async exportSettings() {
+          const res = await this.apiCall('exportSettings');
+          if (res) this.downloadJson(res, \`emby_proxy_settings_\${new Date().getTime()}.json\`);
+      },
+
+      async importSettings(event) {
+          const file = event.target.files[0];
+          if(!file) return;
+          const reader = new FileReader();
+          reader.onload = async (e) => {
+              try {
+                  const data = JSON.parse(e.target.result);
+                  const importedConfig = data && typeof data === 'object' && !Array.isArray(data)
+                    ? ((data.config && typeof data.config === 'object' && !Array.isArray(data.config)) ? data.config : (data.settings && typeof data.settings === 'object' && !Array.isArray(data.settings) ? data.settings : data))
+                    : null;
+                  if(!importedConfig || Array.isArray(importedConfig)) return alert('无效的设置备份文件');
+                  const currentRes = await this.apiCall('loadConfig');
+                  const currentConfig = currentRes.config || {};
+                  const mergedConfig = { ...currentConfig, ...importedConfig };
+                  const { sanitizedConfig, preview } = await this.prepareConfigChangePreview('all', currentConfig, mergedConfig);
+                  if (!preview.hasChanges) return alert('导入文件与当前全局设置一致，无需导入。');
+                  const importMessage = preview.message.replace('即将保存「全部分区」以下变更：', '即将导入以下全局设置变更：');
+                  if (!confirm(importMessage)) return;
+                  const res = await this.apiCall('importSettings', { config: sanitizedConfig, meta: { source: 'settings_file' } });
+                  await this.finalizePersistedSettings(res.config || sanitizedConfig, {
+                    successMessage: '全局设置导入成功，已立即生效。',
+                    partialSuccessPrefix: '全局设置已导入，但设置面板刷新失败: ',
+                    refreshErrorLog: 'loadSettings after importSettings failed'
+                  });
+              } catch(err) {
+                  console.error('importSettings failed', err);
+                  if (err instanceof SyntaxError) alert('文件解析失败');
+                  else alert('全局设置导入失败: ' + (err?.message || '未知错误'));
+              }
+          };
+          reader.readAsText(file);
+          event.target.value = '';
+      },
+
       async importFull(event) {
           const file = event.target.files[0];
           if(!file) return;
@@ -3829,10 +4996,17 @@ const UI_HTML = `<!DOCTYPE html>
               try {
                   const data = JSON.parse(e.target.result);
                   if(!data.config && !data.nodes) return alert('无效的备份文件');
-                  await this.apiCall('importFull', {config: data.config, nodes: data.nodes});
-                  alert('完整数据导入成功，请刷新页面');
-                  location.reload();
-              } catch(err) { alert('文件解析失败'); }
+                  const res = await this.apiCall('importFull', {config: data.config, nodes: data.nodes});
+                  this.applyRuntimeConfig(res.config || {});
+                  await Promise.all([
+                    this.loadNodes(),
+                    this.loadSettings()
+                  ]);
+                  alert('完整数据导入成功，已立即生效。');
+              } catch(err) {
+                  console.error('importFull failed', err);
+                  alert('文件解析失败');
+              }
           };
           reader.readAsText(file);
           event.target.value = '';
@@ -3841,7 +5015,8 @@ const UI_HTML = `<!DOCTYPE html>
     
     document.addEventListener('DOMContentLoaded', async () => {
         try {
-            await App.apiCall('loadConfig');
+            const initialConfigRes = await App.apiCall('loadConfig');
+            App.applyRuntimeConfig(initialConfigRes.config || {});
         } catch (e) {
             const message = e?.message || '未知错误';
             if (message !== 'LOGIN_CANCELLED') alert('身份验证失败或网络异常: ' + message);
@@ -3865,7 +5040,7 @@ const UI_HTML = `<!DOCTYPE html>
 // - `scheduled` 负责日志清理与日报等定时任务。
 // ============================================================================
 function renderLandingPage() {
-  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy V18.0</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 flex items-center justify-center min-h-screen text-center"><div class="p-8 max-w-md w-full bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl"><div class="w-16 h-16 mx-auto bg-brand-500/20 rounded-2xl flex items-center justify-center text-blue-500 mb-6"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg></div><h1 class="text-3xl font-bold text-white mb-2">Emby Proxy V18.0</h1><p class="text-slate-400 mb-8">高性能媒体代理与分流中心</p><a href="/admin" class="block w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-medium transition">进入管理控制台</a></div></body></html>`;
+  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy V18.1</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 flex items-center justify-center min-h-screen text-center"><div class="p-8 max-w-md w-full bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl"><div class="w-16 h-16 mx-auto bg-brand-500/20 rounded-2xl flex items-center justify-center text-blue-500 mb-6"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg></div><h1 class="text-3xl font-bold text-white mb-2">Emby Proxy V18.1</h1><p class="text-slate-400 mb-8">高性能媒体代理与分流中心</p><a href="/admin" class="block w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-medium transition">进入管理控制台</a></div></body></html>`;
   const headers = new Headers({ 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' });
   applySecurityHeaders(headers);
   headers.set('X-Frame-Options', 'DENY');
@@ -3955,12 +5130,77 @@ export default {
       const db = Database.getDB(env);
       const kv = Database.getKV(env);
       if (!kv) return;
+      const runtimeConfig = await getRuntimeConfig(env);
+      const scheduledLeaseMs = clampIntegerConfig(runtimeConfig?.scheduledLeaseMs, Config.Defaults.ScheduledLeaseMs, Config.Defaults.ScheduledLeaseMinMs, 30 * 60 * 1000);
+      const leaseToken = `${nowMs()}-${Math.random().toString(36).slice(2, 10)}`;
+      const lease = await Database.tryAcquireScheduledLease(kv, { token: leaseToken, leaseMs: scheduledLeaseMs });
+      if (!lease.acquired) {
+        await Database.patchOpsStatus(kv, {
+          scheduled: {
+            lastSkippedAt: new Date().toISOString(),
+            lastSkipReason: lease.reason || "lease_not_acquired",
+            lock: {
+              status: "busy",
+              reason: lease.reason || "lease_not_acquired",
+              expiresAt: lease.lock?.expiresAt || null
+            }
+          }
+        }).catch(() => {});
+        return;
+      }
+
+      const leaseState = {
+        active: true,
+        lostReason: null,
+        lock: lease.lock || null
+      };
+      const renewLease = async () => {
+        if (!leaseState.active) return null;
+        const renewed = await Database.renewScheduledLease(kv, leaseToken, scheduledLeaseMs);
+        if (!renewed) {
+          leaseState.active = false;
+          leaseState.lostReason = leaseState.lostReason || "lease_lost";
+          return null;
+        }
+        leaseState.lock = renewed;
+        return renewed;
+      };
+      const ensureLeaseActive = async () => {
+        if (!leaseState.active) throw new Error(leaseState.lostReason || "scheduled_lease_lost");
+        const renewed = await renewLease();
+        if (!renewed) throw new Error(leaseState.lostReason || "scheduled_lease_lost");
+        return renewed;
+      };
+      const leaseRefreshIntervalMs = Math.max(5000, Math.min(Math.floor(scheduledLeaseMs / 3), 60000));
+      const waitForLeaseRefreshWindow = async () => {
+        let remainingMs = leaseRefreshIntervalMs;
+        while (leaseState.active && remainingMs > 0) {
+          const sliceMs = Math.min(remainingMs, 1000);
+          await sleepMs(sliceMs);
+          remainingMs -= sliceMs;
+        }
+      };
+      const leaseKeepalive = (async () => {
+        while (leaseState.active) {
+          await waitForLeaseRefreshWindow();
+          if (!leaseState.active) break;
+          await renewLease();
+        }
+      })().catch(() => {
+        leaseState.active = false;
+        leaseState.lostReason = leaseState.lostReason || "lease_renew_failed";
+      });
 
       const startedAt = new Date().toISOString();
       await Database.patchOpsStatus(kv, {
         scheduled: {
           status: "running",
-          lastStartedAt: startedAt
+          lastStartedAt: startedAt,
+          lock: {
+            status: "held",
+            token: leaseToken,
+            expiresAt: leaseState.lock?.expiresAt || (nowMs() + scheduledLeaseMs)
+          }
         }
       }).catch(() => {});
 
@@ -3972,22 +5212,28 @@ export default {
         lastErrorAt: null,
         lastError: null,
         cleanup: {},
-        report: {}
+        report: {},
+        alerts: {}
       };
 
       try {
-        const config = await kv.get(Database.CONFIG_KEY, { type: "json" }) || {};
+        const config = runtimeConfig || {};
         
         if (db) {
           try {
-            const retentionDays = config.logRetentionDays || 7; 
+            await ensureLeaseActive();
+            const rawRetentionDays = Number(config.logRetentionDays);
+            const retentionDays = Number.isFinite(rawRetentionDays)
+              ? Math.min(Config.Defaults.LogRetentionDaysMax, Math.max(1, Math.floor(rawRetentionDays)))
+              : Config.Defaults.LogRetentionDays;
             const expireTime = Date.now() - (retentionDays * 24 * 60 * 60 * 1000);
             await db.prepare("DELETE FROM proxy_logs WHERE timestamp < ?").bind(expireTime).run();
             scheduledState.cleanup = {
               status: "success",
               lastSuccessAt: new Date().toISOString(),
-              retentionDays: Number(retentionDays) || 7
+              retentionDays
             };
+            await ensureLeaseActive();
           } catch (dbErr) {
             scheduledState.status = "partial_failure";
             scheduledState.cleanup = {
@@ -4008,6 +5254,7 @@ export default {
         const { tgBotToken, tgChatId } = config;
         if (tgBotToken && tgChatId) {
             try {
+              await ensureLeaseActive();
               await Database.sendDailyTelegramReport(env);
               scheduledState.report = {
                 status: "success",
@@ -4029,15 +5276,52 @@ export default {
             reason: "telegram_not_configured"
           };
         }
+
+        try {
+          await ensureLeaseActive();
+          const alertResult = await Database.maybeSendRuntimeAlerts(env, scheduledState);
+          scheduledState.alerts = alertResult.sent
+            ? {
+                status: "success",
+                lastSuccessAt: new Date().toISOString(),
+                issueCount: Number(alertResult.issueCount) || 0
+              }
+            : {
+                status: "skipped",
+                lastSkippedAt: new Date().toISOString(),
+                reason: alertResult.reason || "no_alerts"
+              };
+        } catch (alertErr) {
+          scheduledState.status = scheduledState.status === "success" ? "partial_failure" : scheduledState.status;
+          scheduledState.alerts = {
+            status: "failed",
+            lastErrorAt: new Date().toISOString(),
+            lastError: alertErr?.message || String(alertErr)
+          };
+          console.error("Scheduled Alert Error: ", alertErr);
+        }
       } catch (err) {
           scheduledState.status = "failed";
           scheduledState.lastErrorAt = new Date().toISOString();
           scheduledState.lastError = err?.message || String(err);
           console.error("Scheduled Task Error: ", err);
       } finally {
+          leaseState.active = false;
+          await leaseKeepalive.catch(() => {});
           const finishedAt = new Date().toISOString();
           scheduledState.lastFinishedAt = finishedAt;
           if (scheduledState.status === "success") scheduledState.lastSuccessAt = finishedAt;
+          const released = leaseState.lostReason ? false : await Database.releaseScheduledLease(kv, leaseToken).catch(() => false);
+          scheduledState.lock = leaseState.lostReason
+            ? {
+                status: "lost",
+                reason: leaseState.lostReason,
+                lastCheckedAt: finishedAt
+              }
+            : {
+                status: released ? "released" : "release_skipped",
+                releasedAt: finishedAt
+              };
           await Database.patchOpsStatus(kv, { scheduled: scheduledState }).catch(() => {});
       }
     })());

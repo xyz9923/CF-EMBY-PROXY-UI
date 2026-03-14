@@ -1,0 +1,7 @@
+name = "cf-emby-proxy-ui"
+main = "worker.js"
+compatibility_date = "2026-03-13"
+
+# This file is intentionally limited to Worker code deployment metadata.
+# Keep KV and D1 bindings in the Cloudflare dashboard instead of declaring
+# kv_namespaces or d1_databases here.
