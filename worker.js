@@ -1,4 +1,4 @@
-// EMBY-PROXY-UI V18.3 (SaaS UI Optimized - Ultimate Fix + Emby Auth Patch)
+// EMBY-PROXY-UI V18.4 (SaaS UI Optimized - Ultimate Fix + Emby Auth Patch)
 
 // 单文件导航图（保持单文件部署，不做物理解耦）：
 // 0. 全局状态与通用工具
@@ -95,6 +95,7 @@ const Config = {
     ScheduledLeaseMs: 5 * 60 * 1000,
     DashboardAutoRefreshEnabled: false,
     DashboardAutoRefreshSeconds: 30,
+    UiRadiusPx: 24,
     CacheTtlImagesDays: 30,
     PingTimeoutMs: 5000,
     PingCacheMinutes: 10,
@@ -110,8 +111,8 @@ const Config = {
     ConfigSnapshotLimit: 5,
     CleanupBudgetMs: 1,             
     CleanupChunkSize: 64,           
-    AssetHash: "v18.3",           
-    Version: "18.3"                 
+    AssetHash: "v18.4",           
+    Version: "18.4"                 
   }
 };
 
@@ -360,9 +361,17 @@ function scoreHostnameCandidate(hostname, options = {}) {
   return score;
 }
 
-async function fetchCloudflareApiJson(url, apiToken) {
+async function fetchCloudflareApiJson(url, apiToken, init = {}) {
+  const extraInit = /** @type {any} */ (init && typeof init === "object" ? init : {});
+  let extraHeaders = {};
+  const rawHeaders = extraInit?.headers;
+  if (rawHeaders) {
+    if (rawHeaders instanceof Headers) extraHeaders = Object.fromEntries(rawHeaders.entries());
+    else if (typeof rawHeaders === "object") extraHeaders = rawHeaders;
+  }
   const res = await fetch(url, {
-    headers: { "Authorization": `Bearer ${apiToken}`, "Content-Type": "application/json" }
+    ...extraInit,
+    headers: { "Authorization": `Bearer ${apiToken}`, "Content-Type": "application/json", ...extraHeaders }
   });
   if (!res.ok) throw new Error(`cf_api_http_${res.status}`);
   /** @type {JsonApiEnvelope} */
@@ -762,6 +771,7 @@ const CONFIG_SANITIZE_RULES = {
     logBatchRetryBackoffMs: { fallback: Config.Defaults.LogBatchRetryBackoffMs, min: 0, max: 5000 },
     scheduledLeaseMs: { fallback: Config.Defaults.ScheduledLeaseMs, min: Config.Defaults.ScheduledLeaseMinMs, max: 15 * 60 * 1000 },
     dashboardAutoRefreshSeconds: { fallback: Config.Defaults.DashboardAutoRefreshSeconds, min: 5, max: 3600 },
+    uiRadiusPx: { fallback: Config.Defaults.UiRadiusPx, min: 0, max: 48 },
     tgAlertDroppedBatchThreshold: { fallback: Config.Defaults.TgAlertDroppedBatchThreshold, min: 0, max: 5000 },
     tgAlertFlushRetryThreshold: { fallback: Config.Defaults.TgAlertFlushRetryThreshold, min: 0, max: 10 },
     tgAlertCooldownMinutes: { fallback: Config.Defaults.TgAlertCooldownMinutes, min: 1, max: 1440 },
@@ -1600,6 +1610,9 @@ const Database = {
     if (n.secret === undefined) { n.secret = ""; changed = true; }
     if (n.tag === undefined) { n.tag = ""; changed = true; }
     if (n.remark === undefined) { n.remark = ""; changed = true; }
+    if (n.tagColor === undefined) { n.tagColor = ""; changed = true; }
+    if (n.remarkColor === undefined) { n.remarkColor = ""; changed = true; }
+    if (n.displayName === undefined) { n.displayName = ""; changed = true; }
     const normalizedHeaders = this.sanitizeHeaders(n.headers);
     if (JSON.stringify(normalizedHeaders) !== JSON.stringify(n.headers || {})) changed = true;
     n.headers = normalizedHeaders;
@@ -1633,6 +1646,9 @@ const Database = {
       secret: rawNode?.secret !== undefined ? rawNode.secret : (existingNode.secret || ""),
       tag: rawNode?.tag !== undefined ? rawNode.tag : (existingNode.tag || ""),
       remark: rawNode?.remark !== undefined ? rawNode.remark : (existingNode.remark || ""),
+      tagColor: rawNode?.tagColor !== undefined ? String(rawNode.tagColor || "").trim() : (existingNode.tagColor || ""),
+      remarkColor: rawNode?.remarkColor !== undefined ? String(rawNode.remarkColor || "").trim() : (existingNode.remarkColor || ""),
+      displayName: rawNode?.displayName !== undefined ? String(rawNode.displayName || "").trim() : (existingNode.displayName || ""),
       headers: this.sanitizeHeaders(parsedHeaders),
       schemaVersion: 3,
       createdAt: existingNode.createdAt || new Date().toISOString(),
@@ -2026,6 +2042,150 @@ const Database = {
             if (res.ok) return jsonResponse({ success: true });
             return jsonError("PURGE_FAILED", "清理失败，请检查密钥权限");
         } catch(e) { return jsonError("PURGE_ERROR", e.message); }
+    },
+
+    async listDnsRecords(data, { env }) {
+        const config = sanitizeRuntimeConfig(await getRuntimeConfig(env));
+        const cfZoneId = String(config.cfZoneId || "").trim();
+        const cfApiToken = String(config.cfApiToken || "").trim();
+        if (!cfZoneId || !cfApiToken) return jsonError("CF_API_ERROR", "请在账号设置中完善 Zone ID 和 API 令牌");
+
+        try {
+            const zone = await fetchCloudflareZoneDetails(cfZoneId, cfApiToken).catch(() => null);
+            const records = [];
+            let page = 1;
+            let totalPages = 1;
+            const perPage = 100;
+            do {
+                const url = `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(cfZoneId)}/dns_records?page=${page}&per_page=${perPage}`;
+                const payload = await fetchCloudflareApiJson(url, cfApiToken);
+                if (Array.isArray(payload?.result)) records.push(...payload.result);
+                totalPages = Number(payload?.result_info?.total_pages || payload?.result_info?.totalPages || 1);
+                page += 1;
+            } while (page <= totalPages && page <= 20);
+
+            const normalized = records.map((r) => ({
+                id: String(r?.id || ""),
+                type: String(r?.type || ""),
+                name: String(r?.name || ""),
+                content: String(r?.content || ""),
+                ttl: Number(r?.ttl) || 1,
+                proxied: r?.proxied === true
+            })).filter(r => r.id && r.name);
+
+            return jsonResponse({
+                ok: true,
+                zoneId: cfZoneId,
+                zoneName: String(zone?.name || ""),
+                records: normalized
+            });
+        } catch (e) {
+            const msg = String(e?.message || e || "unknown_error");
+            const hint = msg.includes("cf_api_http_403")
+              ? "Cloudflare DNS 读取失败：API 令牌权限不足（需要 Zone.DNS:Read）"
+              : msg.includes("cf_api_http_401")
+                ? "Cloudflare DNS 读取失败：API 令牌无效"
+                : "Cloudflare DNS 读取失败";
+            return jsonError("CF_DNS_LIST_FAILED", hint, 400, { reason: msg });
+        }
+    },
+
+    async updateDnsRecord(data, { env }) {
+        const recordId = String(data?.recordId || data?.id || "").trim();
+        const nextType = String(data?.type || "").trim().toUpperCase();
+        const nextContent = String(data?.content || "").trim();
+
+        if (!recordId) return jsonError("MISSING_PARAMS", "recordId 不能为空");
+        if (!["A", "AAAA", "CNAME"].includes(nextType)) return jsonError("INVALID_TYPE", "Type 仅允许 A / AAAA / CNAME");
+        if (!nextContent) return jsonError("INVALID_CONTENT", "Content 不能为空");
+
+        const config = sanitizeRuntimeConfig(await getRuntimeConfig(env));
+        const cfZoneId = String(config.cfZoneId || "").trim();
+        const cfApiToken = String(config.cfApiToken || "").trim();
+        if (!cfZoneId || !cfApiToken) return jsonError("CF_API_ERROR", "请在账号设置中完善 Zone ID 和 API 令牌");
+
+        const isAllowedRecordType = (value) => {
+            const t = String(value || "").toUpperCase();
+            return t === "A" || t === "AAAA" || t === "CNAME";
+        };
+
+        const isValidIpv4 = (value) => {
+            const v = String(value || "").trim();
+            const parts = v.split(".");
+            if (parts.length !== 4) return false;
+            for (const part of parts) {
+                if (!/^[0-9]{1,3}$/.test(part)) return false;
+                const num = Number(part);
+                if (!Number.isFinite(num) || num < 0 || num > 255) return false;
+            }
+            return true;
+        };
+
+        const isValidIpv6 = (value) => {
+            const v = String(value || "").trim();
+            if (!v || !v.includes(":")) return false;
+            if (/\s/.test(v)) return false;
+            try {
+                new URL(`http://[${v}]/`);
+                return true;
+            } catch {
+                return false;
+            }
+        };
+
+        if (nextType === "A" && !isValidIpv4(nextContent)) return jsonError("INVALID_CONTENT", "A 记录 Content 必须是合法 IPv4 地址");
+        if (nextType === "AAAA" && !isValidIpv6(nextContent)) return jsonError("INVALID_CONTENT", "AAAA 记录 Content 必须是合法 IPv6 地址");
+        if (nextType === "CNAME" && /\s/.test(nextContent)) return jsonError("INVALID_CONTENT", "CNAME 记录 Content 不能包含空格");
+
+        try {
+            const getUrl = `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(cfZoneId)}/dns_records/${encodeURIComponent(recordId)}`;
+            const existingPayload = await fetchCloudflareApiJson(getUrl, cfApiToken);
+            const existing = existingPayload?.result;
+            if (!existing) return jsonError("NOT_FOUND", "DNS 记录不存在", 404);
+
+            const currentType = String(existing?.type || "").toUpperCase();
+            if (!isAllowedRecordType(currentType)) {
+                return jsonError("UNSUPPORTED_RECORD_TYPE", "该 DNS 记录类型不支持编辑", 400, { currentType });
+            }
+
+            const updateBody = {
+                type: nextType,
+                name: String(existing?.name || ""),
+                content: nextContent,
+                ttl: Number(existing?.ttl) || 1,
+                proxied: existing?.proxied === true
+            };
+            if (typeof existing?.comment === "string") updateBody.comment = existing.comment;
+            if (Array.isArray(existing?.tags)) updateBody.tags = existing.tags.map(tag => String(tag));
+
+            const updatePayload = await fetchCloudflareApiJson(getUrl, cfApiToken, {
+                method: "PUT",
+                body: JSON.stringify(updateBody)
+            });
+
+            const updated = updatePayload?.result || null;
+            return jsonResponse({
+                ok: true,
+                record: updated
+                  ? {
+                      id: String(updated?.id || recordId),
+                      type: String(updated?.type || updateBody.type),
+                      name: String(updated?.name || updateBody.name),
+                      content: String(updated?.content || updateBody.content),
+                      ttl: Number(updated?.ttl) || updateBody.ttl,
+                      proxied: updated?.proxied === true
+                    }
+                  : { id: recordId, ...updateBody }
+            });
+        } catch (e) {
+            const msg = String(e?.message || e || "unknown_error");
+            const hint = msg.includes("cf_api_http_403")
+              ? "Cloudflare DNS 更新失败：API 令牌权限不足（需要 Zone.DNS:Edit）"
+              : msg.includes("cf_api_http_401")
+                ? "Cloudflare DNS 更新失败：API 令牌无效"
+                : "Cloudflare DNS 更新失败";
+            return jsonError("CF_DNS_UPDATE_FAILED", hint, 400, { reason: msg });
+        }
     },
 
     async testTelegram(data) {
@@ -3204,9 +3364,9 @@ const UI_HTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <title>Emby Proxy V18.3 - SaaS Dashboard</title>
+  <title>Emby Proxy V18.4 - SaaS Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/lucide@latest"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide@latest/dist/umd/lucide.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script>
     tailwind.config = {
@@ -3217,6 +3377,16 @@ const UI_HTML = `<!DOCTYPE html>
   <style>
     .glass-card { background: rgba(255,255,255,0.9); backdrop-filter: blur(12px); border: 1px solid #e2e8f0; }
     .dark .glass-card { background: rgba(15,23,42,0.6); border: 1px solid rgba(255,255,255,0.08); }
+    :root { --ui-radius-px: 24px; }
+    .glass-card,
+    .ui-radius-card,
+    #view-settings .settings-nav-shell,
+    #view-settings .settings-panel,
+    #view-settings .settings-block,
+    #view-settings .settings-list-shell,
+    #node-modal > div {
+      border-radius: var(--ui-radius-px) !important;
+    }
     .view-section { display: none; }
     .view-section.active { display: block; animation: fadeIn 0.3s ease-out; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
@@ -3283,13 +3453,14 @@ const UI_HTML = `<!DOCTYPE html>
       <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-500 to-indigo-600 flex items-center justify-center text-white font-bold text-lg flex-shrink-0">E</div>
       <h1 class="ml-3 font-semibold tracking-tight text-lg flex items-center gap-2">
         Emby Proxy 
-        <span class="px-1.5 py-0.5 rounded bg-brand-100 text-brand-600 dark:bg-brand-500/20 dark:text-brand-400 text-[10px] font-bold mt-0.5">V18.3</span>
+        <span class="px-1.5 py-0.5 rounded bg-brand-100 text-brand-600 dark:bg-brand-500/20 dark:text-brand-400 text-[10px] font-bold mt-0.5">V18.4</span>
       </h1>
     </div>
     <nav class="flex-1 overflow-y-auto py-4 px-3 space-y-1">
       <a href="#dashboard" class="nav-item flex items-center px-3 py-2.5 rounded-xl text-sm font-medium transition-colors text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:text-white dark:hover:bg-slate-800/50"><i data-lucide="layout-dashboard" class="w-5 h-5 mr-3"></i> 仪表盘</a>
       <a href="#nodes" class="nav-item flex items-center px-3 py-2.5 rounded-xl text-sm font-medium transition-colors text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:text-white dark:hover:bg-slate-800/50"><i data-lucide="server" class="w-5 h-5 mr-3"></i> 节点列表</a>
       <a href="#logs" class="nav-item flex items-center px-3 py-2.5 rounded-xl text-sm font-medium transition-colors text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:text-white dark:hover:bg-slate-800/50"><i data-lucide="activity" class="w-5 h-5 mr-3"></i> 日志记录</a>
+      <a href="#dns" class="nav-item flex items-center px-3 py-2.5 rounded-xl text-sm font-medium transition-colors text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:text-white dark:hover:bg-slate-800/50"><i data-lucide="globe" class="w-5 h-5 mr-3"></i> DNS编辑</a>
       <div class="my-4 border-t border-slate-200 dark:border-slate-800"></div>
       <a href="#settings" class="nav-item flex items-center px-3 py-2.5 rounded-xl text-sm font-medium transition-colors text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:text-white dark:hover:bg-slate-800/50"><i data-lucide="settings" class="w-5 h-5 mr-3"></i> 全局设置</a>
     </nav>
@@ -3394,6 +3565,70 @@ const UI_HTML = `<!DOCTYPE html>
         </div>
       </div>
 
+      <div id="view-dns" class="view-section w-full mx-auto space-y-6">
+        <div class="glass-card rounded-3xl p-6 shadow-sm flex flex-col min-h-[calc(100vh-120px)]">
+          <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+            <div class="min-w-0">
+              <h3 class="font-semibold text-lg flex-shrink-0">DNS编辑</h3>
+              <p id="dns-zone-hint" class="text-xs text-slate-500 mt-1 break-all">当前域名：加载中...</p>
+              <p class="text-[11px] text-slate-500 mt-1">提示：本页不支持新增/删除记录；名称只读；类型仅允许 A / AAAA / CNAME。</p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2 w-full md:w-auto">
+              <button onclick="App.loadDnsRecords()" class="text-brand-500 text-sm"><i data-lucide="refresh-cw" class="w-4 h-4 inline mr-1"></i>刷新</button>
+              <button id="dns-save-all-btn" onclick="App.saveAllDnsRecords(event)" class="px-4 py-2 bg-brand-600 text-white rounded-xl text-sm font-medium hover:bg-brand-700 flex items-center transition whitespace-nowrap disabled:opacity-40 disabled:pointer-events-none"><i data-lucide="save" class="w-4 h-4 mr-2"></i>保存全部</button>
+            </div>
+          </div>
+          <div class="overflow-x-auto min-h-0 w-full mb-4">
+            <table class="w-full text-left border-collapse table-fixed min-w-[900px]">
+              <thead>
+                <tr class="text-sm text-slate-500 border-b border-slate-200 dark:border-slate-800">
+                  <th class="py-3 px-4 w-28">类型</th>
+                  <th class="py-3 px-4 w-80">名称</th>
+                  <th class="py-3 px-4">内容</th>
+                  <th class="py-3 px-4 w-28">操作</th>
+                </tr>
+              </thead>
+              <tbody id="dns-tbody" class="text-sm"></tbody>
+            </table>
+          </div>
+          <div id="dns-empty" class="text-sm text-slate-500 text-center py-10 hidden">暂无 DNS 记录</div>
+
+          <div class="mt-auto pt-6 border-t border-slate-200 dark:border-slate-800">
+            <div class="ui-radius-card rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm">
+              <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                <div>
+                  <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">链接</div>
+                  <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">实用链接</div>
+                </div>
+                <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">快捷入口</span>
+              </div>
+              <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
+                <a href="https://cf.090227.xyz/" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
+                  <span class="text-sm font-semibold">优选域名</span>
+                  <i data-lucide="arrow-up-right" class="w-4 h-4 text-brand-600 dark:text-brand-400"></i>
+                </a>
+                <a href="https://vps789.com/" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
+                  <span class="text-sm font-semibold">VPS789</span>
+                  <i data-lucide="arrow-up-right" class="w-4 h-4 text-brand-600 dark:text-brand-400"></i>
+                </a>
+                <a href="https://www.wetest.vip/page/cloudflare/address_v4.html" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
+                  <span class="text-sm font-semibold">WeTest.Vip</span>
+                  <i data-lucide="arrow-up-right" class="w-4 h-4 text-brand-600 dark:text-brand-400"></i>
+                </a>
+                <a href="https://stock.hostmonit.com/CloudFlareYes" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
+                  <span class="text-sm font-semibold">CloudFlareYes</span>
+                  <i data-lucide="arrow-up-right" class="w-4 h-4 text-brand-600 dark:text-brand-400"></i>
+                </a>
+                <a href="https://ipdb.api.030101.xyz/" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
+                  <span class="text-sm font-semibold">IPDB API</span>
+                  <i data-lucide="arrow-up-right" class="w-4 h-4 text-brand-600 dark:text-brand-400"></i>
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div id="view-settings" class="view-section max-w-6xl mx-auto space-y-6">
            <div class="settings-view-layout flex flex-col gap-4 md:flex-row md:items-start md:gap-5">
               <div class="md:w-64 md:flex-shrink-0 md:self-start">
@@ -3459,6 +3694,22 @@ const UI_HTML = `<!DOCTYPE html>
                     <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">秒</span>
                   </div>
                   <p class="text-xs text-slate-500 ml-6">推荐 30 到 60 秒；系统会限制在 5 到 3600 秒之间，避免过短刷新放大控制台请求频率。</p>
+                </div>
+                <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block">
+                  <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                    <div>
+                      <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Radius</div>
+                      <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">UI 圆角弧度</div>
+                    </div>
+                    <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">0-48 px</span>
+                  </div>
+                  <p class="text-xs text-slate-500 mb-3 ml-6">控制管理界面主要卡片/面板的圆角弧度；设置为 0 可关闭圆角（更接近矩形 UI）。</p>
+                  <label class="block text-sm text-slate-500 mb-1 ml-6">圆角弧度</label>
+                  <div class="relative w-[calc(100%-1.5rem)] ml-6">
+                    <input type="number" min="0" max="48" step="1" id="cfg-ui-radius-px" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="24">
+                    <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">px</span>
+                  </div>
+                  <p class="text-xs text-slate-500 ml-6">推荐 16-24；保存后会立即应用到所有管理员界面（仅 UI，不影响代理业务逻辑）。</p>
                 </div>
                 <div class="flex flex-wrap gap-2">
                   <button onclick="App.saveSettings('ui')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存 UI 策略</button>
@@ -4008,16 +4259,19 @@ const UI_HTML = `<!DOCTYPE html>
   <dialog id="node-modal" class="backdrop:bg-slate-950/60 bg-transparent w-11/12 md:w-full max-w-6xl m-auto p-0">
     <div class="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl p-6 shadow-2xl">
       <h2 class="text-xl font-bold mb-4 text-slate-900 dark:text-white" id="node-modal-title">新建节点</h2>
-     <form onsubmit="App.saveNode(event)" class="space-y-4 max-h-[calc(80vh-env(safe-area-inset-bottom)-env(safe-area-inset-top))] overflow-y-auto pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[max(0.5rem,env(safe-area-inset-right))]">
+	     <form onsubmit="App.saveNode(event)" class="space-y-4 max-h-[calc(80vh-env(safe-area-inset-bottom)-env(safe-area-inset-top))] overflow-y-auto pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[max(0.5rem,env(safe-area-inset-right))]">
 	        <input type="hidden" id="form-original-name">
 	        <input type="hidden" id="form-active-line-id">
-	        <div><label class="block text-sm text-slate-500 mb-1">节点名称</label><input type="text" id="form-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white" required></div>
-	        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-	          <div><label class="block text-sm text-slate-500 mb-1">标签</label><input type="text" id="form-tag" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white"></div>
-	          <div><label class="block text-sm text-slate-500 mb-1">备注</label><input type="text" id="form-remark" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white"></div>
+	        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+	          <div><label class="block text-sm text-slate-500 mb-1">节点名称</label><input type="text" id="form-display-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white" required></div>
+	          <div><label class="block text-sm text-slate-500 mb-1">节点路径</label><input type="text" id="form-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white" placeholder="不修改默认同左侧"></div>
 	        </div>
+	        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+		          <div><label class="block text-sm text-slate-500 mb-1">标签</label><div class="flex gap-2"><input type="text" id="form-tag" class="flex-1 min-w-0 px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white"><select id="form-tag-color" class="w-28 px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white"><option value="amber">琥珀</option><option value="emerald">翠绿</option><option value="sky">天蓝</option><option value="violet">紫</option><option value="rose">红</option><option value="slate">灰</option></select></div></div>
+		          <div><label class="block text-sm text-slate-500 mb-1">备注</label><input type="text" id="form-remark" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white"></div>
+		        </div>
 	        
-	        <div><label class="block text-sm text-slate-500 mb-1">访问鉴权 (Secret, 可留空)</label><input type="text" id="form-secret" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white"></div>
+	        <div><label class="block text-sm text-slate-500 mb-1">访问鉴权 (Secret, 可留空)</label><input type="text" id="form-secret" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white"></div>
 	        
 	        <div class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-950/50 p-4">
 	          <div class="flex items-center justify-between gap-3 mb-3">
@@ -4058,6 +4312,7 @@ const UI_HTML = `<!DOCTYPE html>
     const UI_DEFAULTS = {
       dashboardAutoRefreshEnabled: false,
       dashboardAutoRefreshSeconds: 30,
+      uiRadiusPx: 24,
       directStaticAssets: false,
       directHlsDash: false,
       disablePrewarmPrefetch: false,
@@ -4086,7 +4341,8 @@ const UI_HTML = `<!DOCTYPE html>
     const CONFIG_FORM_BINDINGS = {
       ui: [
         { key: 'dashboardAutoRefreshEnabled', id: 'cfg-dashboard-auto-refresh', kind: 'checkbox', checkboxMode: 'strictTrue' },
-        { key: 'dashboardAutoRefreshSeconds', id: 'cfg-dashboard-auto-refresh-seconds', kind: 'int-finite', defaultValue: UI_DEFAULTS.dashboardAutoRefreshSeconds }
+        { key: 'dashboardAutoRefreshSeconds', id: 'cfg-dashboard-auto-refresh-seconds', kind: 'int-finite', defaultValue: UI_DEFAULTS.dashboardAutoRefreshSeconds },
+        { key: 'uiRadiusPx', id: 'cfg-ui-radius-px', kind: 'int-finite', defaultValue: UI_DEFAULTS.uiRadiusPx }
       ],
       proxy: [
         { key: 'enableH2', id: 'cfg-enable-h2', kind: 'checkbox', checkboxMode: 'truthy' },
@@ -4150,6 +4406,7 @@ const UI_HTML = `<!DOCTYPE html>
     const CONFIG_FIELD_LABELS = {
       dashboardAutoRefreshEnabled: 'Dashboard 自动刷新',
       dashboardAutoRefreshSeconds: 'Dashboard 自动刷新周期（秒）',
+      uiRadiusPx: 'UI 圆角弧度（px）',
       enableH2: 'HTTP/2',
       enableH3: 'HTTP/3',
       peakDowngrade: '晚高峰降级兜底',
@@ -4247,6 +4504,9 @@ const UI_HTML = `<!DOCTYPE html>
       logPage: 1,
       logTotalPages: 1,
       logsPlaybackModeFilter: '',
+      dnsRecords: [],
+      dnsZone: null,
+      dnsLoadSeq: 0,
       dashboardSeries: [],
       dashboardLoadSeq: 0,
       dashboardRefreshTimer: null,
@@ -4350,7 +4610,19 @@ const UI_HTML = `<!DOCTYPE html>
 
       applyRuntimeConfig(cfg) {
         this.runtimeConfig = cfg && typeof cfg === 'object' ? { ...cfg } : {};
+        this.applyUiRadius();
         this.syncDashboardAutoRefresh();
+      },
+
+      applyUiRadius() {
+        const raw = Number(this.runtimeConfig?.uiRadiusPx);
+        const fallback = Number(UI_DEFAULTS.uiRadiusPx);
+        let next = Number.isFinite(raw) ? Math.trunc(raw) : fallback;
+        if (!Number.isFinite(next)) next = 24;
+        next = Math.max(0, Math.min(48, next));
+        if (document?.documentElement?.style?.setProperty) {
+          document.documentElement.style.setProperty('--ui-radius-px', String(next) + 'px');
+        }
       },
 
       syncDashboardAutoRefresh() {
@@ -4988,7 +5260,7 @@ const UI_HTML = `<!DOCTYPE html>
         const filteredNodes = nodes
           .filter(node => {
             if (!keyword) return true;
-            const haystack = (String(node?.name || '') + ' ' + String(node?.tag || '') + ' ' + String(node?.remark || '')).toLowerCase();
+            const haystack = (String(node?.displayName || '') + ' ' + String(node?.name || '') + ' ' + String(node?.tag || '') + ' ' + String(node?.remark || '')).toLowerCase();
             return haystack.includes(keyword);
           })
           .sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || ''), 'zh-Hans-CN'));
@@ -5041,7 +5313,7 @@ const UI_HTML = `<!DOCTYPE html>
           content.className = 'min-w-0 flex-1';
           const title = document.createElement('div');
           title.className = 'text-sm font-medium text-slate-900 dark:text-white truncate';
-          title.textContent = node?.name || '未命名节点';
+          title.textContent = node?.displayName || node?.name || '未命名节点';
           const meta = document.createElement('div');
           meta.className = 'text-xs text-slate-500 mt-1 break-all';
           const metaParts = [];
@@ -5145,7 +5417,7 @@ const UI_HTML = `<!DOCTYPE html>
           nameInput.type = 'text';
           nameInput.value = line.name || '';
           nameInput.placeholder = this.buildDefaultLineName(index);
-          nameInput.className = 'w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white';
+          nameInput.className = 'w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white';
           nameInput.addEventListener('input', (event) => {
             line.name = event.currentTarget.value;
           });
@@ -5154,7 +5426,7 @@ const UI_HTML = `<!DOCTYPE html>
           targetInput.type = 'url';
           targetInput.value = line.target || '';
           targetInput.placeholder = 'https://emby.example.com';
-          targetInput.className = 'w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white';
+          targetInput.className = 'w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white';
           targetInput.addEventListener('input', (event) => {
             line.target = event.currentTarget.value;
           });
@@ -5260,6 +5532,26 @@ const UI_HTML = `<!DOCTYPE html>
         })();
         try { return await this.loginPromise; } finally { this.loginPromise = null; }
       },
+
+      bindNodeModalNameSync() {
+        const displayNameField = document.getElementById('form-display-name');
+        const pathField = document.getElementById('form-name');
+        if (!displayNameField || !pathField) return;
+        if (displayNameField.dataset.nodeNameSyncBound === '1') return;
+        displayNameField.dataset.nodeNameSyncBound = '1';
+
+        displayNameField.addEventListener('input', () => {
+          if (pathField.dataset.autoSync !== '1') return;
+          if (pathField.dataset.userEdited === '1') return;
+          pathField.value = displayNameField.value;
+        });
+
+        pathField.addEventListener('input', () => {
+          if (pathField.dataset.autoSync === '1') {
+            pathField.dataset.userEdited = '1';
+          }
+        });
+      },
       
       init() {
         const savedTheme = localStorage.getItem('theme');
@@ -5269,6 +5561,7 @@ const UI_HTML = `<!DOCTYPE html>
         
         this.safeCreateIcons();
         this.bindSettingsGuardrails();
+        this.bindNodeModalNameSync();
         window.onhashchange = () => this.route();
         window.addEventListener('resize', () => this.syncSettingsSplitLayout(window.location.hash || '#dashboard'));
         this.route();
@@ -5488,7 +5781,7 @@ const UI_HTML = `<!DOCTYPE html>
         const activeNav = document.querySelector('a[href="' + hash + '"]');
         if (activeNav) activeNav.classList.add('bg-brand-50', 'text-brand-600', 'dark:bg-brand-500/10', 'dark:text-brand-400');
 
-        const titles = {'#dashboard':'仪表盘', '#nodes':'节点列表', '#logs':'日志记录', '#settings':'全局设置'};
+        const titles = {'#dashboard':'仪表盘', '#nodes':'节点列表', '#logs':'日志记录', '#dns':'DNS编辑', '#settings':'全局设置'};
         document.getElementById('page-title').textContent = titles[hash] || 'Emby Proxy';
 
         // 移动端体验优化：切换菜单后自动收起侧边栏
@@ -5500,6 +5793,7 @@ const UI_HTML = `<!DOCTYPE html>
         if (hash === '#dashboard') this.loadDashboard();
         if (hash === '#nodes') this.loadNodes();
         if (hash === '#logs') this.loadLogs(1);
+        if (hash === '#dns') this.loadDnsRecords();
         if (hash === '#settings') this.loadSettings();
         this.syncDashboardAutoRefresh();
       },
@@ -5810,7 +6104,7 @@ const UI_HTML = `<!DOCTYPE html>
           dot.style.backgroundColor = '';
           dot.style.boxShadow = '';
 
-          const baseDot = 'w-3 h-3 rounded-full mr-3 transition-colors duration-500 flex-shrink-0 ';
+          const baseDot = 'w-3 h-3 rounded-full mr-2 transition-colors duration-500 flex-shrink-0 ';
           let colorClass = '';
           let txtClass = '';
 
@@ -5841,11 +6135,22 @@ const UI_HTML = `<!DOCTYPE html>
 
       renderNodesGrid() {
         const keyword = document.getElementById('node-search')?.value.toLowerCase() || '';
+        const tagPillPalette = {
+          amber: 'border-amber-200 bg-amber-100 text-amber-800 dark:border-amber-700 dark:bg-amber-900 dark:text-amber-100',
+          emerald: 'border-emerald-200 bg-emerald-100 text-emerald-800 dark:border-emerald-700 dark:bg-emerald-900 dark:text-emerald-100',
+          sky: 'border-sky-200 bg-sky-100 text-sky-800 dark:border-sky-700 dark:bg-sky-900 dark:text-sky-100',
+          violet: 'border-violet-200 bg-violet-100 text-violet-800 dark:border-violet-700 dark:bg-violet-900 dark:text-violet-100',
+          rose: 'border-rose-200 bg-rose-100 text-rose-800 dark:border-rose-700 dark:bg-rose-900 dark:text-rose-100',
+          slate: 'border-slate-200 bg-slate-100 text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200'
+        };
+        const remarkTone = { text: 'text-red-600 dark:text-red-400', icon: 'text-red-500 dark:text-red-400' };
         const filteredNodes = this.nodes
           .map(node => this.hydrateNode(node))
           .filter(n => {
             const lineNames = this.getNodeLines(n).map(line => line.name).join(' ').toLowerCase();
+            const displayName = String(n.displayName || n.name || '').toLowerCase();
             return n.name.toLowerCase().includes(keyword)
+              || displayName.includes(keyword)
               || (n.tag && n.tag.toLowerCase().includes(keyword))
               || (n.remark && n.remark.toLowerCase().includes(keyword))
               || lineNames.includes(keyword);
@@ -5876,34 +6181,39 @@ const UI_HTML = `<!DOCTYPE html>
 
           const top = document.createElement('div');
           const headerRow = document.createElement('div');
-          headerRow.className = 'flex items-start mb-2 w-full gap-3';
-          const dot = document.createElement('span');
-          dot.id = dotId;
-          dot.className = 'w-3 h-3 rounded-full mt-1 bg-slate-200 dark:bg-slate-700 transition-colors duration-500 flex-shrink-0 shadow-inner';
+          headerRow.className = 'flex items-end mb-2 w-full gap-3';
+          const sideTag = document.createElement('div');
+          const hasTag = String(n.tag || '').trim().length > 0;
+          const tagColorKey = this.normalizeNodeKey(n.tagColor || '');
+          const tagToneKey = hasTag ? (tagPillPalette[tagColorKey] ? tagColorKey : 'amber') : 'slate';
+          const tagToneClass = tagPillPalette[tagToneKey] || tagPillPalette.amber;
+          sideTag.className = 'inline-flex items-center justify-center rounded-full px-2.5 py-1 text-sm leading-5 font-semibold border truncate max-w-[7rem] ' + tagToneClass;
+          sideTag.textContent = hasTag ? n.tag : '无标签';
           const titleWrap = document.createElement('div');
-          titleWrap.className = 'flex-1 min-w-0 flex flex-wrap items-center gap-2';
+          titleWrap.className = 'flex-1 min-w-0 flex items-end gap-2';
           const title = document.createElement('h3');
           title.id = titleId;
-          title.className = 'font-semibold text-lg transition-colors min-w-0 truncate';
-          title.textContent = n.name;
+          title.className = 'font-bold text-xl md:text-2xl transition-colors min-w-0 truncate';
+          title.textContent = String(n.displayName || n.name || '');
           const activeBadge = document.createElement('span');
-          activeBadge.className = 'inline-flex max-w-full flex-shrink-0 items-center gap-1.5 rounded-full border border-emerald-300 bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500 px-3 py-1 text-[11px] font-black tracking-[0.08em] text-white dark:border-emerald-400/30';
+          activeBadge.className = 'inline-flex max-w-full flex-shrink-0 items-center rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-800 dark:border-emerald-700 dark:bg-emerald-900 dark:text-emerald-100';
           activeBadge.title = '当前启用线路';
-          const activeBadgeIcon = document.createElement('i');
-          activeBadgeIcon.setAttribute('data-lucide', 'route');
-          activeBadgeIcon.className = 'w-3.5 h-3.5 flex-shrink-0';
           const activeBadgeText = document.createElement('span');
           activeBadgeText.className = 'truncate max-w-[9rem]';
           activeBadgeText.textContent = activeLine?.name || '未启用线路';
-          activeBadge.appendChild(activeBadgeIcon);
           activeBadge.appendChild(activeBadgeText);
-          headerRow.appendChild(dot);
+          headerRow.appendChild(sideTag);
           titleWrap.appendChild(title);
           titleWrap.appendChild(activeBadge);
           headerRow.appendChild(titleWrap);
 
           const metaRow = document.createElement('div');
-          metaRow.className = 'text-xs text-slate-400 mb-2 flex justify-between tracking-wider';
+          metaRow.className = 'text-sm text-slate-500 dark:text-slate-400 mb-2 flex justify-between tracking-wide';
+          const pingWrap = document.createElement('div');
+          pingWrap.className = 'flex items-center min-w-0';
+          const dot = document.createElement('span');
+          dot.id = dotId;
+          dot.className = 'w-3 h-3 rounded-full mr-2 bg-slate-200 dark:bg-slate-700 transition-colors duration-500 flex-shrink-0 shadow-inner';
           const pingLabel = document.createElement('span');
           pingLabel.textContent = 'Ping: ';
           const pingValue = document.createElement('span');
@@ -5911,6 +6221,8 @@ const UI_HTML = `<!DOCTYPE html>
           pingValue.textContent = this.formatLatency(activeLine?.latencyMs);
           pingValue.className = 'text-slate-500 dark:text-slate-400 font-medium';
           pingLabel.appendChild(pingValue);
+          pingWrap.appendChild(dot);
+          pingWrap.appendChild(pingLabel);
           const shield = document.createElement('span');
           shield.className = 'truncate ml-2 text-right';
           const shieldIcon = document.createElement('i');
@@ -5918,8 +6230,11 @@ const UI_HTML = `<!DOCTYPE html>
           shieldIcon.className = 'w-3 h-3 inline';
           shield.appendChild(shieldIcon);
           shield.appendChild(document.createTextNode(' ' + (n.secret ? '已防护' : '未防护')));
-          metaRow.appendChild(pingLabel);
+          metaRow.appendChild(pingWrap);
           metaRow.appendChild(shield);
+
+          const divider = document.createElement('div');
+          divider.className = 'mt-2 mb-3 border-t border-dashed border-slate-200/80 dark:border-slate-700/70';
 
           const detailWrap = document.createElement('div');
           detailWrap.className = 'text-xs text-slate-500 dark:text-slate-400 mb-3 space-y-1';
@@ -5929,36 +6244,50 @@ const UI_HTML = `<!DOCTYPE html>
           lineIcon.setAttribute('data-lucide', 'route');
           lineIcon.className = 'w-3 h-3 mr-1.5 flex-shrink-0 text-emerald-500';
           const lineText = document.createElement('span');
-          lineText.className = 'truncate flex-1 min-w-0';
-          lineText.textContent = '当前线路：' + (activeLine?.name || '未启用') + ' / 共 ' + nodeLines.length + ' 条';
+          lineText.className = 'truncate flex-1 min-w-0 text-[15px] md:text-base leading-6 font-medium text-emerald-700 dark:text-emerald-300';
+          lineText.textContent = '线路：共 ' + nodeLines.length + ' 条';
           lineRow.appendChild(lineIcon);
           lineRow.appendChild(lineText);
-          const tagRow = document.createElement('div');
-          tagRow.className = 'flex items-center min-w-0';
-          const tagIcon = document.createElement('i');
-          tagIcon.setAttribute('data-lucide', 'tag');
-          tagIcon.className = 'w-3 h-3 mr-1.5 flex-shrink-0 text-brand-500';
-          const tagText = document.createElement('span');
-          tagText.className = 'truncate flex-1 min-w-0';
-          tagText.textContent = n.tag || '无标签';
-          tagRow.appendChild(tagIcon);
-          tagRow.appendChild(tagText);
-          const remarkRow = document.createElement('div');
-          remarkRow.className = 'flex items-center min-w-0';
-          const remarkIcon = document.createElement('i');
-          remarkIcon.setAttribute('data-lucide', 'file-text');
-          remarkIcon.className = 'w-3 h-3 mr-1.5 flex-shrink-0 text-purple-500';
-          const remarkText = document.createElement('span');
-          remarkText.className = 'truncate flex-1 min-w-0';
-          remarkText.textContent = n.remark || '无备注';
-          remarkRow.appendChild(remarkIcon);
-          remarkRow.appendChild(remarkText);
-          detailWrap.appendChild(tagRow);
-          detailWrap.appendChild(remarkRow);
+          const remarkValue = String(n.remark || '').trim();
+          if (remarkValue) {
+            const remarkRow = document.createElement('div');
+            remarkRow.className = 'flex items-center min-w-0';
+            const svgNs = 'http://www.w3.org/2000/svg';
+            const remarkIcon = document.createElementNS(svgNs, 'svg');
+            remarkIcon.setAttribute('viewBox', '0 0 24 24');
+            remarkIcon.setAttribute('fill', 'none');
+            remarkIcon.setAttribute('stroke', 'currentColor');
+            remarkIcon.setAttribute('stroke-width', '2');
+            remarkIcon.setAttribute('stroke-linecap', 'round');
+            remarkIcon.setAttribute('stroke-linejoin', 'round');
+            remarkIcon.setAttribute('class', 'w-4 h-4 mr-1.5 flex-shrink-0 ' + remarkTone.icon);
+            const alertTriangle = document.createElementNS(svgNs, 'path');
+            alertTriangle.setAttribute('d', 'M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z');
+            const alertLine = document.createElementNS(svgNs, 'line');
+            alertLine.setAttribute('x1', '12');
+            alertLine.setAttribute('y1', '9');
+            alertLine.setAttribute('x2', '12');
+            alertLine.setAttribute('y2', '13');
+            const alertDot = document.createElementNS(svgNs, 'line');
+            alertDot.setAttribute('x1', '12');
+            alertDot.setAttribute('y1', '17');
+            alertDot.setAttribute('x2', '12.01');
+            alertDot.setAttribute('y2', '17');
+            remarkIcon.appendChild(alertTriangle);
+            remarkIcon.appendChild(alertLine);
+            remarkIcon.appendChild(alertDot);
+            const remarkText = document.createElement('span');
+            remarkText.className = 'truncate flex-1 min-w-0 text-[15px] md:text-base leading-6 font-medium ' + remarkTone.text;
+            remarkText.textContent = remarkValue;
+            remarkRow.appendChild(remarkIcon);
+            remarkRow.appendChild(remarkText);
+            detailWrap.appendChild(remarkRow);
+          }
           detailWrap.appendChild(lineRow);
 
           top.appendChild(headerRow);
           top.appendChild(metaRow);
+          top.appendChild(divider);
           top.appendChild(detailWrap);
 
           const bottom = document.createElement('div');
@@ -6085,17 +6414,29 @@ const UI_HTML = `<!DOCTYPE html>
         document.getElementById('node-modal-title').textContent = name ? '编辑节点' : '新建节点';
         const form = document.querySelector('#node-modal form'); form.reset();
         document.getElementById('headers-container').innerHTML = ''; 
+        const displayNameField = document.getElementById('form-display-name');
+        const pathField = document.getElementById('form-name');
+        const tagColorField = document.getElementById('form-tag-color');
+        if (pathField) {
+            pathField.dataset.userEdited = '';
+            pathField.dataset.autoSync = '1';
+        }
         
         if(name) {
             const n = this.nodes.find(x => String(x.name) === String(name));
             if(n) {
                 const hydratedNode = this.hydrateNode(n);
                 document.getElementById('form-original-name').value = n.name; 
+                if (displayNameField) displayNameField.value = n.displayName || n.name;
                 document.getElementById('form-name').value = n.name;
+                if (pathField && displayNameField) {
+                    pathField.dataset.autoSync = String(pathField.value || '') === String(displayNameField.value || '') ? '1' : '0';
+                }
                 document.getElementById('form-name').readOnly = false; 
                 document.getElementById('form-secret').value = n.secret || ''; 
                 document.getElementById('form-tag').value = n.tag || '';
                 document.getElementById('form-remark').value = n.remark || ''; 
+                if (tagColorField) tagColorField.value = n.tagColor || 'amber';
                 this.ensureNodeModalLines(hydratedNode.lines, hydratedNode.target);
                 document.getElementById('form-active-line-id').value = hydratedNode.activeLineId || this.nodeModalLines[0]?.id || '';
                 
@@ -6107,6 +6448,9 @@ const UI_HTML = `<!DOCTYPE html>
             }
         } else {
             document.getElementById('form-original-name').value = '';
+            if (displayNameField) displayNameField.value = '';
+            if (pathField) pathField.value = '';
+            if (tagColorField) tagColorField.value = 'amber';
             this.ensureNodeModalLines();
             document.getElementById('form-active-line-id').value = this.nodeModalLines[0]?.id || '';
             this.addHeaderRow(); 
@@ -6128,15 +6472,25 @@ const UI_HTML = `<!DOCTYPE html>
               const v = hVals[i].value.trim();
               if(k) headersObj[k] = v;
           }
+
+          const displayName = document.getElementById('form-display-name')?.value.trim() || '';
+          const nodePath = document.getElementById('form-name')?.value.trim() || displayName;
+          const tagColor = document.getElementById('form-tag-color')?.value || 'amber';
           
           const payload = {
               originalName: document.getElementById('form-original-name').value,
-              name: document.getElementById('form-name').value.trim(),
+              name: nodePath,
+              displayName,
               secret: document.getElementById('form-secret').value.trim(),
               tag: document.getElementById('form-tag').value.trim(),
+              tagColor,
               remark: document.getElementById('form-remark').value.trim(),
               headers: headersObj
           };
+          if (!payload.name) {
+              alert('节点路径不能为空');
+              return;
+          }
 
           const normalizedLines = [];
           for (let index = 0; index < this.nodeModalLines.length; index++) {
@@ -6182,11 +6536,13 @@ const UI_HTML = `<!DOCTYPE html>
           const optimisticNode = {
               ...(previousNode || {}),
               name: payload.name,
+              displayName: payload.displayName,
               target: payload.target,
               lines: payload.lines,
               activeLineId: payload.activeLineId,
               secret: payload.secret,
               tag: payload.tag,
+              tagColor: payload.tagColor,
               remark: payload.remark,
               headers: payload.headers
           };
@@ -6325,6 +6681,352 @@ const UI_HTML = `<!DOCTYPE html>
           this.logsPlaybackModeFilter = String(mode || '').trim();
           this.updateLogsPlaybackFilterButtons();
           this.loadLogs(1);
+      },
+
+      // ============================================================================
+      // DNS 编辑：读取 / 受限修改（不支持增删）
+      // ============================================================================
+      isDnsTypeAllowed(type) {
+          const upper = String(type || '').toUpperCase();
+          return upper === 'A' || upper === 'AAAA' || upper === 'CNAME';
+      },
+
+      isDnsRecordDirty(record) {
+          if (!record) return false;
+          const type = String(record.type || '').toUpperCase();
+          const content = String(record.content || '');
+          const originalType = String(record._originalType || '').toUpperCase();
+          const originalContent = String(record._originalContent || '');
+          return type !== originalType || content !== originalContent;
+      },
+
+      inferZoneNameFromRecordNames(names = []) {
+          const normalized = (Array.isArray(names) ? names : [])
+            .map(name => String(name || '').trim().toLowerCase())
+            .filter(Boolean);
+          if (!normalized.length) return '';
+
+          const reversedPartsList = normalized
+            .map(name => name.split('.').map(part => part.trim()).filter(Boolean).reverse())
+            .filter(parts => parts.length > 0);
+          if (!reversedPartsList.length) return '';
+
+          let common = reversedPartsList[0].slice();
+          for (let i = 1; i < reversedPartsList.length && common.length; i++) {
+              const parts = reversedPartsList[i];
+              let j = 0;
+              while (j < common.length && j < parts.length && common[j] === parts[j]) j++;
+              common = common.slice(0, j);
+          }
+
+          const zoneParts = common.slice().reverse();
+          if (zoneParts.length < 2) return '';
+          return zoneParts.join('.');
+      },
+
+      updateDnsSaveAllButtonState() {
+          const btn = document.getElementById('dns-save-all-btn');
+          if (!btn) return;
+          const records = Array.isArray(this.dnsRecords) ? this.dnsRecords : [];
+          const dirtyCount = records.filter(r => r && r.editable && this.isDnsRecordDirty(r) && !r._saving).length;
+          const anySaving = records.some(r => r && r._saving);
+          btn.disabled = anySaving || dirtyCount === 0;
+          btn.title = anySaving ? '正在保存中...' : (dirtyCount ? ('将保存 ' + dirtyCount + ' 条变更') : '没有可保存的变更');
+      },
+
+      renderDnsRecords() {
+          const tbody = document.getElementById('dns-tbody');
+          const empty = document.getElementById('dns-empty');
+          if (!tbody) return;
+          const records = Array.isArray(this.dnsRecords) ? this.dnsRecords : [];
+          tbody.innerHTML = '';
+          if (empty) empty.classList.add('hidden');
+
+          if (!records.length) {
+              if (empty) empty.classList.remove('hidden');
+              this.updateDnsSaveAllButtonState();
+              return;
+          }
+
+          records.forEach((record) => {
+              const row = document.createElement('tr');
+              row.className = 'border-b border-slate-200 dark:border-slate-800 hover:bg-slate-50/60 dark:hover:bg-slate-900/40';
+
+              const typeCell = document.createElement('td');
+              typeCell.className = 'py-3 px-4';
+              const typeSelect = document.createElement('select');
+              typeSelect.className = 'w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white disabled:opacity-50';
+              ['A', 'AAAA', 'CNAME'].forEach((t) => {
+                  const opt = document.createElement('option');
+                  opt.value = t;
+                  opt.textContent = t;
+                  typeSelect.appendChild(opt);
+              });
+
+              const currentType = String(record.type || '').toUpperCase();
+              const editable = this.isDnsTypeAllowed(currentType);
+              record.editable = editable;
+              if (editable) {
+                  typeSelect.value = currentType;
+                  typeSelect.disabled = !!record._saving;
+                  typeSelect.addEventListener('change', (event) => {
+                      record.type = String(event.currentTarget.value || '').toUpperCase();
+                      updateDirtyUi();
+                      this.updateDnsSaveAllButtonState();
+                  });
+                  typeCell.appendChild(typeSelect);
+              } else {
+                  const badge = document.createElement('div');
+                  badge.className = 'text-xs font-mono text-slate-500 dark:text-slate-400 px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700';
+                  badge.textContent = currentType || '-';
+                  badge.title = '该类型不在受限编辑范围内';
+                  typeCell.appendChild(badge);
+              }
+
+              const nameCell = document.createElement('td');
+              nameCell.className = 'py-3 px-4';
+              const nameInput = document.createElement('input');
+              nameInput.type = 'text';
+              nameInput.value = record.name || '';
+              nameInput.disabled = true;
+              nameInput.className = 'w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 outline-none text-sm text-slate-500 dark:text-slate-400';
+              nameCell.appendChild(nameInput);
+
+              const contentCell = document.createElement('td');
+              contentCell.className = 'py-3 px-4';
+              const contentInput = document.createElement('input');
+              contentInput.type = 'text';
+              contentInput.value = record.content || '';
+              contentInput.disabled = !editable || !!record._saving;
+              contentInput.placeholder = editable ? '请输入记录内容' : '只读';
+              contentInput.className = 'w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white disabled:bg-slate-100 disabled:dark:bg-slate-800 disabled:text-slate-500 disabled:dark:text-slate-400 disabled:opacity-70';
+              contentInput.addEventListener('input', (event) => {
+                  record.content = event.currentTarget.value;
+                  updateDirtyUi();
+                  this.updateDnsSaveAllButtonState();
+              });
+              contentCell.appendChild(contentInput);
+
+              const actionCell = document.createElement('td');
+              actionCell.className = 'py-3 px-4';
+
+              let saveBtn = null;
+
+              const updateDirtyUi = () => {
+                  if (saveBtn) {
+                      const dirty = this.isDnsRecordDirty(record);
+                      saveBtn.disabled = !!record._saving || !dirty;
+                      saveBtn.textContent = record._saving ? '保存中...' : '保存';
+                  }
+                  if (editable) {
+                      typeSelect.disabled = !!record._saving;
+                      contentInput.disabled = !!record._saving;
+                  }
+              };
+
+              if (editable) {
+                  saveBtn = document.createElement('button');
+                  saveBtn.type = 'button';
+                  saveBtn.className = 'px-3 py-1.5 rounded-lg bg-brand-600 text-white text-sm font-medium hover:bg-brand-700 transition disabled:opacity-40 disabled:pointer-events-none';
+                  saveBtn.textContent = '保存';
+                  saveBtn.addEventListener('click', async () => {
+                      try {
+                          await this.saveDnsRecord(record.id, { button: saveBtn, typeSelect, contentInput });
+                      } catch (e) {
+                          alert('保存失败: ' + (e && e.message ? e.message : '未知错误'));
+                      }
+                  });
+                  actionCell.appendChild(saveBtn);
+              } else {
+                  const ro = document.createElement('span');
+                  ro.className = 'text-xs text-slate-400';
+                  ro.textContent = '只读';
+                  actionCell.appendChild(ro);
+              }
+
+              row.appendChild(typeCell);
+              row.appendChild(nameCell);
+              row.appendChild(contentCell);
+              row.appendChild(actionCell);
+              tbody.appendChild(row);
+
+              updateDirtyUi();
+          });
+
+          this.updateDnsSaveAllButtonState();
+      },
+
+      isValidIpv4(value) {
+          const v = String(value || '').trim();
+          const parts = v.split('.');
+          if (parts.length !== 4) return false;
+          for (const part of parts) {
+              if (!/^[0-9]{1,3}$/.test(part)) return false;
+              const num = Number(part);
+              if (!Number.isFinite(num) || num < 0 || num > 255) return false;
+          }
+          return true;
+      },
+
+      isValidIpv6(value) {
+          const v = String(value || '').trim();
+          if (!v) return false;
+          if (!v.includes(':')) return false;
+          if (/[\\s]/.test(v)) return false;
+          try {
+              // 利用 URL 解析做一个轻量校验（浏览器原生）
+              new URL('http://[' + v + ']/');
+              return true;
+          } catch {
+              return false;
+          }
+      },
+
+      validateDnsRecordForSave(record) {
+          const type = String(record?.type || '').toUpperCase();
+          const content = String(record?.content || '').trim();
+          if (!this.isDnsTypeAllowed(type)) return 'Type 仅允许 A / AAAA / CNAME';
+          if (!content) return 'Content 不能为空';
+          if (type === 'A' && !this.isValidIpv4(content)) return 'A 记录 Content 必须是合法 IPv4 地址';
+          if (type === 'AAAA' && !this.isValidIpv6(content)) return 'AAAA 记录 Content 必须是合法 IPv6 地址';
+          if (type === 'CNAME') {
+              if (/[\\s]/.test(content)) return 'CNAME 记录 Content 不能包含空格';
+              if (content.length > 255) return 'CNAME 记录 Content 过长';
+          }
+          return '';
+      },
+
+      async loadDnsRecords() {
+          const loadSeq = ++this.dnsLoadSeq;
+          const hint = document.getElementById('dns-zone-hint');
+          if (hint) hint.textContent = '当前域名：加载中...';
+
+          try {
+              const res = await this.apiCall('listDnsRecords');
+              if (loadSeq !== this.dnsLoadSeq) return;
+
+              const zoneName = res.zoneName || res.zone?.name || '';
+              const zoneId = res.zoneId || res.zone?.id || '';
+
+              const rawRecords = Array.isArray(res.records) ? res.records : [];
+              const inferredZoneName = zoneName ? String(zoneName || '') : this.inferZoneNameFromRecordNames(rawRecords.map(item => item?.name));
+              const displayZoneName = String(inferredZoneName || zoneName || '').trim();
+              if (hint) {
+                  const zoneText = displayZoneName ? displayZoneName : '未知域名';
+                  hint.textContent = '当前域名：' + zoneText;
+              }
+              const records = rawRecords.map((item) => {
+                  const type = String(item?.type || '').toUpperCase();
+                  const name = String(item?.name || '');
+                  const content = String(item?.content || '');
+                  return {
+                      id: String(item?.id || ''),
+                      type,
+                      name,
+                      content,
+                      ttl: Number(item?.ttl) || 1,
+                      proxied: item?.proxied === true,
+                      editable: this.isDnsTypeAllowed(type),
+                      _originalType: type,
+                      _originalContent: content,
+                      _saving: false
+                  };
+              }).filter(r => r.id && r.name);
+
+              records.sort((a, b) => (a.name.localeCompare(b.name) || a.type.localeCompare(b.type) || a.id.localeCompare(b.id)));
+              this.dnsRecords = records;
+              this.dnsZone = zoneId || displayZoneName ? { id: zoneId, name: displayZoneName } : null;
+              this.renderDnsRecords();
+          } catch (e) {
+              if (loadSeq !== this.dnsLoadSeq) return;
+              console.error('loadDnsRecords failed', e);
+              if (hint) hint.textContent = '当前域名：加载失败（请检查 CF Zone ID、API 令牌权限）';
+              this.dnsRecords = [];
+              this.renderDnsRecords();
+              const message = e && e.message ? e.message : '未知错误';
+              alert('DNS 记录加载失败: ' + message);
+          }
+      },
+
+      async saveDnsRecord(recordId, opts = {}) {
+          const records = Array.isArray(this.dnsRecords) ? this.dnsRecords : [];
+          const record = records.find(r => String(r?.id || '') === String(recordId || ''));
+          if (!record) throw new Error('记录不存在');
+
+          if (!record.editable) throw new Error('该记录类型不支持编辑');
+          const dirty = this.isDnsRecordDirty(record);
+          if (!dirty) return;
+
+          const validationError = this.validateDnsRecordForSave(record);
+          if (validationError) throw new Error(validationError);
+
+          record._saving = true;
+          if (opts.button) {
+              opts.button.disabled = true;
+              opts.button.textContent = '保存中...';
+          }
+          if (opts.typeSelect) opts.typeSelect.disabled = true;
+          if (opts.contentInput) opts.contentInput.disabled = true;
+          this.updateDnsSaveAllButtonState();
+
+          try {
+              await this.apiCall('updateDnsRecord', { recordId: record.id, type: record.type, content: record.content });
+              record._originalType = String(record.type || '').toUpperCase();
+              record._originalContent = String(record.content || '');
+              if (!opts.silent) alert('保存成功');
+          } finally {
+              record._saving = false;
+              if (opts.button) {
+                  opts.button.textContent = '保存';
+              }
+              if (opts.typeSelect) opts.typeSelect.disabled = false;
+              if (opts.contentInput) opts.contentInput.disabled = false;
+              this.updateDnsSaveAllButtonState();
+              if (opts.button) opts.button.disabled = !this.isDnsRecordDirty(record);
+          }
+      },
+
+      async saveAllDnsRecords(event) {
+          const btn = event && event.currentTarget ? event.currentTarget : document.getElementById('dns-save-all-btn');
+          const records = Array.isArray(this.dnsRecords) ? this.dnsRecords : [];
+          const dirtyRecords = records.filter(r => r && r.editable && this.isDnsRecordDirty(r) && !r._saving);
+          if (!dirtyRecords.length) return alert('没有需要保存的变更');
+
+          if (!confirm('确定保存 ' + dirtyRecords.length + ' 条 DNS 记录变更？')) return;
+
+          const originalText = btn && btn.textContent ? btn.textContent : '';
+          if (btn) {
+              btn.disabled = true;
+              btn.textContent = '保存中...';
+          }
+
+          const errors = [];
+          let okCount = 0;
+          try {
+              for (let i = 0; i < dirtyRecords.length; i++) {
+                  const record = dirtyRecords[i];
+                  if (btn) btn.textContent = '保存中... (' + (i + 1) + '/' + dirtyRecords.length + ')';
+                  try {
+                      await this.saveDnsRecord(record.id, { silent: true });
+                      okCount += 1;
+                  } catch (e) {
+                      errors.push((record.name || record.id) + ': ' + (e && e.message ? e.message : '未知错误'));
+                  }
+              }
+          } finally {
+              if (btn) {
+                  btn.textContent = originalText || '保存全部';
+              }
+              this.updateDnsSaveAllButtonState();
+          }
+
+          if (errors.length) {
+              const head = '已保存 ' + okCount + '/' + dirtyRecords.length + '，失败 ' + errors.length + ' 条。';
+              const detail = errors.slice(0, 6).join('\\n') + (errors.length > 6 ? '\\n...' : '');
+              alert(head + '\\n' + detail);
+          } else {
+              alert('已保存 ' + okCount + ' 条 DNS 记录变更');
+          }
       },
 
       async loadLogs(page = this.logPage) {
@@ -6559,7 +7261,7 @@ const UI_HTML = `<!DOCTYPE html>
 // - `scheduled` 负责日志清理与日报等定时任务。
 // ============================================================================
 function renderLandingPage() {
-  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy V18.3</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 flex items-center justify-center min-h-screen text-center"><div class="p-8 max-w-md w-full bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl"><div class="w-16 h-16 mx-auto bg-brand-500/20 rounded-2xl flex items-center justify-center text-blue-500 mb-6"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg></div><h1 class="text-3xl font-bold text-white mb-2">Emby Proxy V18.3</h1><p class="text-slate-400 mb-8">高性能媒体代理与分流中心</p><a href="/admin" class="block w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-medium transition">进入管理控制台</a></div></body></html>`;
+  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 flex items-center justify-center min-h-screen text-center"><div class="p-8 max-w-md w-full bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl"><div class="w-16 h-16 mx-auto bg-brand-500/20 rounded-2xl flex items-center justify-center text-blue-500 mb-6"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg></div><h1 class="text-3xl font-bold text-white mb-2">Emby Proxy</h1><p class="text-slate-400 mb-8">高性能媒体代理与分流中心</p><a href="/admin" class="block w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-medium transition">进入管理控制台</a></div></body></html>`;
   const headers = new Headers({ 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' });
   applySecurityHeaders(headers);
   headers.set('X-Frame-Options', 'DENY');
