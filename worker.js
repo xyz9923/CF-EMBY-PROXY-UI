@@ -133,6 +133,8 @@ const GLOBALS = {
   LogDedupe: new Map(),
   RateLimitCache: new Map(),
   LogFlushPending: false,
+  LogFlushTask: null,
+  LogClearEpochMs: 0,
   LogLastFlushAt: 0,
   OpsStatusWriteChain: Promise.resolve(),
   OpsStatusDbReady: new WeakMap(),
@@ -653,6 +655,41 @@ function normalizeNodeNameList(input) {
     result.push(value);
   }
   return result;
+}
+
+function reconcileNamedNodeSelection(currentSelection = [], options = {}) {
+  const renameMapInput = options.renameMap instanceof Map
+    ? options.renameMap
+    : new Map(Object.entries(options.renameMap && typeof options.renameMap === "object" ? options.renameMap : {}));
+  const renameMap = new Map();
+  for (const [fromName, toName] of renameMapInput.entries()) {
+    const fromKey = String(fromName || "").trim().toLowerCase();
+    const nextName = String(toName || "").trim();
+    if (!fromKey || !nextName) continue;
+    renameMap.set(fromKey, nextName);
+  }
+  const removedKeys = new Set(normalizeNodeNameList(options.removedNames || []).map(name => String(name || "").trim().toLowerCase()).filter(Boolean));
+  /** @type {[string, string][] | null} */
+  const allowedNameEntries = options.allowedNames === undefined
+    ? null
+    : normalizeNodeNameList(options.allowedNames || [])
+        .map(name => /** @type {[string, string]} */ ([String(name || "").trim().toLowerCase(), String(name || "").trim()]))
+        .filter(([key, value]) => key && value);
+  const allowedNameMap = allowedNameEntries ? new Map(allowedNameEntries) : null;
+  const nextSelection = [];
+  const seen = new Set();
+  for (const rawName of normalizeNodeNameList(currentSelection)) {
+    const currentKey = String(rawName || "").trim().toLowerCase();
+    if (!currentKey || removedKeys.has(currentKey)) continue;
+    const renamedName = renameMap.get(currentKey) || String(rawName || "").trim();
+    const nextKey = renamedName.toLowerCase();
+    if (!nextKey || removedKeys.has(nextKey)) continue;
+    if (allowedNameMap && !allowedNameMap.has(nextKey)) continue;
+    if (seen.has(nextKey)) continue;
+    seen.add(nextKey);
+    nextSelection.push(allowedNameMap?.get(nextKey) || renamedName);
+  }
+  return nextSelection;
 }
 
 function isNodeDirectSourceEnabled(node, currentConfig = null) {
@@ -1536,6 +1573,16 @@ const Database = {
   async getOpsStatus(envOrStore) {
     return this.getOpsStatusFromStores(this.resolveOpsStatusStores(envOrStore));
   },
+  getLogClearEpochMsFromStatus(logStatus) {
+    const epoch = Number(logStatus?.clearEpochMs);
+    return Number.isFinite(epoch) && epoch > 0 ? Math.floor(epoch) : 0;
+  },
+  async getLogClearEpochMs(envOrStore) {
+    const logStatus = await this.getOpsStatusSection(envOrStore, "log");
+    const epoch = this.getLogClearEpochMsFromStatus(logStatus);
+    if (epoch > GLOBALS.LogClearEpochMs) GLOBALS.LogClearEpochMs = epoch;
+    return epoch;
+  },
   async patchOpsStatus(envOrKv, patch, ctx = null) {
     const stores = this.resolveOpsStatusStores(envOrKv);
     if (!stores.kv && !stores.db) return {};
@@ -1992,6 +2039,31 @@ const Database = {
     }
     return nextConfig;
   },
+  async syncSourceDirectNodesConfig(env, kv, ctx, options = {}) {
+    if (!kv) return null;
+    const currentConfig = env
+      ? await getRuntimeConfig(env)
+      : sanitizeRuntimeConfig(await kv.get(this.CONFIG_KEY, { type: "json" }) || {});
+    const currentSelection = normalizeNodeNameList(currentConfig.sourceDirectNodes || currentConfig.directSourceNodes || currentConfig.nodeDirectList || []);
+    const nextSelection = reconcileNamedNodeSelection(currentSelection, {
+      renameMap: options.renameMap,
+      removedNames: options.removedNames,
+      allowedNames: options.allowedNames
+    });
+    if (serializeConfigValue(currentSelection) === serializeConfigValue(nextSelection)) return currentConfig;
+    return this.persistRuntimeConfig({ ...currentConfig, sourceDirectNodes: nextSelection }, {
+      env,
+      kv,
+      ctx,
+      snapshotMeta: {
+        reason: "sync_source_direct_nodes",
+        section: "proxy",
+        source: String(options.source || "node_mutation"),
+        actor: "admin",
+        note: String(options.note || "").trim()
+      }
+    });
+  },
   async sendTelegramMessage({ tgBotToken, tgChatId, text }) {
       const botToken = String(tgBotToken || "").trim();
       const chatId = String(tgChatId || "").trim();
@@ -2191,6 +2263,12 @@ const Database = {
       .replace(/^-+|-+$/g, "");
     return normalized || `line-${Number(fallbackIndex) + 1}`;
   },
+  parseLatencyMs(value) {
+    if (value === "" || value === null || value === undefined) return null;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0) return null;
+    return Math.round(parsed);
+  },
   normalizeIsoDatetime(value) {
     if (!value) return "";
     const date = new Date(value);
@@ -2228,12 +2306,11 @@ const Database = {
       }
       usedIds.add(nextId);
 
-      const latencyCandidate = Number(line?.latencyMs);
       normalized.push({
         id: nextId,
         name: String(line?.name || "").trim() || this.buildDefaultLineName(index),
         target,
-        latencyMs: Number.isFinite(latencyCandidate) && latencyCandidate >= 0 ? Math.round(latencyCandidate) : null,
+        latencyMs: this.parseLatencyMs(line?.latencyMs),
         latencyUpdatedAt: this.normalizeIsoDatetime(line?.latencyUpdatedAt)
       });
     });
@@ -2658,16 +2735,23 @@ const Database = {
       return new Response(JSON.stringify({ nodes: await CacheManager.getNodesList(env, ctx) }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
     },
 
-    async saveOrImport(data, { action, ctx, kv }) {
+    async saveOrImport(data, { action, ctx, kv, env }) {
       const nodesToSave = action === "save" ? [data] : data.nodes;
       const savedNodes = [];
       let index = await Database.getNodesIndex(kv);
+      const renameMap = new Map();
       
       for (const n of nodesToSave) {
         if (!n.name || (!n.target && !(Array.isArray(n.lines) && n.lines.length))) continue;
         const name = String(n.name).toLowerCase();
         const originalName = n.originalName ? String(n.originalName).toLowerCase() : null;
         const isRename = !!(originalName && originalName !== name);
+        if (action === "save" && (!originalName || originalName !== name)) {
+          const targetExisting = await kv.get(`${Database.PREFIX}${name}`, { type: "json" });
+          if (targetExisting) {
+            return jsonError("NODE_NAME_CONFLICT", "节点路径已存在，请更换后重试", 409, { name });
+          }
+        }
         
         let existingNode = {};
         if (isRename) {
@@ -2683,6 +2767,7 @@ const Database = {
           await kv.delete(`${Database.PREFIX}${originalName}`);
           Database.invalidateNodeCaches([originalName, name], { invalidateList: true });
           index = index.filter(x => x !== originalName);
+          renameMap.set(originalName, name);
         } else {
           Database.invalidateNodeCaches(name, { invalidateList: true });
         }
@@ -2692,6 +2777,14 @@ const Database = {
       
       if (savedNodes.length > 0) { 
         await Database.persistNodesIndex(index, { kv, ctx, invalidateList: true });
+      }
+      if (renameMap.size > 0) {
+        await Database.syncSourceDirectNodesConfig(env, kv, ctx, {
+          renameMap,
+          allowedNames: index,
+          source: action === "import" ? "node_import" : "node_save",
+          note: [...renameMap.entries()].map(([fromName, toName]) => `${fromName}->${toName}`).join(",")
+        });
       }
       
       if (action === "save" && savedNodes.length === 0) return jsonError("INVALID_TARGET", "目标源站必须是有效的 http/https URL");
@@ -2735,13 +2828,19 @@ const Database = {
       return jsonResponse({ success: true, config: savedConfig || await getRuntimeConfig(env) });
     },
 
-    async delete(data, { ctx, kv }) {
+    async delete(data, { ctx, kv, env }) {
       if (data.name) {
         const delName = String(data.name).toLowerCase(); 
         await kv.delete(`${Database.PREFIX}${delName}`); 
         Database.invalidateNodeCaches(delName, { invalidateList: true });
         const index = (await Database.getNodesIndex(kv)).filter(n => n !== delName);
         await Database.persistNodesIndex(index, { kv, ctx, invalidateList: true });
+        await Database.syncSourceDirectNodesConfig(env, kv, ctx, {
+          removedNames: [delName],
+          allowedNames: index,
+          source: "node_delete",
+          note: delName
+        });
       }
       return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
     },
@@ -3154,8 +3253,25 @@ const Database = {
       }), { headers: { ...corsHeaders } });
     },
 
-    async clearLogs(data, { db }) {
+    async clearLogs(data, { db, env, ctx }) {
       if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders } });
+      const clearEpochMs = nowMs();
+      GLOBALS.LogClearEpochMs = Math.max(GLOBALS.LogClearEpochMs || 0, clearEpochMs);
+      await Database.patchOpsStatus(env || db, {
+        log: {
+          clearEpochMs,
+          clearEpochAt: new Date(clearEpochMs).toISOString()
+        }
+      }, ctx);
+      const activeFlushTask = GLOBALS.LogFlushTask;
+      if (activeFlushTask) {
+        try {
+          await activeFlushTask;
+        } catch {}
+      }
+      GLOBALS.LogQueue.length = 0;
+      GLOBALS.LogDedupe.clear();
+      GLOBALS.LogLastFlushAt = 0;
       await db.prepare("DELETE FROM proxy_logs").run();
       let vacuumed = false;
       try {
@@ -3298,16 +3414,20 @@ const Proxy = {
     const isWsUpgrade = request.headers.get("Upgrade")?.toLowerCase() === "websocket";
     const looksLikeVideoRoute = GLOBALS.Regex.Streaming.test(proxyPath) || /\/videos\/[^/]+\/(stream|original|download|file)/i.test(proxyPath) || /\/items\/[^/]+\/download/i.test(proxyPath) || requestUrl.searchParams.get("Static") === "true" || requestUrl.searchParams.get("Download") === "true";
     const isSafeMethod = request.method === "GET" || request.method === "HEAD";
+    const isBigStream = looksLikeVideoRoute && !isManifest && !isSegment && !isSubtitle && !isImage;
+    const isApiRequest = !isImage && !isStaticFile && !isSubtitle && !isManifest && !isSegment && !isBigStream && !isWsUpgrade;
+    // 节点直连只放行厚重媒体字节流，避免前端静态资源与 API 被 307 误伤。
+    const nodeDirectMedia = options.nodeDirectSource === true && isSafeMethod && isBigStream;
     const directStaticAssets = options.directStaticAssets === true && isSafeMethod && isStaticFile;
     // WebVTT 字幕轨继续走 Worker 缓存：307 直连会额外多一次跳转，双语字幕场景通常更容易比代理缓存更慢。
     const directHlsDash = options.directHlsDash === true && isSafeMethod && (isManifest || isSegment);
-    const direct307Mode = options.nodeDirectSource === true || directStaticAssets || directHlsDash;
+    const direct307Mode = nodeDirectMedia || directStaticAssets || directHlsDash;
     const enablePrewarm = currentConfig.enablePrewarm !== false && !direct307Mode;
     const prewarmCacheTtl = clampIntegerConfig(currentConfig.prewarmCacheTtl, Config.Defaults.PrewarmCacheTtl, 0, 3600);
     const prewarmDepth = normalizePrewarmDepth(currentConfig.prewarmDepth);
-    const isBigStream = looksLikeVideoRoute && !isManifest && !isSegment && !isSubtitle && !isImage;
     const isMetadataCacheable = request.method === "GET" && !isWsUpgrade && !direct307Mode && (isImage || isSubtitle || isManifest);
     const isCacheableAsset = request.method === "GET" && !isWsUpgrade && (isImage || isStaticFile || isSubtitle || isSegment || isManifest);
+    const canStripAuthOnProtocolFallback = isSafeMethod && !isApiRequest && (isBigStream || isManifest || isSegment);
     return {
       rangeHeader,
       enablePrewarm,
@@ -3321,10 +3441,13 @@ const Proxy = {
       isWsUpgrade,
       looksLikeVideoRoute,
       isBigStream,
+      isApiRequest,
       isMetadataCacheable,
       isCacheableAsset,
+      nodeDirectMedia,
       directStaticAssets,
       directHlsDash,
+      canStripAuthOnProtocolFallback,
       direct307Mode
     };
   },
@@ -3759,6 +3882,8 @@ const Proxy = {
         const upstream = await this.performFetchWithTimeout(absoluteUrl, state.buildFetchOptions, {
           ...state.fetchOptions,
           isRetry: effectiveRetry,
+          protocolFallbackRetry: state.protocolFallbackRetry === true,
+          stripAuthOnProtocolFallback: state.stripAuthOnProtocolFallback === true,
           timeoutMs: state.upstreamTimeoutMs
         });
         const response = upstream.response;
@@ -3769,7 +3894,7 @@ const Proxy = {
 
         if (this.shouldRetryWithProtocolFallback(response, { ...state, isRetry: effectiveRetry })) {
           try { response.body?.cancel?.(); } catch {}
-          return await this.fetchAbsoluteWithRetryLoop({ ...state, isRetry: true });
+          return await this.fetchAbsoluteWithRetryLoop({ ...state, isRetry: true, protocolFallbackRetry: true });
         }
 
         const isLastPass = pass === totalPasses - 1;
@@ -3807,6 +3932,8 @@ const Proxy = {
         try {
           const upstream = await this.performUpstreamFetch(targetBase, state.proxyPath, state.requestUrl, state.buildFetchOptions, {
             isRetry: effectiveRetry,
+            protocolFallbackRetry: state.protocolFallbackRetry === true,
+            stripAuthOnProtocolFallback: state.stripAuthOnProtocolFallback === true,
             timeoutMs: state.upstreamTimeoutMs
           });
           lastFinalUrl = upstream.finalUrl;
@@ -3818,7 +3945,7 @@ const Proxy = {
 
           if (this.shouldRetryWithProtocolFallback(response, { ...state, isRetry: effectiveRetry })) {
             try { response.body?.cancel?.(); } catch {}
-            return await this.fetchUpstreamWithRetryLoop({ ...state, isRetry: true });
+            return await this.fetchUpstreamWithRetryLoop({ ...state, isRetry: true, protocolFallbackRetry: true });
           }
 
           const isLastTarget = index === state.retryTargets.length - 1;
@@ -3880,7 +4007,7 @@ const Proxy = {
       directStaticAssets: currentConfig.directStaticAssets === true,
       directHlsDash: currentConfig.directHlsDash === true
     });
-    const { rangeHeader, prewarmCacheTtl, isImage, isStaticFile, isSubtitle, isManifest, isSegment, isWsUpgrade, isBigStream, isMetadataCacheable, directStaticAssets, directHlsDash } = requestTraits;
+    const { rangeHeader, prewarmCacheTtl, isImage, isStaticFile, isSubtitle, isManifest, isSegment, isWsUpgrade, isBigStream, isMetadataCacheable, directStaticAssets, directHlsDash, direct307Mode, canStripAuthOnProtocolFallback } = requestTraits;
 
     const rateLimitResponse = this.applyRateLimit(currentConfig, clientIp, requestTraits, startTime, finalOrigin);
     if (rateLimitResponse) return rateLimitResponse;
@@ -3930,6 +4057,35 @@ const Proxy = {
 
     const { targetBases, invalidResponse } = this.parseTargetBases(node, finalOrigin);
     if (invalidResponse) return invalidResponse;
+    if (direct307Mode) {
+      const activeTargetBase = targetBases[0];
+      const directRedirectUrl = buildUpstreamProxyUrl(activeTargetBase, proxyPath);
+      directRedirectUrl.search = requestUrl.search;
+      const syntheticRedirect = new Response(null, { status: 307, statusText: "Temporary Redirect" });
+      const modifiedHeaders = this.buildProxyResponseHeaders(syntheticRedirect, request, dynamicCors, finalOrigin, requestTraits, {
+        enableH3,
+        forceH1,
+        imageCacheMaxAge
+      });
+      this.applyProxyRedirectHeaders(modifiedHeaders, syntheticRedirect, activeTargetBase, name, key, directRedirectUrl, directRedirectUrl);
+      Logger.record(env, ctx, {
+        nodeName: name,
+        requestPath: proxyPath,
+        requestMethod: request.method,
+        statusCode: 307,
+        responseTime: Date.now() - startTime,
+        clientIp,
+        userAgent: request.headers.get("User-Agent"),
+        referer: request.headers.get("Referer"),
+        category: this.classifyProxyLogCategory(requestTraits),
+        errorDetail: null
+      });
+      return new Response(null, {
+        status: 307,
+        statusText: "Temporary Redirect",
+        headers: modifiedHeaders
+      });
+    }
     const { newHeaders, adminCustomHeaders, preparedBody, preparedBodyMode, retryTargets, allowAutomaticRetry } =
       await this.buildProxyRequestState(request, node, proxyPath, requestUrl, clientIp, requestTraits, forceH1, targetBases);
 
@@ -3943,8 +4099,9 @@ const Proxy = {
       const effectiveMethod = String(options.method || request.method || "GET").toUpperCase();
       const effectiveBodyMode = options.bodyMode || preparedBodyMode;
       const effectiveBody = options.body !== undefined ? options.body : preparedBody;
-      const isRetry = options.isRetry === true;
       const isExternalRedirect = options.isExternalRedirect === true;
+      const isProtocolFallbackRetry = options.protocolFallbackRetry === true;
+      const shouldStripAuthOnProtocolFallback = options.stripAuthOnProtocolFallback === true;
 
       if (headers.has("Origin") && !adminCustomHeaders.has("origin")) {
         headers.set("Origin", targetOrigin);
@@ -3970,9 +4127,11 @@ const Proxy = {
         if (!adminCustomHeaders.has("referer")) headers.delete("Referer");
       }
 
-      if (isRetry && protocolFallback) {
-        headers.delete("Authorization");
-        headers.delete("X-Emby-Authorization");
+      if (isProtocolFallbackRetry && protocolFallback) {
+        if (shouldStripAuthOnProtocolFallback) {
+          headers.delete("Authorization");
+          headers.delete("X-Emby-Authorization");
+        }
         headers.set("Connection", "keep-alive");
       }
 
@@ -4003,7 +4162,6 @@ const Proxy = {
     let activeTargetBase;
     let proxiedExternalRedirect = false;
     let directRedirectUrl = null;
-    let directRedirectStatus = null;
 
     try {
       const upstream = await this.fetchUpstreamWithRetryLoop({
@@ -4015,6 +4173,7 @@ const Proxy = {
         protocolFallback,
         preparedBodyMode,
         allowAutomaticRetry,
+        stripAuthOnProtocolFallback: canStripAuthOnProtocolFallback,
         upstreamTimeoutMs,
         maxExtraAttempts: allowAutomaticRetry ? upstreamRetryAttempts : 0,
         isRetry: false
@@ -4063,6 +4222,7 @@ const Proxy = {
           protocolFallback,
           preparedBodyMode: nextBodyMode,
           allowAutomaticRetry,
+          stripAuthOnProtocolFallback: canStripAuthOnProtocolFallback,
           upstreamTimeoutMs,
           maxExtraAttempts: allowAutomaticRetry ? upstreamRetryAttempts : 0,
           isRetry: false
@@ -4076,15 +4236,8 @@ const Proxy = {
         redirectHop += 1;
       }
 
-      if (!directRedirectUrl && response.status >= 200 && response.status < 300 && (request.method === "GET" || request.method === "HEAD") && (nodeDirectSource || directStaticAssets || directHlsDash)) {
-        directRedirectUrl = finalUrl instanceof URL ? new URL(finalUrl.toString()) : buildUpstreamProxyUrl(activeTargetBase, proxyPath);
-        if (!(finalUrl instanceof URL)) directRedirectUrl.search = requestUrl.search;
-        directRedirectStatus = 307;
-        try { response.body?.cancel?.(); } catch {}
-      }
-
-      const finalStatus = directRedirectStatus || response.status;
-      const finalStatusText = directRedirectStatus ? "Temporary Redirect" : response.statusText;
+      const finalStatus = response.status;
+      const finalStatusText = response.statusText;
       const modifiedHeaders = this.buildProxyResponseHeaders(response, request, dynamicCors, finalOrigin, requestTraits, {
         enableH3,
         forceH1,
@@ -4125,7 +4278,7 @@ const Proxy = {
       });
       /** @type {UpgradeableResponse} */
       const upgradeResponse = response;
-      if (!directRedirectStatus && response.status === 101 && upgradeResponse.webSocket) {
+      if (response.status === 101 && upgradeResponse.webSocket) {
         /** @type {ResponseInit & { webSocket?: unknown }} */
         const upgradeInit = {
           status: 101,
@@ -4135,7 +4288,7 @@ const Proxy = {
         };
         return new Response(null, upgradeInit);
       }
-      return new Response(directRedirectStatus ? null : response.body, {
+      return new Response(response.body, {
         status: finalStatus,
         statusText: finalStatusText,
         headers: modifiedHeaders
@@ -4183,6 +4336,8 @@ const Logger = {
     if (logData.requestMethod === "OPTIONS") return;
 
     const currentMs = nowMs();
+    const logClearEpochMs = Math.max(0, Number(GLOBALS.LogClearEpochMs) || 0);
+    const recordTimestamp = currentMs <= logClearEpochMs ? (logClearEpochMs + 1) : currentMs;
     let dedupeWindow = 0;
     if (logData.requestMethod === "HEAD") dedupeWindow = 300000;
     else if (logData.category === "segment" || logData.category === "prewarm") dedupeWindow = 30000;
@@ -4209,7 +4364,7 @@ const Logger = {
     }
 
     GLOBALS.LogQueue.push({
-      timestamp: currentMs,
+      timestamp: recordTimestamp,
       nodeName: logData.nodeName || "unknown",
       requestPath: logData.requestPath || "/",
       requestMethod: logData.requestMethod || "GET",
@@ -4220,7 +4375,7 @@ const Logger = {
       referer: logData.referer || null,
       category: logData.category || "api",
       errorDetail: logData.errorDetail || null, // [新增] 记录错误详情
-      createdAt: new Date().toISOString()
+      createdAt: new Date(recordTimestamp).toISOString()
     });
     // 💡 [极简修复 1] 内存泄流阀：如果 D1 阻塞导致队列堆积，强行丢弃最老的日志，死守内存底线
     if (GLOBALS.LogQueue.length > 2000) {
@@ -4243,21 +4398,26 @@ const Logger = {
     const shouldFlush = GLOBALS.LogQueue.length >= flushCountThreshold || flushWindowMs === 0 || (currentMs - GLOBALS.LogLastFlushAt) >= flushWindowMs;
     if (shouldFlush && !GLOBALS.LogFlushPending) {
       GLOBALS.LogFlushPending = true;
-      ctx.waitUntil(this.flush(env).finally(() => {
+      const flushTask = this.flush(env).finally(() => {
+        if (GLOBALS.LogFlushTask === flushTask) GLOBALS.LogFlushTask = null;
         GLOBALS.LogFlushPending = false;
         GLOBALS.LogLastFlushAt = nowMs();
-      }));
+      });
+      GLOBALS.LogFlushTask = flushTask;
+      ctx.waitUntil(flushTask);
     }
   },
   async flush(env) {
     const db = Database.getDB(env);
     if (!db || GLOBALS.LogQueue.length === 0) return;
+    await Database.ensureSysStatusTable(db);
     const configuredChunkSize = Number(GLOBALS.ConfigCache?.data?.logBatchChunkSize);
     const configuredRetryCount = Number(GLOBALS.ConfigCache?.data?.logBatchRetryCount);
     const configuredRetryBackoffMs = Number(GLOBALS.ConfigCache?.data?.logBatchRetryBackoffMs);
     const chunkSize = clampIntegerConfig(configuredChunkSize, Config.Defaults.LogBatchChunkSize, 1, 100);
     const maxRetryCount = clampIntegerConfig(configuredRetryCount, Config.Defaults.LogBatchRetryCount, 0, 5);
     const retryBackoffMs = clampIntegerConfig(configuredRetryBackoffMs, Config.Defaults.LogBatchRetryBackoffMs, 0, 5000);
+    const logScope = Database.getOpsStatusDbScope("log");
     let writtenCount = 0;
     let retryCount = 0;
     let activeBatchSize = 0;
@@ -4266,11 +4426,21 @@ const Logger = {
       // 同一次 flush 持续排空期间新增的日志，避免首批写完后尾批滞留到下一次请求。
       while (GLOBALS.LogQueue.length > 0) {
         const batchLogs = GLOBALS.LogQueue.splice(0, GLOBALS.LogQueue.length);
-        activeBatchSize = batchLogs.length;
+        const clearEpochMs = Math.max(GLOBALS.LogClearEpochMs || 0, await Database.getLogClearEpochMs(env));
+        const eligibleLogs = batchLogs.filter(item => (Number(item?.timestamp) || 0) > clearEpochMs);
+        if (!eligibleLogs.length) continue;
+        activeBatchSize = eligibleLogs.length;
         activeBatchWrittenCount = 0;
-        for (let index = 0; index < batchLogs.length; index += chunkSize) {
-          const chunk = batchLogs.slice(index, index + chunkSize);
-          const statements = chunk.map(item => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, user_agent, referer, category, error_detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.userAgent, item.referer, item.category, item.errorDetail, item.createdAt));
+        for (let index = 0; index < eligibleLogs.length; index += chunkSize) {
+          const chunk = eligibleLogs.slice(index, index + chunkSize);
+          const statements = chunk.map(item => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, user_agent, referer, category, error_detail, created_at)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE ? > COALESCE((
+              SELECT CAST(json_extract(payload, '$.clearEpochMs') AS INTEGER)
+              FROM ${Database.SYS_STATUS_TABLE}
+              WHERE scope = ?
+              LIMIT 1
+            ), 0)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.userAgent, item.referer, item.category, item.errorDetail, item.createdAt, item.timestamp, logScope));
           let attempt = 0;
           while (true) {
             try {
@@ -4431,7 +4601,7 @@ const UI_HTML = `<!DOCTYPE html>
   </template>
 
   <template id="tpl-node-card">
-    <div class="glass-card p-6 rounded-3xl flex flex-col justify-between" v-lucide-icons>
+    <div class="glass-card p-6 rounded-3xl flex flex-col justify-between">
       <div>
         <div class="flex items-end mb-2 w-full gap-3">
           <div class="inline-flex items-center justify-center rounded-full px-2.5 py-1 text-sm leading-5 font-semibold border truncate max-w-[7rem]" :class="tagToneClass">{{ hasTag ? hydratedNode.tag : '无标签' }}</div>
@@ -4558,10 +4728,10 @@ const UI_HTML = `<!DOCTYPE html>
         <div class="flex flex-col xl:flex-row justify-between items-center gap-4">
           <div class="flex items-center gap-2 w-full xl:w-auto">
             <button @click="App.showNodeModal()" class="px-4 py-2 bg-brand-600 text-white rounded-xl text-sm font-medium hover:bg-brand-700 flex items-center transition whitespace-nowrap"><i data-lucide="plus" class="w-4 h-4 mr-2"></i> 新建节点</button>
-            <input type="text" id="node-search" v-model="App.nodeSearchKeyword" placeholder="搜索节点名称或标签..." class="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white w-full sm:w-64 transition">
+            <input type="text" id="node-search" v-model="App.nodeSearchKeyword" @input="App.syncFilteredNodes()" placeholder="搜索节点名称或标签..." class="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white w-full sm:w-64 transition">
           </div>
           <div class="flex flex-wrap gap-2 w-full xl:w-auto">
-            <label class="flex-1 sm:flex-none px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm font-medium hover:bg-slate-300 dark:hover:bg-slate-700 transition flex items-center justify-center"><i data-lucide="upload" class="w-4 h-4 mr-2"></i> 导入配置<input type="file" id="import-nodes-file" class="hidden" accept=".json" @change="App.importNodes"></label>
+            <label class="flex-1 sm:flex-none px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm font-medium hover:bg-slate-300 dark:hover:bg-slate-700 transition flex items-center justify-center"><i data-lucide="upload" class="w-4 h-4 mr-2"></i> 导入配置<input type="file" id="import-nodes-file" class="hidden" accept=".json" @change="App.importNodes($event)"></label>
             <button @click="App.exportNodes()" class="flex-1 sm:flex-none px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm font-medium hover:bg-slate-300 dark:hover:bg-slate-700 transition flex items-center justify-center"><i data-lucide="download" class="w-4 h-4 mr-2"></i> 导出配置</button>
             <button @click="App.forceHealthCheck()" :disabled="App.nodesHealthCheckPending" class="w-full sm:w-auto px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm font-medium hover:bg-emerald-700 flex items-center justify-center transition disabled:opacity-60 disabled:cursor-not-allowed"><i :data-lucide="App.nodesHealthCheckPending ? 'loader' : 'activity'" :class="App.nodesHealthCheckPending ? 'w-4 h-4 mr-2 animate-spin' : 'w-4 h-4 mr-2'"></i> {{ App.nodesHealthCheckPending ? '探测中...' : '全局 Ping' }}</button>
             <a v-auto-download="{ href: App.downloadHref, key: App.downloadTriggerKey }" :href="App.downloadHref" :download="App.downloadFilename" class="hidden" aria-hidden="true"></a>
@@ -5297,7 +5467,7 @@ const UI_HTML = `<!DOCTYPE html>
                     </div>
                     <p class="text-sm text-slate-500 mb-4">只导出 / 导入 settings，不包含节点清单。适合多环境同步代理、监控、账号与 Dashboard 策略。</p>
                     <div class="flex gap-4 flex-wrap">
-                      <label class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm transition font-medium"><i data-lucide="upload-cloud" class="w-4 h-4 inline mr-1"></i> 导入全局设置<input type="file" id="import-settings-file" class="hidden" accept=".json" @change="App.importSettings"></label>
+                      <label class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm transition font-medium"><i data-lucide="upload-cloud" class="w-4 h-4 inline mr-1"></i> 导入全局设置<input type="file" id="import-settings-file" class="hidden" accept=".json" @change="App.importSettings($event)"></label>
                       <button @click="App.exportSettings()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition font-medium"><i data-lucide="download-cloud" class="w-4 h-4 inline mr-1"></i> 导出全局设置</button>
                     </div>
                   </div>
@@ -5326,7 +5496,7 @@ const UI_HTML = `<!DOCTYPE html>
                     </div>
                     <p class="text-sm text-slate-500 mb-4">导出或导入系统内的所有节点以及全局设置数据（单文件）。</p>
                     <div class="flex gap-4 flex-wrap">
-                      <label class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm transition font-medium"><i data-lucide="upload" class="w-4 h-4 inline mr-1"></i> 导入完整备份<input type="file" id="import-full-file" class="hidden" accept=".json" @change="App.importFull"></label>
+                      <label class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm transition font-medium"><i data-lucide="upload" class="w-4 h-4 inline mr-1"></i> 导入完整备份<input type="file" id="import-full-file" class="hidden" accept=".json" @change="App.importFull($event)"></label>
                       <button @click="App.exportFull()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition font-medium"><i data-lucide="download" class="w-4 h-4 inline mr-1"></i> 导出完整备份</button>
                     </div>
                   </div>
@@ -5368,15 +5538,27 @@ const UI_HTML = `<!DOCTYPE html>
     </div>
   </main>
 
-  <dialog id="node-modal" v-dialog-visible="App.nodeModalOpen" v-lucide-icons @cancel.prevent="App.handleNodeModalCancel" @close="App.handleNodeModalNativeClose" class="backdrop:bg-slate-950/60 bg-transparent w-11/12 md:w-full max-w-6xl m-auto p-0">
+  <dialog id="node-modal" v-dialog-visible="App.nodeModalOpen" v-lucide-icons @cancel.prevent="App.handleNodeModalCancel($event)" @close="App.handleNodeModalNativeClose()" class="backdrop:bg-slate-950/60 bg-transparent w-11/12 md:w-full max-w-6xl m-auto p-0">
     <div class="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl p-6 shadow-2xl">
       <h2 class="text-xl font-bold mb-4 text-slate-900 dark:text-white" id="node-modal-title">{{ App.nodeModalForm.originalName ? '编辑节点' : '新建节点' }}</h2>
-	     <form @submit.prevent="App.saveNode" class="space-y-4 max-h-[calc(80vh-env(safe-area-inset-bottom)-env(safe-area-inset-top))] overflow-y-auto pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[max(0.5rem,env(safe-area-inset-right))]">
+	     <form @submit.prevent="App.saveNode()" novalidate class="space-y-4 max-h-[calc(80vh-env(safe-area-inset-bottom)-env(safe-area-inset-top))] overflow-y-auto pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[max(0.5rem,env(safe-area-inset-right))]">
+          <div v-if="App.nodeModalFeedback.message" class="rounded-2xl border px-4 py-3 text-sm font-medium" :class="App.getNodeModalFeedbackClass(App.nodeModalFeedback.tone)">
+            {{ App.nodeModalFeedback.message }}
+          </div>
 	        <input type="hidden" id="form-original-name" :value="App.nodeModalForm.originalName">
 	        <input type="hidden" id="form-active-line-id" :value="App.nodeModalForm.activeLineId">
 	        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-	          <div><label class="block text-sm text-slate-500 mb-1">节点名称</label><input type="text" id="form-display-name" v-model="App.nodeModalForm.displayName" @input="App.handleNodeModalDisplayNameInput()" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white" required></div>
-	          <div><label class="block text-sm text-slate-500 mb-1">节点路径</label><input type="text" id="form-name" v-model="App.nodeModalForm.name" @input="App.handleNodeModalPathInput()" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white" placeholder="不修改默认同左侧"></div>
+	          <div>
+              <label class="block text-sm text-slate-500 mb-1">节点名称</label>
+              <input type="text" id="form-display-name" v-model="App.nodeModalForm.displayName" @input="App.handleNodeModalDisplayNameInput()" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white" :class="App.getNodeModalFieldClass('displayName')" required>
+              <p v-if="App.getNodeModalFieldError('displayName')" class="mt-1 text-xs font-medium text-red-600 dark:text-red-400">{{ App.getNodeModalFieldError('displayName') }}</p>
+            </div>
+	          <div>
+              <label class="block text-sm text-slate-500 mb-1">节点路径</label>
+              <input type="text" id="form-name" v-model="App.nodeModalForm.name" @input="App.handleNodeModalPathInput()" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white" :class="App.getNodeModalFieldClass('name')" placeholder="例如 alpha-node 或 hk_01">
+              <p class="mt-1 text-xs text-slate-400">仅支持单段路径：小写字母、数字、连字符(-)、下划线(_)。保存时会自动转为小写。</p>
+              <p v-if="App.getNodeModalFieldError('name')" class="mt-1 text-xs font-medium text-red-600 dark:text-red-400">{{ App.getNodeModalFieldError('name') }}</p>
+            </div>
 	        </div>
 	        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 		          <div><label class="block text-sm text-slate-500 mb-1">标签</label><div class="flex gap-2"><input type="text" id="form-tag" v-model="App.nodeModalForm.tag" class="flex-1 min-w-0 px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white"><select id="form-tag-color" v-model="App.nodeModalForm.tagColor" class="w-28 px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white"><option value="amber">琥珀</option><option value="emerald">翠绿</option><option value="sky">天蓝</option><option value="violet">紫</option><option value="rose">红</option><option value="slate">灰</option></select></div></div>
@@ -5385,11 +5567,12 @@ const UI_HTML = `<!DOCTYPE html>
 	        
 	        <div><label class="block text-sm text-slate-500 mb-1">访问鉴权 (Secret, 可留空)</label><input type="text" id="form-secret" v-model="App.nodeModalForm.secret" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white"></div>
 	        
-	        <div class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-950/50 p-4">
+	        <div class="rounded-2xl border p-4" :class="App.getNodeModalLinesPanelClass()">
 	          <div class="flex items-center justify-between gap-3 mb-3">
 	            <div>
 	              <label class="block text-sm text-slate-500">线路列表</label>
 		              <p class="text-xs text-slate-400 mt-1">支持单节点多线路、手动启用、桌面端整行拖拽排序和一键延迟测试；是否自动排序可在全局设置中控制。</p>
+                  <p v-if="App.getNodeModalFieldError('lines')" class="mt-2 text-xs font-medium text-red-600 dark:text-red-400">{{ App.getNodeModalFieldError('lines') }}</p>
 	            </div>
 	            <div class="flex items-center gap-2">
 	              <button type="button" @click="App.pingAllNodeLinesInModal()" :disabled="App.nodeModalPingAllPending" class="px-3 py-2 rounded-xl border border-emerald-200 text-emerald-600 hover:bg-emerald-50 dark:border-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/20 text-sm font-medium transition disabled:opacity-60 disabled:cursor-not-allowed">{{ App.nodeModalPingAllText }}</button>
@@ -5415,7 +5598,10 @@ const UI_HTML = `<!DOCTYPE html>
 	                  <span>启用</span>
 	                </label>
 	                <input data-node-line-interactive="1" type="text" v-model="line.name" :placeholder="App.buildDefaultLineName(index)" class="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
-	                <input data-node-line-interactive="1" type="url" v-model="line.target" placeholder="https://emby.example.com" class="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
+		                <div class="space-y-1">
+                      <input data-node-line-interactive="1" type="text" inputmode="url" autocapitalize="off" autocomplete="off" spellcheck="false" v-model="line.target" @input="App.handleNodeModalLineTargetInput(line.id)" placeholder="https://emby.example.com" class="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white" :class="App.getNodeModalLineTargetClass(line.id)">
+                      <p v-if="App.getNodeModalLineTargetError(line.id)" class="text-xs font-medium text-red-600 dark:text-red-400">{{ App.getNodeModalLineTargetError(line.id) }}</p>
+                    </div>
 	                <div class="text-sm font-medium text-slate-500 dark:text-slate-300" :title="line.latencyUpdatedAt ? ('最近测速：' + App.formatLocalDateTime(line.latencyUpdatedAt)) : '尚未测速'">{{ App.formatLatency(line.latencyMs) }}</div>
 	                <div data-node-line-interactive="1" class="flex items-center gap-2">
 	                  <button type="button" title="整行可拖拽排序" disabled class="px-2.5 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800 transition"><i data-lucide="grip-vertical" class="w-4 h-4"></i></button>
@@ -5442,7 +5628,7 @@ const UI_HTML = `<!DOCTYPE html>
 
         <div class="flex gap-3 mt-6 sticky bottom-0 bg-white dark:bg-slate-900 py-3 border-t border-slate-100 dark:border-slate-800 z-10 shadow-[0_-10px_15px_-3px_rgba(0,0,0,0.05)] dark:shadow-none">
            <button type="button" @click="App.closeNodeModal()" class="flex-1 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-900 dark:text-white transition shadow-sm">取消</button>
-           <button type="submit" :disabled="App.nodeModalSubmitting" class="flex-1 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium transition shadow-sm disabled:opacity-60 disabled:cursor-not-allowed">{{ App.nodeModalSubmitting ? '保存中...' : '保存' }}</button>
+           <button type="button" @click="App.saveNode()" :disabled="App.nodeModalSubmitting" :aria-busy="App.nodeModalSubmitting ? 'true' : 'false'" class="flex-1 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium transition shadow-sm disabled:opacity-60 disabled:cursor-not-allowed">{{ App.getNodeModalSubmitText() }}</button>
         </div>
       </form>
     </div>
@@ -5737,6 +5923,22 @@ const UI_HTML = `<!DOCTYPE html>
       };
     }
 
+    function createNodeModalFeedbackState() {
+      return {
+        message: '',
+        tone: 'info'
+      };
+    }
+
+    function createNodeModalValidationState() {
+      return {
+        displayName: '',
+        name: '',
+        lines: '',
+        lineTargets: {}
+      };
+    }
+
     function createMessageDialogState() {
       return {
         open: false,
@@ -5787,6 +5989,7 @@ const UI_HTML = `<!DOCTYPE html>
       activeSettingsTab: 'ui',
       nodeSearchKeyword: '',
       nodes: [],
+      filteredNodes: [],
       settingsForm: {},
       settingsDirectNodeSearch: '',
       settingsSourceDirectNodes: [],
@@ -5796,6 +5999,7 @@ const UI_HTML = `<!DOCTYPE html>
       nodePingPending: {},
       nodeMutationSeq: 0,
       nodeMutationVersion: {},
+      pageLoadSeq: 0,
       logPage: 1,
       logTotalPages: 1,
       logRows: [],
@@ -5866,6 +6070,8 @@ const UI_HTML = `<!DOCTYPE html>
       nodeModalPingAllPending: false,
       nodeModalPingAllText: '一键测试延迟',
       nodeModalForm: createEmptyNodeModalForm(),
+      nodeModalFeedback: createNodeModalFeedbackState(),
+      nodeModalValidation: createNodeModalValidationState(),
       nodeModalPathManual: false,
       nodeModalLastDisplayName: '',
       nodeModalLines: [],
@@ -5892,6 +6098,111 @@ const UI_HTML = `<!DOCTYPE html>
           error: 'border-red-200 bg-red-50/95 text-red-700 dark:border-red-900/40 dark:bg-red-950/90 dark:text-red-200'
         };
         return palette[tone] || palette.info;
+      },
+
+      getNodeModalFeedbackClass(tone = 'info') {
+        const palette = {
+          info: 'border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-900/40 dark:bg-sky-950/40 dark:text-sky-200',
+          success: 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/40 dark:text-emerald-200',
+          warning: 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/40 dark:text-amber-200',
+          error: 'border-red-200 bg-red-50 text-red-700 dark:border-red-900/40 dark:bg-red-950/40 dark:text-red-200'
+        };
+        return palette[tone] || palette.info;
+      },
+
+      clearNodeModalFeedback() {
+        this.nodeModalFeedback = createNodeModalFeedbackState();
+      },
+
+      clearNodeModalValidation() {
+        this.nodeModalValidation = createNodeModalValidationState();
+      },
+
+      setNodeModalFieldError(field, message) {
+        const text = this.normalizeUiMessage(message);
+        const nextValidation = {
+          ...createNodeModalValidationState(),
+          ...(this.nodeModalValidation && typeof this.nodeModalValidation === 'object' ? this.nodeModalValidation : {})
+        };
+        if (field === 'lineTargets') {
+          nextValidation.lineTargets = text && message && typeof message === 'object'
+            ? { ...message }
+            : { ...(nextValidation.lineTargets || {}) };
+        } else if (field === 'lineTargetsMap' && message && typeof message === 'object') {
+          nextValidation.lineTargets = { ...message };
+        } else {
+          nextValidation[field] = text;
+        }
+        this.nodeModalValidation = nextValidation;
+        return text;
+      },
+
+      clearNodeModalFieldError(field, lineId = '') {
+        const nextValidation = {
+          ...createNodeModalValidationState(),
+          ...(this.nodeModalValidation && typeof this.nodeModalValidation === 'object' ? this.nodeModalValidation : {})
+        };
+        if (field === 'lineTarget') {
+          const nextLineTargets = { ...(nextValidation.lineTargets || {}) };
+          delete nextLineTargets[String(lineId || '')];
+          nextValidation.lineTargets = nextLineTargets;
+          if (!Object.keys(nextLineTargets).length && nextValidation.lines) nextValidation.lines = '';
+        } else {
+          nextValidation[field] = '';
+        }
+        this.nodeModalValidation = nextValidation;
+      },
+
+      getNodeModalFieldError(field) {
+        return String(this.nodeModalValidation?.[field] || '').trim();
+      },
+
+      getNodeModalLineTargetError(lineId) {
+        return String(this.nodeModalValidation?.lineTargets?.[String(lineId || '')] || '').trim();
+      },
+
+      getNodeModalFieldClass(field) {
+        return this.getNodeModalFieldError(field)
+          ? 'border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-950/30'
+          : '';
+      },
+
+      getNodeModalLineTargetClass(lineId) {
+        return this.getNodeModalLineTargetError(lineId)
+          ? 'border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-950/30'
+          : '';
+      },
+
+      getNodeModalLinesPanelClass() {
+        return this.getNodeModalFieldError('lines')
+          ? 'border-red-300 dark:border-red-800 bg-red-50/70 dark:bg-red-950/20'
+          : 'border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-950/50';
+      },
+
+      setNodeModalFeedback(message, tone = 'info') {
+        const text = this.normalizeUiMessage(message);
+        this.nodeModalFeedback = {
+          message: text,
+          tone: String(tone || 'info') || 'info'
+        };
+        return text;
+      },
+
+      getNodeModalSubmitText() {
+        if (this.nodeModalSubmitting) return '正在保存到 KV...';
+        return this.nodeModalForm.originalName ? '保存修改' : '创建节点';
+      },
+
+      normalizeNodePathInput(value) {
+        return String(value || '').trim().toLowerCase();
+      },
+
+      validateNodePath(value) {
+        return /^[a-z0-9_-]+$/.test(this.normalizeNodePathInput(value));
+      },
+
+      getNodePathRuleText() {
+        return '节点路径仅支持小写字母、数字、-、_，且不能包含斜杠或空格';
       },
 
       getDialogConfirmButtonClass(tone = 'info') {
@@ -6500,6 +6811,12 @@ const UI_HTML = `<!DOCTYPE html>
         while (usedNames.has('线路' + cursor)) cursor += 1;
         return '线路' + cursor;
       },
+      parseLatencyMs(value) {
+        if (value === '' || value === null || value === undefined) return null;
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed) || parsed < 0) return null;
+        return Math.round(parsed);
+      },
       normalizeSingleTarget(value) {
         const raw = String(value || '').trim();
         if (!raw) return '';
@@ -6541,13 +6858,12 @@ const UI_HTML = `<!DOCTYPE html>
             suffix += 1;
           }
           usedIds.add(nextId);
-          const latencyValue = Number(line?.latencyMs);
           const checkedAt = line?.latencyUpdatedAt ? new Date(line.latencyUpdatedAt) : null;
           result.push({
             id: nextId,
             name: String(line?.name || '').trim() || this.buildDefaultLineName(index),
             target,
-            latencyMs: Number.isFinite(latencyValue) && latencyValue >= 0 ? Math.round(latencyValue) : null,
+            latencyMs: this.parseLatencyMs(line?.latencyMs),
             latencyUpdatedAt: checkedAt && Number.isFinite(checkedAt.getTime()) ? checkedAt.toISOString() : ''
           });
         });
@@ -6584,13 +6900,95 @@ const UI_HTML = `<!DOCTYPE html>
           target: this.buildLegacyTargetFromLines(lines)
         };
       },
-      upsertNode(nextNode) {
+      normalizeNodeCollection(nodes = []) {
+        return (Array.isArray(nodes) ? nodes : [])
+          .map(node => this.hydrateNode(node))
+          .filter(node => node && typeof node === 'object' && this.normalizeNodeKey(node?.name))
+          .sort((left, right) => {
+            const leftLabel = String(left?.displayName || left?.name || '');
+            const rightLabel = String(right?.displayName || right?.name || '');
+            return leftLabel.localeCompare(rightLabel, 'zh-Hans-CN', { sensitivity: 'base' });
+          });
+      },
+      reconcileSourceDirectNodesSelection(options = {}) {
+        const renameMapInput = options.renameMap instanceof Map
+          ? options.renameMap
+          : new Map(Object.entries(options.renameMap && typeof options.renameMap === 'object' ? options.renameMap : {}));
+        const renameMap = new Map();
+        renameMapInput.forEach((toName, fromName) => {
+          const fromKey = this.normalizeNodeKey(fromName);
+          const nextName = String(toName || '').trim();
+          if (!fromKey || !nextName) return;
+          renameMap.set(fromKey, nextName);
+        });
+        const allowedNames = this.normalizeNodeNameList(options.allowedNames !== undefined
+          ? options.allowedNames
+          : (Array.isArray(this.nodes) ? this.nodes.map(node => node?.name) : []));
+        const allowedNameMap = new Map(allowedNames.map(name => [this.normalizeNodeKey(name), String(name || '').trim()]).filter(([key, value]) => key && value));
+        const nextSelection = [];
+        const seen = new Set();
+        this.normalizeNodeNameList(this.settingsSourceDirectNodes).forEach(name => {
+          const currentKey = this.normalizeNodeKey(name);
+          if (!currentKey) return;
+          const renamedName = renameMap.get(currentKey) || String(name || '').trim();
+          const nextKey = this.normalizeNodeKey(renamedName);
+          if (!nextKey || !allowedNameMap.has(nextKey) || seen.has(nextKey)) return;
+          seen.add(nextKey);
+          nextSelection.push(allowedNameMap.get(nextKey) || renamedName);
+        });
+        this.settingsSourceDirectNodes = nextSelection;
+        return nextSelection;
+      },
+      applyNodesState(nodes, options = {}) {
+        const nextNodes = this.normalizeNodeCollection(nodes);
+        this.nodes = nextNodes;
+        const validKeys = new Set(nextNodes.map(node => this.normalizeNodeKey(node?.name)).filter(Boolean));
+        this.nodeHealth = Object.fromEntries(Object.entries(this.nodeHealth || {}).filter(([key]) => validKeys.has(this.normalizeNodeKey(key))));
+        this.syncFilteredNodes();
+        if (options.syncSourceDirectNodes !== false) {
+          this.reconcileSourceDirectNodesSelection({
+            renameMap: options.renameMap,
+            allowedNames: nextNodes.map(node => node?.name)
+          });
+        }
+        return nextNodes;
+      },
+      syncFilteredNodes() {
+        const keyword = String(this.nodeSearchKeyword || '').trim().toLowerCase();
+        this.filteredNodes = (Array.isArray(this.nodes) ? this.nodes : [])
+          .map(node => this.hydrateNode(node))
+          .filter(node => node && typeof node === 'object')
+          .filter(n => {
+            const nodeName = String(n.name || '').trim();
+            const displayName = String(n.displayName || n.name || '').trim();
+            const tagText = String(n.tag || '').trim();
+            const remarkText = String(n.remark || '').trim();
+            if (!nodeName && !displayName) return false;
+            if (!keyword) return true;
+            const lineNames = this.getNodeLines(n).map(line => String(line?.name || '')).join(' ').toLowerCase();
+            return nodeName.toLowerCase().includes(keyword)
+              || displayName.toLowerCase().includes(keyword)
+              || tagText.toLowerCase().includes(keyword)
+              || remarkText.toLowerCase().includes(keyword)
+              || lineNames.includes(keyword);
+          });
+        return this.filteredNodes;
+      },
+      upsertNode(nextNode, options = {}) {
         if (!nextNode?.name) return;
         const hydratedNode = this.hydrateNode(nextNode);
         const nextKey = this.normalizeNodeKey(hydratedNode.name);
-        const index = this.nodes.findIndex(node => this.normalizeNodeKey(node?.name) === nextKey);
-        if (index > -1) this.nodes[index] = hydratedNode;
-        else this.nodes.push(hydratedNode);
+        const previousKey = this.normalizeNodeKey(options.previousName || '');
+        const nextNodes = (Array.isArray(this.nodes) ? this.nodes : []).filter(node => {
+          const nodeKey = this.normalizeNodeKey(node?.name);
+          if (!nodeKey) return false;
+          if (nodeKey === nextKey) return false;
+          if (previousKey && nodeKey === previousKey) return false;
+          return true;
+        });
+        nextNodes.push(hydratedNode);
+        const renameMap = previousKey && previousKey !== nextKey ? { [previousKey]: hydratedNode.name } : null;
+        this.applyNodesState(nextNodes, { renameMap });
       },
       formatLatency(ms) {
         const latency = Number(ms);
@@ -6639,25 +7037,13 @@ const UI_HTML = `<!DOCTYPE html>
           titleClass: overloaded ? 'text-red-600 dark:text-red-400' : ''
         };
       },
+      getNodeHealthCount(name) {
+        const normalized = this.normalizeNodeKey(name);
+        if (!normalized) return 0;
+        return Number(this.nodeHealth?.[normalized]) || 0;
+      },
       getFilteredNodes() {
-        const keyword = String(this.nodeSearchKeyword || '').trim().toLowerCase();
-        return (Array.isArray(this.nodes) ? this.nodes : [])
-          .map(node => this.hydrateNode(node))
-          .filter(node => node && typeof node === 'object')
-          .filter(n => {
-            const nodeName = String(n.name || '').trim();
-            const displayName = String(n.displayName || n.name || '').trim();
-            const tagText = String(n.tag || '').trim();
-            const remarkText = String(n.remark || '').trim();
-            if (!nodeName && !displayName) return false;
-            if (!keyword) return true;
-            const lineNames = this.getNodeLines(n).map(line => String(line?.name || '')).join(' ').toLowerCase();
-            return nodeName.toLowerCase().includes(keyword)
-              || displayName.toLowerCase().includes(keyword)
-              || tagText.toLowerCase().includes(keyword)
-              || remarkText.toLowerCase().includes(keyword)
-              || lineNames.includes(keyword);
-          });
+        return Array.isArray(this.filteredNodes) ? this.filteredNodes : this.syncFilteredNodes();
       },
       sortLinesByLatency(lines = []) {
         return (Array.isArray(lines) ? lines : [])
@@ -6806,6 +7192,7 @@ const UI_HTML = `<!DOCTYPE html>
         } else {
           this.settingsSourceDirectNodes = this.normalizeNodeNameList(this.settingsSourceDirectNodes);
         }
+        this.reconcileSourceDirectNodesSelection();
       },
 
       validateTargets(targetValue) {
@@ -6891,6 +7278,7 @@ const UI_HTML = `<!DOCTYPE html>
       },
 
       handleNodeModalDisplayNameInput() {
+        this.clearNodeModalFieldError('displayName');
         const previousDisplayName = String(this.nodeModalLastDisplayName || '');
         const nextDisplayName = String(this.nodeModalForm.displayName || '');
         const currentPath = String(this.nodeModalForm.name || '');
@@ -6901,9 +7289,14 @@ const UI_HTML = `<!DOCTYPE html>
       },
 
       handleNodeModalPathInput() {
+        this.clearNodeModalFieldError('name');
         const currentPath = String(this.nodeModalForm.name || '');
         const currentDisplayName = String(this.nodeModalForm.displayName || '');
         this.nodeModalPathManual = !!currentPath && currentPath !== currentDisplayName;
+      },
+
+      handleNodeModalLineTargetInput(lineId) {
+        this.clearNodeModalFieldError('lineTarget', lineId);
       },
 
       handleNodeModalCancel(event) {
@@ -6920,6 +7313,7 @@ const UI_HTML = `<!DOCTYPE html>
         if (!this.logStartDate) this.logStartDate = defaultLogRange.startDate;
         if (!this.logEndDate) this.logEndDate = defaultLogRange.endDate;
         this.isDarkTheme = uiBrowserBridge.resolveDarkTheme();
+        this.syncFilteredNodes();
         this.route(this.getCurrentRouteHash());
       },
 
@@ -6931,11 +7325,26 @@ const UI_HTML = `<!DOCTYPE html>
 
       navigate(hash) {
         const nextHash = String(hash || '').trim() || '#dashboard';
-        if (this.getCurrentRouteHash() === nextHash) {
+        if (String(this.currentHash || '#dashboard') === nextHash && this.getCurrentRouteHash() === nextHash) {
           this.route(nextHash);
           return;
         }
-        uiBrowserBridge.writeHash(nextHash);
+        this.route(nextHash);
+        if (this.getCurrentRouteHash() !== nextHash) {
+          uiBrowserBridge.writeHash(nextHash);
+        }
+      },
+
+      runRouteLoader(hash, loader, failurePrefix) {
+        const loadSeq = ++this.pageLoadSeq;
+        Promise.resolve()
+          .then(() => loader())
+          .catch(err => {
+            if (loadSeq !== this.pageLoadSeq) return;
+            if (String(this.currentHash || '') !== String(hash || '')) return;
+            const detail = err?.message || '未知错误';
+            this.showMessage(String(failurePrefix || '页面加载失败: ') + detail, { tone: 'error', modal: true });
+          });
       },
 
       getNavItemClass(hash) {
@@ -7112,11 +7521,11 @@ const UI_HTML = `<!DOCTYPE html>
         this.pageTitle = VIEW_TITLES[hash] || 'Emby Proxy';
         this.syncViewportState(hash);
 
-        if (hash === '#dashboard') this.loadDashboard();
-        if (hash === '#nodes') this.loadNodes();
-        if (hash === '#logs') this.loadLogs(1);
-        if (hash === '#dns') this.loadDnsRecords();
-        if (hash === '#settings') this.loadSettings();
+        if (hash === '#dashboard') this.runRouteLoader(hash, () => this.loadDashboard(), '仪表盘加载失败: ');
+        if (hash === '#nodes') this.runRouteLoader(hash, () => this.loadNodes(), '节点列表加载失败: ');
+        if (hash === '#logs') this.runRouteLoader(hash, () => this.loadLogs(1), '日志加载失败: ');
+        if (hash === '#dns') this.runRouteLoader(hash, () => this.loadDnsRecords(), 'DNS 加载失败: ');
+        if (hash === '#settings') this.runRouteLoader(hash, () => this.loadSettings(), '设置加载失败: ');
       },
 
       syncSettingsSplitLayout(hash) {
@@ -7214,7 +7623,7 @@ const UI_HTML = `<!DOCTYPE html>
           ]);
           const cfg = configRes.config || { enableH2: false, enableH3: false, peakDowngrade: true, protocolFallback: true, sourceSameOriginProxy: true, forceExternalProxy: true };
           this.applyRuntimeConfig(cfg);
-          if (Array.isArray(nodesRes.nodes)) this.nodes = nodesRes.nodes.map(node => this.hydrateNode(node));
+          if (Array.isArray(nodesRes.nodes)) this.applyNodesState(nodesRes.nodes);
           this.applyConfigSnapshotsState(snapshotRes.snapshots || []);
 
           this.applyConfigSectionToForm('ui', cfg);
@@ -7331,13 +7740,19 @@ const UI_HTML = `<!DOCTYPE html>
 
       async clearLogsFromUi() {
           if (!await this.askConfirm('确定清空所有日志?', { title: '清空日志', tone: 'danger', confirmText: '清空' })) return;
-          await this.apiCall('clearLogs');
-          await this.loadLogs(1);
+          try {
+              const res = await this.apiCall('clearLogs');
+              await this.loadLogs(1);
+              this.showMessage(res?.vacuumed ? '日志已清空，并已完成 VACUUM 整理' : '日志已清空', { tone: 'success' });
+          } catch (err) {
+              console.error('clearLogsFromUi failed', err);
+              this.showMessage('日志清理失败: ' + (err?.message || '未知错误'), { tone: 'error', modal: true });
+          }
       },
 
       async loadNodes() {
           const res = await this.apiCall('list');
-          if(res.nodes) { this.nodes = res.nodes.map(node => this.hydrateNode(node)); }
+          if(Array.isArray(res.nodes)) { this.applyNodesState(res.nodes); }
       },
 
       isNodePingPending(name) {
@@ -7408,8 +7823,9 @@ const UI_HTML = `<!DOCTYPE html>
           });
           this.upsertNode({ ...hydratedNode, lines: nextLines, target: this.buildLegacyTargetFromLines(nextLines) });
 
-          if (ms > 300) this.nodeHealth[name] = (this.nodeHealth[name] || 0) + 1;
-          else this.nodeHealth[name] = 0;
+          if (!normalizedName) return;
+          if (ms > 300) this.nodeHealth[normalizedName] = (this.nodeHealth[normalizedName] || 0) + 1;
+          else this.nodeHealth[normalizedName] = 0;
       },
 
       addHeaderRow(key = '', val = '') {
@@ -7432,6 +7848,8 @@ const UI_HTML = `<!DOCTYPE html>
         this.nodeModalSubmitting = false;
         this.nodeModalPingAllPending = false;
         this.nodeModalPingAllText = '一键测试延迟';
+        this.clearNodeModalFeedback();
+        this.clearNodeModalValidation();
         this.clearNodeLineDragState();
 
         let nextForm = createEmptyNodeModalForm();
@@ -7476,10 +7894,46 @@ const UI_HTML = `<!DOCTYPE html>
         this.nodeModalSubmitting = false;
         this.nodeModalPingAllPending = false;
         this.nodeModalPingAllText = '一键测试延迟';
+        this.clearNodeModalFeedback();
+        this.clearNodeModalValidation();
         this.clearNodeLineDragState();
+      },
+
+      captureNodeModalDraft() {
+        return {
+          form: JSON.parse(JSON.stringify(this.nodeModalForm || createEmptyNodeModalForm())),
+          lines: JSON.parse(JSON.stringify(Array.isArray(this.nodeModalLines) ? this.nodeModalLines : [])),
+          pathManual: this.nodeModalPathManual === true,
+          lastDisplayName: String(this.nodeModalLastDisplayName || '')
+        };
+      },
+
+      restoreNodeModalDraft(draft, options = {}) {
+        const safeDraft = draft && typeof draft === 'object' ? draft : {};
+        this.nodeModalSubmitting = false;
+        this.nodeModalPingAllPending = false;
+        this.nodeModalPingAllText = '一键测试延迟';
+        this.clearNodeLineDragState();
+        this.clearNodeModalValidation();
+        this.nodeModalForm = safeDraft.form && typeof safeDraft.form === 'object'
+          ? { ...createEmptyNodeModalForm(), ...safeDraft.form }
+          : createEmptyNodeModalForm();
+        this.ensureNodeModalLines(Array.isArray(safeDraft.lines) ? safeDraft.lines : [], this.nodeModalForm.target || '');
+        this.nodeModalLastDisplayName = String(safeDraft.lastDisplayName || this.nodeModalForm.displayName || '');
+        this.nodeModalPathManual = safeDraft.pathManual === true;
+        this.syncNodeModalLinesState(this.nodeModalForm.activeLineId);
+        this.nodeModalOpen = true;
+        if (options.feedbackMessage) {
+          this.setNodeModalFeedback(options.feedbackMessage, options.feedbackTone || 'error');
+        } else {
+          this.clearNodeModalFeedback();
+        }
       },
       
       async saveNode() {
+          if (this.nodeModalSubmitting) return;
+          this.clearNodeModalFeedback();
+          this.clearNodeModalValidation();
           let headersObj = {};
           const headerRows = Array.isArray(this.nodeModalForm.headers) ? this.nodeModalForm.headers : [];
           for (let i = 0; i < headerRows.length; i++) {
@@ -7490,7 +7944,7 @@ const UI_HTML = `<!DOCTYPE html>
           }
 
           const displayName = String(this.nodeModalForm.displayName || '').trim();
-          const nodePath = String(this.nodeModalForm.name || '').trim() || displayName;
+          const nodePath = this.normalizeNodePathInput(String(this.nodeModalForm.name || '').trim() || displayName);
           const tagColor = String(this.nodeModalForm.tagColor || 'amber') || 'amber';
           
           const payload = {
@@ -7503,91 +7957,101 @@ const UI_HTML = `<!DOCTYPE html>
               remark: String(this.nodeModalForm.remark || '').trim(),
               headers: headersObj
           };
+          if (!payload.displayName) {
+              this.setNodeModalFieldError('displayName', '请输入节点名称');
+              this.setNodeModalFeedback('节点名称不能为空', 'warning');
+              return;
+          }
           if (!payload.name) {
-              this.showMessage('节点路径不能为空', { tone: 'warning' });
+              this.setNodeModalFieldError('name', '请输入节点路径');
+              this.setNodeModalFeedback('节点路径不能为空', 'warning');
+              return;
+          }
+          if (!this.validateNodePath(payload.name)) {
+              this.setNodeModalFieldError('name', this.getNodePathRuleText());
+              this.setNodeModalFeedback('节点路径格式无效，请使用单段小写路径', 'warning');
               return;
           }
 
           const normalizedLines = [];
+          const invalidLineTargets = {};
           for (let index = 0; index < this.nodeModalLines.length; index++) {
               const rawLine = this.nodeModalLines[index] || {};
-              const hasAnyValue = String(rawLine.name || '').trim() || String(rawLine.target || '').trim() || Number.isFinite(Number(rawLine.latencyMs));
-              if (!hasAnyValue) continue;
+              const latencyMs = this.parseLatencyMs(rawLine.latencyMs);
+              const defaultLineName = this.buildDefaultLineName(index);
+              const rawLineName = String(rawLine.name || '').trim();
+              const hasTargetInput = !!String(rawLine.target || '').trim();
+              const hasCustomName = !!rawLineName && rawLineName !== defaultLineName;
+              if (!hasTargetInput && !hasCustomName && latencyMs === null) continue;
               const target = this.normalizeSingleTarget(rawLine.target);
               if (!target) {
-                  this.showMessage('每条线路都必须填写有效的 http/https 目标源站', { tone: 'warning' });
+                  invalidLineTargets[String(rawLine.id || '')] = '请填写有效的 http/https 目标源站';
+                  this.setNodeModalFieldError('lines', '请修正线路目标源站后再保存');
+                  this.setNodeModalFieldError('lineTargetsMap', invalidLineTargets);
+                  this.setNodeModalFeedback('每条线路都必须填写有效的 http/https 目标源站', 'warning');
                   return;
               }
               normalizedLines.push({
                   id: this.normalizeNodeKey(rawLine.id) || this.createLineId(),
-                  name: String(rawLine.name || '').trim() || this.buildDefaultLineName(index),
+                  name: rawLineName || defaultLineName,
                   target,
-                  latencyMs: Number.isFinite(Number(rawLine.latencyMs)) ? Math.round(Number(rawLine.latencyMs)) : null,
+                  latencyMs,
                   latencyUpdatedAt: rawLine.latencyUpdatedAt || ''
               });
           }
 
           if (!normalizedLines.length) {
-              this.showMessage('至少需要保留一条有效线路', { tone: 'warning' });
+              this.setNodeModalFieldError('lines', '至少需要保留一条有效线路');
+              this.setNodeModalFeedback('至少需要保留一条有效线路', 'warning');
               return;
           }
           payload.lines = normalizedLines;
           payload.activeLineId = this.resolveActiveLineId(this.nodeModalForm.activeLineId, normalizedLines);
           payload.target = this.buildLegacyTargetFromLines(normalizedLines);
-          this.nodeModalSubmitting = true;
-
-          const originalNameKey = this.normalizeNodeKey(payload.originalName);
-          const optimisticNameKey = this.normalizeNodeKey(payload.name);
-          const mutationNames = [payload.originalName, payload.name];
-          const mutationId = this.markNodeMutation(mutationNames);
-          const optimisticIdx = this.nodes.findIndex(n => {
-              const currentName = this.normalizeNodeKey(n?.name);
-              return currentName === originalNameKey || currentName === optimisticNameKey;
-          });
-          const previousNode = optimisticIdx > -1 ? this.nodes[optimisticIdx] : null;
-          const optimisticNode = {
-              ...(previousNode || {}),
-              name: payload.name,
-              displayName: payload.displayName,
-              target: payload.target,
-              lines: payload.lines,
-              activeLineId: payload.activeLineId,
-              secret: payload.secret,
-              tag: payload.tag,
-              tagColor: payload.tagColor,
-              remark: payload.remark,
-              headers: payload.headers
-          };
-
-          if (optimisticIdx > -1) {
-              this.nodes[optimisticIdx] = optimisticNode;
-          } else {
-              this.nodes.push(optimisticNode);
-          }
-
+          const modalDraft = this.captureNodeModalDraft();
+          const affectedNames = Array.from(new Set([payload.originalName, payload.name].map(name => String(name || '').trim()).filter(Boolean)));
+          const mutationId = this.markNodeMutation(affectedNames);
+          const optimisticNode = this.hydrateNode(payload);
+          this.upsertNode(optimisticNode, { previousName: payload.originalName });
           this.closeNodeModal();
-
-          this.apiCall('save', payload).then(res => {
-              if (!this.isNodeMutationCurrent([...mutationNames, res?.node?.name], mutationId)) return;
-              if (res && res.node) {
-                  this.upsertNode(res.node);
+          this.showMessage(payload.originalName ? '节点已在本地更新，正在同步到 KV...' : '节点已在本地创建，正在同步到 KV...', { tone: 'info' });
+          try {
+              const res = await this.apiCall('save', payload);
+              if (!this.isNodeMutationCurrent(affectedNames, mutationId)) return;
+              if (res?.node) {
+                  this.upsertNode(res.node, { previousName: payload.originalName });
+              } else {
+                  this.upsertNode(payload, { previousName: payload.originalName });
               }
-          }).catch(err => {
-              if (!this.isNodeMutationCurrent(mutationNames, mutationId)) return;
-              return this.rollbackNodesState('后台同步到 KV 数据库失败: ' + err.message);
-          }).finally(() => {
-              this.nodeModalSubmitting = false;
-          });
+              this.showMessage(payload.originalName ? '节点已保存' : '节点已创建', { tone: 'success' });
+          } catch (err) {
+              console.error('saveNode failed', err);
+              if (!this.isNodeMutationCurrent(affectedNames, mutationId)) return;
+              try {
+                  await this.loadNodes();
+              } catch (rollbackErr) {
+                  console.error('loadNodes rollback after save failed', rollbackErr);
+                  this.showMessage('节点保存失败，且自动回滚失败，请手动刷新页面后重试', { tone: 'error', modal: true });
+                  return;
+              }
+              const errorMessage = '节点保存失败: ' + (err?.message || '未知错误');
+              this.restoreNodeModalDraft(modalDraft, {
+                feedbackMessage: errorMessage,
+                feedbackTone: 'error'
+              });
+              this.showMessage('后台保存失败，已回滚本地节点列表', { tone: 'error' });
+          }
       },
       
       async deleteNode(name) {
           if (!await this.askConfirm('删除节点后将立即同步到 KV，是否继续？', { title: '删除节点', tone: 'danger', confirmText: '删除' })) return;
           const normalizedName = this.normalizeNodeKey(name);
           const mutationId = this.markNodeMutation([name]);
-          this.nodes = this.nodes.filter(n => String(n?.name || '').trim().toLowerCase() !== normalizedName);
+          this.applyNodesState((Array.isArray(this.nodes) ? this.nodes : []).filter(n => this.normalizeNodeKey(n?.name) !== normalizedName), { syncSourceDirectNodes: false });
 
           try {
               await this.apiCall('delete', {name});
+              this.reconcileSourceDirectNodesSelection({ allowedNames: this.nodes.map(node => node?.name) });
           } catch(err) {
               if (!this.isNodeMutationCurrent([name], mutationId)) return;
               await this.rollbackNodesState('后台删除节点失败: ' + err.message);
@@ -8855,7 +9319,7 @@ const UI_HTML = `<!DOCTYPE html>
           return tagPillPalette[toneKey] || tagPillPalette.amber;
         },
         statusMeta() {
-          return this.app.getNodeLatencyMeta(this.activeLine?.latencyMs, this.app.nodeHealth[this.hydratedNode.name] || 0);
+          return this.app.getNodeLatencyMeta(this.activeLine?.latencyMs, this.app.getNodeHealthCount(this.hydratedNode.name));
         },
         pingPending() {
           return this.app.isNodePingPending(this.hydratedNode.name);
@@ -8897,7 +9361,11 @@ const UI_HTML = `<!DOCTYPE html>
         let unbindDesktopViewportChange = null;
         let unbindHashRouteChange = null;
         uiBrowserBridge.attachDebugApp(appState);
-        const handleHashChange = () => appState.route(uiBrowserBridge.readHash(appState.currentHash || '#dashboard'));
+        const handleHashChange = () => {
+          const nextHash = uiBrowserBridge.readHash(appState.currentHash || '#dashboard');
+          if (String(nextHash || '') === String(appState.currentHash || '')) return;
+          appState.route(nextHash);
+        };
         const handleDesktopViewportChange = (event) => {
           appState.syncViewportState(appState.getCurrentRouteHash(), event?.matches === true);
         };
@@ -8983,7 +9451,7 @@ function renderAdminPage(env, initHealth = buildInitHealth(env)) {
   const html = UI_HTML
     .replace("__ADMIN_BOOTSTRAP__", () => serializeInlineJson(bootstrap))
     .replace('<div id="app" v-cloak></div>', () => `${buildInitHealthBannerHtml(initHealth)}\n  <div id="app" v-cloak></div>`);
-  const headers = new Headers({ 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'public, max-age=0, s-maxage=86400, stale-while-revalidate=3600' });
+  const headers = new Headers({ 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store, max-age=0' });
   applySecurityHeaders(headers);
   return new Response(html, { headers });
 }
@@ -9278,41 +9746,15 @@ export default {
           };
         }
 
-        try {
-          await ensureLeaseActive();
-          const previousKvTidyState = previousScheduledStatus?.kvTidy && typeof previousScheduledStatus.kvTidy === "object"
-            ? previousScheduledStatus.kvTidy
-            : {};
-          let lastKvTidyAt = typeof previousKvTidyState.lastSuccessAt === "string"
-            ? previousKvTidyState.lastSuccessAt
-            : "";
-          if (Database.shouldRunKvTidy(lastKvTidyAt)) {
-            const tidyResult = await Database.tidyKvData(env, { kv, ctx });
-            lastKvTidyAt = new Date().toISOString();
-            scheduledState.kvTidy = {
-              status: "success",
-              lastSuccessAt: lastKvTidyAt,
-              lastTriggeredBy: "scheduled",
-              summary: tidyResult.summary
-            };
-          } else {
-            scheduledState.kvTidy = {
-              status: "skipped",
-              lastSkippedAt: new Date().toISOString(),
-              lastSuccessAt: lastKvTidyAt,
-              reason: "cooldown_active"
-            };
-          }
-        } catch (kvTidyErr) {
-          scheduledState.status = scheduledState.status === "success" ? "partial_failure" : scheduledState.status;
-          scheduledState.kvTidy = {
-            status: "failed",
-            lastErrorAt: new Date().toISOString(),
-            lastError: kvTidyErr?.message || String(kvTidyErr),
-            lastTriggeredBy: "scheduled"
-          };
-          console.error("Scheduled KV Tidy Error: ", kvTidyErr);
-        }
+        const previousKvTidyState = previousScheduledStatus?.kvTidy && typeof previousScheduledStatus.kvTidy === "object"
+          ? previousScheduledStatus.kvTidy
+          : {};
+        scheduledState.kvTidy = {
+          ...previousKvTidyState,
+          mode: "manual_only",
+          lastAutoSkipAt: new Date().toISOString(),
+          autoSkipReason: "manual_only"
+        };
         
         const { tgBotToken, tgChatId } = config;
         if (tgBotToken && tgChatId) {
