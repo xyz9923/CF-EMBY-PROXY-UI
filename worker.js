@@ -1,4 +1,4 @@
-// EMBY-PROXY-UI V18.5 (SaaS UI Optimized - Ultimate Fix + Emby Auth Patch)
+// EMBY-PROXY-UI V18.6 (SaaS UI Optimized - Ultimate Fix + Emby Auth Patch)
 
 /**
  * @typedef {{
@@ -62,6 +62,17 @@
  * @typedef {RequestInit & { cf?: { cacheEverything: boolean, cacheTtl: number } }} WorkerRequestInit
  * @typedef {Response & { webSocket?: unknown }} UpgradeableResponse
  * @typedef {Error & { code?: string, status?: number }} AppError
+ *
+ * @typedef {{
+ *   match: (...args: any[]) => Promise<any>,
+ *   put: (...args: any[]) => Promise<any>
+ * }} WorkerDefaultCacheLike
+ *
+ * @typedef {{
+ *   caches?: {
+ *     default?: WorkerDefaultCacheLike | null
+ *   } | null
+ * }} WorkerGlobalWithCachesLike
  */
 
 // ============================================================================
@@ -86,7 +97,7 @@ const Config = {
     LogBatchRetryBackoffMs: 75,
     ScheduledLeaseMinMs: 30 * 1000,
     ScheduledLeaseMs: 5 * 60 * 1000,
-    UiRadiusPx: 24,
+    UiRadiusPx: 10,
     CacheTtlImagesDays: 30,
     PingTimeoutMs: 5000,
     PingCacheMinutes: 10,
@@ -95,22 +106,25 @@ const Config = {
     TgAlertFlushRetryThreshold: 0,
     TgAlertCooldownMinutes: 30,
     TgAlertOnScheduledFailure: false,
-    UpstreamTimeoutMs: 0,
+    UpstreamTimeoutMs: 8000,
     UpstreamRetryAttempts: 0,
     BufferedRetryBodyMaxBytes: 2 * 1024 * 1024,
     LogQueryDefaultDays: 1,
     LogKeywordMaxWindowDays: 3,
+    LogSearchMode: "like",
     LogVacuumMinIntervalMs: 7 * 24 * 60 * 60 * 1000,
+    LogFtsRebuildMinIntervalMs: 7 * 24 * 60 * 60 * 1000,
     KvTidyIntervalMs: 60 * 60 * 1000,
-    PrewarmCacheTtl: 180,
+    PrewarmCacheTtl: 120,
     MetadataPrewarmTimeoutMs: 3000,
     PrewarmPrefetchBytes: 4 * 1024 * 1024,
     ConfigSnapshotLimit: 5,
-    DnsHistoryLimit: 10,
+    DnsHistoryLimit: 5,
     CleanupBudgetMs: 1,             
     CleanupChunkSize: 64,           
-    AssetHash: "v18.5",           
-    Version: "18.5"                 
+    CleanupMinIntervalMs: 1000,
+    AssetHash: "v18.6",           
+    Version: "18.6"                 
   }
 };
 
@@ -121,6 +135,7 @@ const GLOBALS = {
   NodesListCache: null,
   CleanupState: {
     phase: 0,
+    lastRunAt: 0,
     iterators: {
       node: null,
       crypto: null,
@@ -398,7 +413,42 @@ function buildProxyPrefix(name, key) {
 
 function normalizePrewarmDepth(value) {
   const normalized = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
-  return normalized === "poster" ? "poster" : "poster_manifest";
+  return normalized === "poster_manifest" ? "poster_manifest" : "poster";
+}
+
+function normalizeLogSearchMode(value) {
+  return String(value || "").trim().toLowerCase() === "fts" ? "fts" : Config.Defaults.LogSearchMode;
+}
+
+function looksLikeFtsExpression(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  if (/\b(?:AND|OR|NOT|NEAR)\b/i.test(text)) return true;
+  if (/(?:^|\s)(?:node_name|request_path|user_agent|error_detail)\s*:/i.test(text)) return true;
+  if (/(?:^|\s)[^\s"]+\*/.test(text)) return true;
+  return /^"(?:[^"]|"")+"$/.test(text);
+}
+
+function quoteFtsTerm(term) {
+  return `"${String(term || "").replace(/"/g, '""')}"`;
+}
+
+function normalizeFtsExpression(text) {
+  return String(text || "").replace(
+    /(^|\s)((?:node_name|request_path|user_agent|error_detail)\s*:\s*)([^"\s()]+)(?=\s|$)/gi,
+    (match, lead, prefix, value) => `${lead}${prefix}${quoteFtsTerm(value)}`
+  );
+}
+
+function buildFtsMatchQuery(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (looksLikeFtsExpression(text)) return normalizeFtsExpression(text);
+  return text
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(token => quoteFtsTerm(token))
+    .join(" AND ");
 }
 
 function normalizeRegionCodeCsv(value = "") {
@@ -410,6 +460,18 @@ function normalizeRegionCodeCsv(value = "") {
   )].join(",");
 }
 
+function quoteSqlIdentifier(name) {
+  return `"${String(name || "").replace(/"/g, '""')}"`;
+}
+
+function normalizeSqlIdentifierSearchText(sql) {
+  return String(sql || "")
+    .toLowerCase()
+    .replace(/["`\[\]]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function parseContentLengthHeader(value) {
   const raw = String(value || "").trim();
   if (!/^\d+$/.test(raw)) return null;
@@ -419,8 +481,11 @@ function parseContentLengthHeader(value) {
 
 function getDefaultCacheHandle() {
   try {
-    const cachesHandle = /** @type {{ default?: { match: (...args: any[]) => Promise<any>, put: (...args: any[]) => Promise<any> } | null } | undefined} */ (globalThis.caches);
-    return cachesHandle?.default || null;
+    /** @type {unknown} */
+    const globalObject = globalThis;
+    /** @type {WorkerGlobalWithCachesLike | null | undefined} */
+    const runtimeGlobals = globalObject;
+    return runtimeGlobals?.caches?.default ?? null;
   } catch {
     return null;
   }
@@ -673,7 +738,11 @@ function reconcileNamedNodeSelection(currentSelection = [], options = {}) {
   const allowedNameEntries = options.allowedNames === undefined
     ? null
     : normalizeNodeNameList(options.allowedNames || [])
-        .map(name => /** @type {[string, string]} */ ([String(name || "").trim().toLowerCase(), String(name || "").trim()]))
+        .map(name => {
+          /** @type {[string, string]} */
+          const entry = [String(name || "").trim().toLowerCase(), String(name || "").trim()];
+          return entry;
+        })
         .filter(([key, value]) => key && value);
   const allowedNameMap = allowedNameEntries ? new Map(allowedNameEntries) : null;
   const nextSelection = [];
@@ -719,7 +788,7 @@ function normalizeRedirectMethod(status, method = "GET") {
   return upperMethod;
 }
 
-const CF_DASH_CACHE_VERSION = 5;
+const CF_DASH_CACHE_VERSION = 6;
 
 function makeCfDashCacheKey(zoneId, dateKey = "") {
   const safeZoneId = encodeURIComponent(String(zoneId || "default").trim() || "default");
@@ -776,7 +845,9 @@ function scoreHostnameCandidate(hostname, options = {}) {
 }
 
 async function fetchCloudflareApiJson(url, apiToken, init = {}) {
-  const extraInit = /** @type {any} */ (init && typeof init === "object" ? init : {});
+  const normalizedInit = init && typeof init === "object" ? init : {};
+  /** @type {any} */
+  const extraInit = normalizedInit;
   let extraHeaders = {};
   const rawHeaders = extraInit?.headers;
   if (rawHeaders) {
@@ -829,6 +900,101 @@ async function fetchCloudflareZoneDetails(zoneId, apiToken) {
   if (!zoneId || !apiToken) return null;
   const payload = await fetchCloudflareApiJson(`https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(String(zoneId).trim())}`, apiToken);
   return payload?.result || null;
+}
+
+function isEditableDnsRecordType(value = "") {
+  const upper = String(value || "").trim().toUpperCase();
+  return upper === "A" || upper === "AAAA" || upper === "CNAME";
+}
+
+function normalizeDnsEditModeValue(value = "") {
+  return String(value || "").trim().toLowerCase() === "a" ? "a" : "cname";
+}
+
+function isValidIpv4Address(value = "") {
+  const text = String(value || "").trim();
+  const parts = text.split(".");
+  if (parts.length !== 4) return false;
+  for (const part of parts) {
+    if (!/^[0-9]{1,3}$/.test(part)) return false;
+    const num = Number(part);
+    if (!Number.isFinite(num) || num < 0 || num > 255) return false;
+  }
+  return true;
+}
+
+function isValidIpv6Address(value = "") {
+  const text = String(value || "").trim();
+  if (!text || !text.includes(":")) return false;
+  if (/\s/.test(text)) return false;
+  try {
+    new URL(`http://[${text}]/`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getDnsContentValidationError(type, content, options = {}) {
+  const nextType = String(type || "").trim().toUpperCase();
+  const nextContent = String(content || "").trim();
+  const allowCname = options.allowCname !== false;
+  if (!isEditableDnsRecordType(nextType)) return "Type 仅允许 A / AAAA / CNAME";
+  if (!allowCname && nextType === "CNAME") return "A 模式仅允许 A / AAAA";
+  if (!nextContent) return "Content 不能为空";
+  if (nextType === "A" && !isValidIpv4Address(nextContent)) return "A 记录 Content 必须是合法 IPv4 地址";
+  if (nextType === "AAAA" && !isValidIpv6Address(nextContent)) return "AAAA 记录 Content 必须是合法 IPv6 地址";
+  if (nextType === "CNAME") {
+    if (/\s/.test(nextContent)) return "CNAME 记录 Content 不能包含空格";
+    if (nextContent.length > 255) return "CNAME 记录 Content 过长";
+  }
+  return "";
+}
+
+function normalizeEditableDnsRecord(record = {}) {
+  return {
+    id: String(record?.id || "").trim(),
+    type: String(record?.type || "").trim().toUpperCase(),
+    name: normalizeHostnameText(record?.name),
+    content: String(record?.content || "").trim(),
+    ttl: Number(record?.ttl) || 1,
+    proxied: record?.proxied === true,
+    comment: typeof record?.comment === "string" ? record.comment : undefined,
+    tags: Array.isArray(record?.tags) ? record.tags.map(tag => String(tag)) : undefined
+  };
+}
+
+async function listCloudflareDnsRecords(zoneId, apiToken) {
+  const records = [];
+  let page = 1;
+  let totalPages = 1;
+  const perPage = 100;
+  do {
+    const url = `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(zoneId)}/dns_records?page=${page}&per_page=${perPage}`;
+    const payload = await fetchCloudflareApiJson(url, apiToken);
+    if (Array.isArray(payload?.result)) {
+      records.push(...payload.result.map(item => normalizeEditableDnsRecord(item)).filter(item => item.id && item.name));
+    }
+    totalPages = Number(payload?.result_info?.total_pages || payload?.result_info?.totalPages || 1);
+    page += 1;
+  } while (page <= totalPages && page <= 20);
+  return records;
+}
+
+function buildCloudflareDnsRecordBody(baseRecord = {}, options = {}) {
+  const type = String(options.type || baseRecord?.type || "A").trim().toUpperCase();
+  const host = normalizeHostnameText(options.host || baseRecord?.name);
+  const content = String(options.content || "").trim();
+  const body = {
+    type,
+    name: host,
+    content,
+    ttl: Number(baseRecord?.ttl) || 1,
+    proxied: baseRecord?.proxied === true
+  };
+  if (typeof baseRecord?.comment === "string") body.comment = baseRecord.comment;
+  if (Array.isArray(baseRecord?.tags)) body.tags = baseRecord.tags.map(tag => String(tag));
+  return body;
 }
 
 async function resolveCloudflareWorkerServices({ cfAccountId, cfZoneId, cfApiToken }) {
@@ -966,8 +1132,8 @@ async function resolveCloudflareBoundHostname({ cfAccountId, cfZoneId, cfApiToke
 function sanitizeRuntimeConfig(input = {}) {
   const sanitized = sanitizeConfigWithRules(input, CONFIG_SANITIZE_RULES, { normalizeNodeNameList });
   sanitized.prewarmDepth = normalizePrewarmDepth(sanitized.prewarmDepth);
-  delete sanitized.dashboardAutoRefreshEnabled;
-  delete sanitized.dashboardAutoRefreshSeconds;
+  sanitized.settingsExperienceMode = String(sanitized.settingsExperienceMode || '').trim().toLowerCase() === 'expert' ? 'expert' : 'novice';
+  sanitized.logSearchMode = normalizeLogSearchMode(sanitized.logSearchMode);
   return sanitized;
 }
 
@@ -1196,8 +1362,81 @@ function clampNumberConfig(value, fallback, min, max) {
   return Math.min(max, Math.max(min, num));
 }
 
+const CONFIG_ALLOWED_FIELDS = [
+  "uiRadiusPx",
+  "settingsExperienceMode",
+  "enableH2",
+  "enableH3",
+  "peakDowngrade",
+  "protocolFallback",
+  "enablePrewarm",
+  "prewarmDepth",
+  "prewarmCacheTtl",
+  "prewarmPrefetchBytes",
+  "disablePrewarmPrefetch",
+  "directStaticAssets",
+  "directHlsDash",
+  "sourceSameOriginProxy",
+  "forceExternalProxy",
+  "wangpandirect",
+  "sourceDirectNodes",
+  "pingTimeout",
+  "pingCacheMinutes",
+  "nodePanelPingAutoSort",
+  "upstreamTimeoutMs",
+  "upstreamRetryAttempts",
+  "geoAllowlist",
+  "geoBlocklist",
+  "ipBlacklist",
+  "rateLimitRpm",
+  "cacheTtlImages",
+  "corsOrigins",
+  "logSearchMode",
+  "logRetentionDays",
+  "logWriteDelayMinutes",
+  "logFlushCountThreshold",
+  "logBatchChunkSize",
+  "logBatchRetryCount",
+  "logBatchRetryBackoffMs",
+  "scheduledLeaseMs",
+  "tgBotToken",
+  "tgChatId",
+  "tgAlertDroppedBatchThreshold",
+  "tgAlertFlushRetryThreshold",
+  "tgAlertOnScheduledFailure",
+  "tgAlertCooldownMinutes",
+  "jwtExpiryDays",
+  "cfAccountId",
+  "cfZoneId",
+  "cfApiToken"
+];
+
+const CONFIG_ALIAS_FIELDS = {
+  sourceDirectNodes: ["directSourceNodes", "nodeDirectList"]
+};
+
+const CONFIG_DEFAULT_TRUE_FIELDS = [
+  "peakDowngrade",
+  "protocolFallback",
+  "enablePrewarm",
+  "sourceSameOriginProxy",
+  "forceExternalProxy"
+];
+
+const CONFIG_DEFAULT_FALSE_FIELDS = [
+  "enableH2",
+  "enableH3",
+  "tgAlertOnScheduledFailure",
+  "directStaticAssets",
+  "directHlsDash",
+  "disablePrewarmPrefetch",
+  "nodePanelPingAutoSort"
+];
+
 const CONFIG_SANITIZE_RULES = {
-  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "wangpandirect", "prewarmDepth"],
+  allowedFields: CONFIG_ALLOWED_FIELDS,
+  aliasFields: CONFIG_ALIAS_FIELDS,
+  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "wangpandirect", "prewarmDepth", "logSearchMode"],
   arrayNormalizers: {
     sourceDirectNodes: "nodeNameList"
   },
@@ -1223,12 +1462,37 @@ const CONFIG_SANITIZE_RULES = {
   numberFields: {
     logWriteDelayMinutes: { fallback: Config.Defaults.LogFlushDelayMinutes, min: 0, max: 1440 }
   },
-  booleanTrueFields: [],
-  booleanFalseFields: ["tgAlertOnScheduledFailure", "directStaticAssets", "directHlsDash", "disablePrewarmPrefetch", "nodePanelPingAutoSort"]
+  booleanTrueFields: CONFIG_DEFAULT_TRUE_FIELDS,
+  booleanFalseFields: CONFIG_DEFAULT_FALSE_FIELDS
 };
 
+function applyConfigRuleAliases(config = {}, rules = {}) {
+  for (const [targetKey, sourceKeys] of Object.entries(rules.aliasFields || {})) {
+    if (config[targetKey] !== undefined && config[targetKey] !== null) continue;
+    if (!Array.isArray(sourceKeys)) continue;
+    for (const sourceKey of sourceKeys) {
+      if (config[sourceKey] === undefined || config[sourceKey] === null) continue;
+      config[targetKey] = config[sourceKey];
+      break;
+    }
+  }
+  return config;
+}
+
+function filterConfigAllowedFields(config = {}, rules = {}) {
+  const allowedFields = Array.isArray(rules.allowedFields) ? rules.allowedFields : [];
+  if (!allowedFields.length) return config;
+  const filtered = {};
+  for (const key of allowedFields) {
+    if (!Object.prototype.hasOwnProperty.call(config, key)) continue;
+    filtered[key] = config[key];
+  }
+  return filtered;
+}
+
 function sanitizeConfigWithRules(input = {}, rules = CONFIG_SANITIZE_RULES, helpers = {}) {
-  const config = input && typeof input === "object" ? { ...input } : {};
+  let config = input && typeof input === "object" && !Array.isArray(input) ? { ...input } : {};
+  config = applyConfigRuleAliases(config, rules);
   for (const key of rules.trimFields || []) {
     if (config[key] === undefined || config[key] === null) continue;
     config[key] = String(config[key]).trim();
@@ -1251,7 +1515,7 @@ function sanitizeConfigWithRules(input = {}, rules = CONFIG_SANITIZE_RULES, help
   for (const key of rules.booleanFalseFields || []) {
     config[key] = config[key] === true;
   }
-  return config;
+  return filterConfigAllowedFields(config, rules);
 }
 
 async function runWithConcurrency(items, limit, worker) {
@@ -1398,11 +1662,13 @@ const CacheManager = {
   },
   async invalidateList(ctx) { GLOBALS.NodesListCache = null; },
   maybeCleanup() {
+    const now = nowMs();
+    if ((now - (GLOBALS.CleanupState.lastRunAt || 0)) < Config.Defaults.CleanupMinIntervalMs) return;
+    GLOBALS.CleanupState.lastRunAt = now;
     const budget = Config.Defaults.CleanupBudgetMs;
     const chunkSize = Config.Defaults.CleanupChunkSize;
     const state = GLOBALS.CleanupState;
     const iterators = state.iterators || (state.iterators = { node: null, crypto: null, rate: null, log: null });
-    const now = nowMs();
     const start = now;
     const cleanMap = (map, shouldDelete, iteratorKey) => {
       let iterator = iterators[iteratorKey];
@@ -1446,6 +1712,9 @@ const Database = {
   DNS_RECORD_HISTORY_PREFIX: "sys:dns_record_history:v1:",
   TELEGRAM_ALERT_STATE_KEY: "sys:telegram_alert_state:v1",
   SYS_STATUS_TABLE: "sys_status",
+  LOGS_TABLE: "proxy_logs",
+  LOGS_FTS_TABLE: "proxy_logs_fts",
+  LOGS_FTS_INSERT_TRIGGER: "proxy_logs_fts_ai",
   OPS_STATUS_DB_SCOPE_ROOT: "ops_status:root",
   OPS_STATUS_SECTION_KEYS: {
     log: "sys:ops_status:log:v1",
@@ -1453,6 +1722,97 @@ const Database = {
   },
   getKV(env) { return Auth.getKV(env); },
   getDB(env) { return env.DB || env.D1 || env.PROXY_LOGS; },
+  async hasLogsFtsTable(db) {
+    if (!db) return false;
+    try {
+      const row = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").bind(this.LOGS_FTS_TABLE).first();
+      return String(row?.name || "") === this.LOGS_FTS_TABLE;
+    } catch {
+      return false;
+    }
+  },
+  async ensureLogsBaseSchema(db) {
+    if (!db) return false;
+    await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.LOGS_TABLE} (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, node_name TEXT NOT NULL, request_path TEXT NOT NULL, request_method TEXT NOT NULL, status_code INTEGER NOT NULL, response_time INTEGER NOT NULL, client_ip TEXT NOT NULL, user_agent TEXT, referer TEXT, category TEXT DEFAULT 'api', error_detail TEXT, created_at TEXT NOT NULL)`).run();
+    let existingColumns = new Set();
+    try {
+      const schemaRows = await db.prepare(`PRAGMA table_info(${this.LOGS_TABLE})`).all();
+      existingColumns = new Set((schemaRows?.results || []).map(row => String(row?.name || "").toLowerCase()).filter(Boolean));
+    } catch {}
+    if (!existingColumns.has("category")) {
+      await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN category TEXT DEFAULT 'api'`).run();
+      existingColumns.add("category");
+    }
+    if (!existingColumns.has("error_detail")) {
+      await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN error_detail TEXT`).run();
+    }
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_timestamp ON ${this.LOGS_TABLE} (timestamp)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_client_ip ON ${this.LOGS_TABLE} (client_ip)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_node_time ON ${this.LOGS_TABLE} (node_name, timestamp)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_category ON ${this.LOGS_TABLE} (category)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_status_time ON ${this.LOGS_TABLE} (status_code, timestamp)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_category_time ON ${this.LOGS_TABLE} (category, timestamp)`).run();
+    return true;
+  },
+  async dropLogsFtsSyncTriggers(db) {
+    if (!db) return 0;
+    let dropped = 0;
+    let triggerRows = [];
+    try {
+      const triggerResult = await db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?").bind(this.LOGS_TABLE).all();
+      triggerRows = triggerResult?.results || [];
+    } catch {}
+    const ftsTableLower = this.LOGS_FTS_TABLE.toLowerCase();
+    const insertTriggerLower = this.LOGS_FTS_INSERT_TRIGGER.toLowerCase();
+    const legacySyncTriggerNames = new Set([
+      insertTriggerLower,
+      `${this.LOGS_TABLE}_ai`,
+      `${this.LOGS_TABLE}_au`,
+      `${this.LOGS_TABLE}_ad`,
+      `${this.LOGS_FTS_TABLE}_ai`,
+      `${this.LOGS_FTS_TABLE}_au`,
+      `${this.LOGS_FTS_TABLE}_ad`
+    ].map(name => String(name || "").toLowerCase()));
+    for (const row of triggerRows) {
+      const name = String(row?.name || "").trim();
+      if (!name) continue;
+      const lowerName = name.toLowerCase();
+      const normalizedSql = normalizeSqlIdentifierSearchText(row?.sql || "");
+      const touchesFts = legacySyncTriggerNames.has(lowerName)
+        || normalizedSql.includes(ftsTableLower);
+      if (!touchesFts) continue;
+      await db.prepare(`DROP TRIGGER IF EXISTS ${quoteSqlIdentifier(name)}`).run();
+      dropped += 1;
+    }
+    return dropped;
+  },
+  async rebuildLogsFts(db) {
+    if (!db || !await this.hasLogsFtsTable(db)) return false;
+    await db.prepare(`INSERT INTO ${this.LOGS_FTS_TABLE}(${this.LOGS_FTS_TABLE}) VALUES('rebuild')`).run();
+    return true;
+  },
+  async ensureLogsFtsSchema(db, options = {}) {
+    if (!db) return { migratedRows: 0, droppedTriggers: 0, rebuilt: false, recreated: false };
+    const forceRecreate = options.forceRecreate === true;
+    await this.ensureLogsBaseSchema(db);
+    let recreated = false;
+    let droppedTriggers = 0;
+    if (forceRecreate) {
+      droppedTriggers = await this.dropLogsFtsSyncTriggers(db);
+      await db.prepare(`DROP TABLE IF EXISTS ${this.LOGS_FTS_TABLE}`).run();
+      recreated = true;
+    }
+    await db.prepare(`CREATE VIRTUAL TABLE IF NOT EXISTS ${this.LOGS_FTS_TABLE} USING fts5(node_name, request_path, user_agent, error_detail, content='${this.LOGS_TABLE}', content_rowid='id', tokenize='unicode61')`).run();
+    droppedTriggers += await this.dropLogsFtsSyncTriggers(db);
+    await db.prepare(`CREATE TRIGGER IF NOT EXISTS ${this.LOGS_FTS_INSERT_TRIGGER} AFTER INSERT ON ${this.LOGS_TABLE} BEGIN
+      INSERT INTO ${this.LOGS_FTS_TABLE}(rowid, node_name, request_path, user_agent, error_detail)
+      VALUES (new.id, new.node_name, new.request_path, COALESCE(new.user_agent, ''), COALESCE(new.error_detail, ''));
+    END;`).run();
+    const migratedRows = (await db.prepare(`SELECT COUNT(*) as total FROM ${this.LOGS_TABLE}`).first())?.total || 0;
+    // 历史数据迁移 SQL：把现有 proxy_logs 全量重建进 FTS5 虚拟表。
+    await db.prepare(`INSERT INTO ${this.LOGS_FTS_TABLE}(${this.LOGS_FTS_TABLE}) VALUES('rebuild')`).run();
+    return { migratedRows, droppedTriggers, rebuilt: true, recreated };
+  },
   resolveOpsStatusStores(envOrStore) {
     if (envOrStore && typeof envOrStore.prepare === "function") {
       return { kv: null, db: envOrStore };
@@ -1723,6 +2083,10 @@ const Database = {
     const safeRecordId = encodeURIComponent(String(recordId || "").trim() || "unknown");
     return `${this.DNS_RECORD_HISTORY_PREFIX}${safeZoneId}:${safeRecordId}`;
   },
+  getDnsHostHistoryRecordId(hostname) {
+    const normalizedHost = normalizeHostnameText(hostname);
+    return `host:${normalizedHost || "unknown"}`;
+  },
   normalizeDnsHistoryValueKey(type, content) {
     return `${String(type || "").trim().toUpperCase()}::${String(content || "").trim().toLowerCase()}`;
   },
@@ -1752,7 +2116,7 @@ const Database = {
     const seen = new Set();
     for (const rawEntry of Array.isArray(entries) ? entries : []) {
       const entry = this.normalizeDnsRecordHistoryEntry(rawEntry);
-      if (!entry.type || !entry.content) continue;
+      if (entry.type !== "CNAME" || !entry.content) continue;
       const historyKey = this.normalizeDnsHistoryValueKey(entry.type, entry.content);
       if (seen.has(historyKey)) continue;
       seen.add(historyKey);
@@ -1780,13 +2144,22 @@ const Database = {
     if (!kv || !zoneId || !recordId) return [];
     const currentHistory = await this.getDnsRecordHistory(kv, zoneId, recordId);
     const normalizedEntry = this.normalizeDnsRecordHistoryEntry(entry);
-    if (!normalizedEntry.type || !normalizedEntry.content) return currentHistory;
+    if (normalizedEntry.type !== "CNAME" || !normalizedEntry.content) return currentHistory;
     const nextValueKey = this.normalizeDnsHistoryValueKey(normalizedEntry.type, normalizedEntry.content);
     const currentValueKey = currentHistory[0]
       ? this.normalizeDnsHistoryValueKey(currentHistory[0].type, currentHistory[0].content)
       : "";
     if (currentValueKey && currentValueKey === nextValueKey) return currentHistory;
     return this.persistDnsRecordHistory(kv, zoneId, recordId, [normalizedEntry, ...currentHistory]);
+  },
+  async getDnsHostHistory(kv, zoneId, hostname) {
+    return this.getDnsRecordHistory(kv, zoneId, this.getDnsHostHistoryRecordId(hostname));
+  },
+  async persistDnsHostHistory(kv, zoneId, hostname, entries) {
+    return this.persistDnsRecordHistory(kv, zoneId, this.getDnsHostHistoryRecordId(hostname), entries);
+  },
+  async recordDnsHostHistory(kv, zoneId, hostname, entry = {}) {
+    return this.recordDnsRecordHistory(kv, zoneId, this.getDnsHostHistoryRecordId(hostname), entry);
   },
   getCurrentDateKey(now = new Date()) {
     const utc8Now = new Date(now.getTime() + 8 * 3600 * 1000);
@@ -1939,17 +2312,24 @@ const Database = {
       }
     };
   },
-  shouldRunLogsVacuum(lastVacuumAt, options = {}) {
+  shouldRunLogsOptimize(lastOptimizeAt, options = {}) {
     const now = Number(options.nowMs) || nowMs();
     const minIntervalMs = Math.max(0, Number(options.minIntervalMs) || Config.Defaults.LogVacuumMinIntervalMs);
     if (options.force === true) return true;
-    const parsedLastVacuumAt = typeof lastVacuumAt === "string" ? new Date(lastVacuumAt).getTime() : NaN;
-    if (!Number.isFinite(parsedLastVacuumAt)) return true;
-    return (now - parsedLastVacuumAt) >= minIntervalMs;
+    const parsedLastOptimizeAt = typeof lastOptimizeAt === "string" ? new Date(lastOptimizeAt).getTime() : NaN;
+    if (!Number.isFinite(parsedLastOptimizeAt)) return true;
+    return (now - parsedLastOptimizeAt) >= minIntervalMs;
   },
-  async vacuumLogsDb(db) {
+  shouldRunLogsFtsRebuild(lastFtsRebuildAt, options = {}) {
+    return this.shouldRunLogsOptimize(lastFtsRebuildAt, {
+      ...options,
+      minIntervalMs: Math.max(0, Number(options.minIntervalMs) || Config.Defaults.LogFtsRebuildMinIntervalMs)
+    });
+  },
+  async optimizeLogsDb(db) {
     if (!db) return false;
-    await db.prepare("VACUUM").run();
+    // D1 官方文档列出了兼容的 PRAGMA，并推荐使用 PRAGMA optimize 做数据库维护。
+    await db.prepare("PRAGMA optimize").run();
     return true;
   },
   /**
@@ -2107,6 +2487,7 @@ const Database = {
       const videoWhereClause = getVideoRequestWhereClause();
 
       let reqTotal = 0, playCount = 0, infoCount = 0;
+      let reqDisplay = "0";
       let cfTrafficStatus = "未找到今日缓存 (需打开面板刷新)";
       let domainName = cfZoneId ? "Cloudflare (读取自缓存)" : "未接入 CF (读取自缓存)";
 
@@ -2121,7 +2502,9 @@ const Database = {
           }
 
           if (cached && cached.ver === CF_DASH_CACHE_VERSION) {
-              reqTotal = Number(cached.todayRequests) || 0;
+              reqTotal = Number(cached.todayRequests);
+              if (!Number.isFinite(reqTotal)) reqTotal = 0;
+              reqDisplay = String(cached.requestCountDisplay || "").trim() || reqTotal.toString();
               cfTrafficStatus = cached.todayTraffic || "0 B";
               if (cfTrafficStatus === "未配置") cfTrafficStatus = "缓存暂无流量数据";
               playCount = cached.playCount || 0;
@@ -2132,8 +2515,8 @@ const Database = {
           console.log("Read CF cache failed", e);
       }
 
-      let reqStr = reqTotal.toString();
-      if (reqTotal > 1000) reqStr = (reqTotal / 1000).toFixed(2) + "k";
+      let reqStr = reqDisplay;
+      if (reqStr === "0" && reqTotal > 1000) reqStr = (reqTotal / 1000).toFixed(2) + "k";
 
       const msgText = `📊 Cloudflare Zone 每日报表 (UTC+8)\n域名: ${domainName}\n\n📅 今天 (${todayStr})\n请求数: ${reqStr}\n视频流量 (CF 总计): ${cfTrafficStatus}\n请求: 播放请求 ${playCount} 次 | 获取播放信息 ${infoCount} 次\n#Cloudflare #Emby #日报`;
       await this.sendTelegramMessage({ tgBotToken, tgChatId, text: msgText });
@@ -2481,7 +2864,7 @@ const Database = {
   // - 面板统计 / 运行状态：getDashboardStats / getRuntimeStatus
   // - 配置与备份：loadConfig / previewConfig / saveConfig / exportConfig / importFull
   // - 节点治理：list / saveOrImport / delete / pingNode
-  // - 运维动作：getLogs / clearLogs / initLogsDb / purgeCache / tidyKvData / testTelegram / sendDailyReport
+  // - 运维动作：getLogs / clearLogs / initLogsDb / initLogsFts / purgeCache / tidyKvData / testTelegram / sendDailyReport
   // 设计意图：
   // - 维持单文件部署，但把“动作分发”和“动作实现”拆成两个认知层次。
   // - 新增 action 时，优先在这里挂处理器，再在 handleApi 做最小派发。
@@ -2492,7 +2875,7 @@ const Database = {
   ApiHandlers: {
     async getDashboardStats(data, { env, ctx, kv, db }) {
       const config = sanitizeRuntimeConfig(await getRuntimeConfig(env));
-      let todayRequests = 0, todayTraffic = "未配置", nodeCount = 0;
+      let todayRequests = null, todayTraffic = "未配置", nodeCount = 0;
       let cfAnalyticsLoaded = false, requestsLoaded = false;
       let cfAnalyticsStatus = "", cfAnalyticsError = "", cfAnalyticsDetail = "";
       let requestSource = "pending", requestSourceText = "等待数据加载", trafficSourceText = "视频流量口径：CF Zone 总流量";
@@ -2592,7 +2975,6 @@ const Database = {
       } else {
           cfAnalyticsStatus = "未配置 Cloudflare";
           cfAnalyticsError = "请在账号设置中填写并保存 Cloudflare Zone ID 与 API 令牌";
-          requestSourceText = "今日请求量当前对齐：本地 D1 日志（兜底口径）";
           trafficSourceText = "视频流量当前对齐：未配置 Cloudflare，无法获取 CF Zone 总流量";
       }
             if (db) {
@@ -2618,9 +3000,28 @@ const Database = {
                 }
             }
 
+            if (!requestsLoaded) {
+                todayRequests = null;
+                if (!cfZoneId || !cfApiToken) {
+                    requestSource = "unconfigured";
+                    requestSourceText = db
+                      ? "今日请求量暂不可用：未配置 Cloudflare 联动，且本地 D1 日志未初始化或不可读"
+                      : "今日请求量未配置：未绑定 D1，且未配置 Cloudflare 联动";
+                } else {
+                    requestSource = "pending";
+                    requestSourceText = db
+                      ? "今日请求量暂不可用：Cloudflare 请求数查询失败，且本地 D1 日志未初始化或不可读"
+                      : "今日请求量暂不可用：Cloudflare 请求数查询失败，且未绑定 D1";
+                }
+            }
+
+            const requestCountDisplay = todayRequests === null || todayRequests === undefined
+              ? (requestSource === "unconfigured" ? "未配置" : "暂不可用")
+              : String(Number(todayRequests) || 0);
+
             const cachePayload = JSON.stringify({
           ver: CF_DASH_CACHE_VERSION, ts: Date.now(),
-          todayRequests, todayTraffic, hourlySeries,
+          todayRequests, requestCountDisplay, todayTraffic, hourlySeries,
           requestSource, requestSourceText, trafficSourceText,
           generatedAt,
           cfAnalyticsLoaded, cfAnalyticsStatus, cfAnalyticsError, cfAnalyticsDetail,
@@ -2630,7 +3031,7 @@ const Database = {
       if (ctx) ctx.waitUntil(kv.put(cacheKey, cachePayload));
       else await kv.put(cacheKey, cachePayload);
 
-      return new Response(JSON.stringify({ todayRequests, todayTraffic, nodeCount, hourlySeries, cfAnalyticsLoaded, cfAnalyticsStatus, cfAnalyticsError, cfAnalyticsDetail, requestSource, requestSourceText, trafficSourceText, generatedAt, cacheStatus: "live", playCount, infoCount }), { headers: { ...corsHeaders } });      
+      return new Response(JSON.stringify({ todayRequests, requestCountDisplay, todayTraffic, nodeCount, hourlySeries, cfAnalyticsLoaded, cfAnalyticsStatus, cfAnalyticsError, cfAnalyticsDetail, requestSource, requestSourceText, trafficSourceText, generatedAt, cacheStatus: "live", playCount, infoCount }), { headers: { ...corsHeaders } });      
     },
 
     async loadConfig(data, { env }) {
@@ -2900,29 +3301,10 @@ const Database = {
         try {
             const zone = await fetchCloudflareZoneDetails(cfZoneId, cfApiToken).catch(() => null);
             const requestHost = normalizeHostnameText(new URL(request.url).hostname);
-            const records = [];
-            let page = 1;
-            let totalPages = 1;
-            const perPage = 100;
-            do {
-                const url = `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(cfZoneId)}/dns_records?page=${page}&per_page=${perPage}`;
-                const payload = await fetchCloudflareApiJson(url, cfApiToken);
-                if (Array.isArray(payload?.result)) records.push(...payload.result);
-                totalPages = Number(payload?.result_info?.total_pages || payload?.result_info?.totalPages || 1);
-                page += 1;
-            } while (page <= totalPages && page <= 20);
-
-            const normalized = records.map((r) => ({
-                id: String(r?.id || ""),
-                type: String(r?.type || ""),
-                name: String(r?.name || ""),
-                content: String(r?.content || ""),
-                ttl: Number(r?.ttl) || 1,
-                proxied: r?.proxied === true
-            })).filter(r => r.id && r.name);
+            const normalized = await listCloudflareDnsRecords(cfZoneId, cfApiToken);
 
             const zoneName = String(zone?.name || "").trim() || "";
-            const inferredZoneName = zoneName || normalizeHostnameText(records[0]?.name || "");
+            const inferredZoneName = zoneName || normalizeHostnameText(normalized[0]?.name || "");
             let currentHost = requestHost;
             if (!isHostnameInsideZone(currentHost, inferredZoneName || zoneName)) {
               currentHost = normalizeHostnameText(await resolveCloudflareBoundHostname({
@@ -2934,12 +3316,11 @@ const Database = {
             }
 
             const filteredRecords = currentHost
-              ? normalized.filter(record => normalizeHostnameText(record.name) === currentHost)
-              : normalized;
-            const recordsWithHistory = await Promise.all(filteredRecords.map(async (record) => ({
-              ...record,
-              history: await Database.getDnsRecordHistory(kv, cfZoneId, record.id)
-            })));
+              ? normalized.filter(record => normalizeHostnameText(record.name) === currentHost && isEditableDnsRecordType(record.type))
+              : normalized.filter(record => isEditableDnsRecordType(record.type));
+            const history = currentHost
+              ? await Database.getDnsHostHistory(kv, cfZoneId, currentHost)
+              : [];
 
             return jsonResponse({
                 ok: true,
@@ -2947,8 +3328,9 @@ const Database = {
                 zoneName,
                 currentHost,
                 totalRecords: normalized.length,
-                filteredCount: recordsWithHistory.length,
-                records: recordsWithHistory
+                filteredCount: filteredRecords.length,
+                records: filteredRecords,
+                history
             });
         } catch (e) {
             const msg = String(e?.message || e || "unknown_error");
@@ -2970,96 +3352,52 @@ const Database = {
         const nextContent = String(data?.content || "").trim();
 
         if (!recordId) return jsonError("MISSING_PARAMS", "recordId 不能为空");
-        if (!["A", "AAAA", "CNAME"].includes(nextType)) return jsonError("INVALID_TYPE", "Type 仅允许 A / AAAA / CNAME");
-        if (!nextContent) return jsonError("INVALID_CONTENT", "Content 不能为空");
+        if (!isEditableDnsRecordType(nextType)) return jsonError("INVALID_TYPE", "Type 仅允许 A / AAAA / CNAME");
+        const validationError = getDnsContentValidationError(nextType, nextContent);
+        if (validationError) return jsonError("INVALID_CONTENT", validationError);
 
         const config = sanitizeRuntimeConfig(await getRuntimeConfig(env));
         const cfZoneId = String(config.cfZoneId || "").trim();
         const cfApiToken = String(config.cfApiToken || "").trim();
         if (!cfZoneId || !cfApiToken) return jsonError("CF_API_ERROR", "请在账号设置中完善 Zone ID 和 API 令牌");
 
-        const isAllowedRecordType = (value) => {
-            const t = String(value || "").toUpperCase();
-            return t === "A" || t === "AAAA" || t === "CNAME";
-        };
-
-        const isValidIpv4 = (value) => {
-            const v = String(value || "").trim();
-            const parts = v.split(".");
-            if (parts.length !== 4) return false;
-            for (const part of parts) {
-                if (!/^[0-9]{1,3}$/.test(part)) return false;
-                const num = Number(part);
-                if (!Number.isFinite(num) || num < 0 || num > 255) return false;
-            }
-            return true;
-        };
-
-        const isValidIpv6 = (value) => {
-            const v = String(value || "").trim();
-            if (!v || !v.includes(":")) return false;
-            if (/\s/.test(v)) return false;
-            try {
-                new URL(`http://[${v}]/`);
-                return true;
-            } catch {
-                return false;
-            }
-        };
-
-        if (nextType === "A" && !isValidIpv4(nextContent)) return jsonError("INVALID_CONTENT", "A 记录 Content 必须是合法 IPv4 地址");
-        if (nextType === "AAAA" && !isValidIpv6(nextContent)) return jsonError("INVALID_CONTENT", "AAAA 记录 Content 必须是合法 IPv6 地址");
-        if (nextType === "CNAME" && /\s/.test(nextContent)) return jsonError("INVALID_CONTENT", "CNAME 记录 Content 不能包含空格");
-
         try {
             const getUrl = `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(cfZoneId)}/dns_records/${encodeURIComponent(recordId)}`;
             const existingPayload = await fetchCloudflareApiJson(getUrl, cfApiToken);
-            const existing = existingPayload?.result;
-            if (!existing) return jsonError("NOT_FOUND", "DNS 记录不存在", 404);
+            const existing = normalizeEditableDnsRecord(existingPayload?.result || null);
+            if (!existing?.id) return jsonError("NOT_FOUND", "DNS 记录不存在", 404);
 
             const currentType = String(existing?.type || "").toUpperCase();
-            if (!isAllowedRecordType(currentType)) {
+            if (!isEditableDnsRecordType(currentType)) {
                 return jsonError("UNSUPPORTED_RECORD_TYPE", "该 DNS 记录类型不支持编辑", 400, { currentType });
             }
 
-            const updateBody = {
+            const updateBody = buildCloudflareDnsRecordBody(existing, {
+                host: existing.name,
                 type: nextType,
-                name: String(existing?.name || ""),
-                content: nextContent,
-                ttl: Number(existing?.ttl) || 1,
-                proxied: existing?.proxied === true
-            };
-            if (typeof existing?.comment === "string") updateBody.comment = existing.comment;
-            if (Array.isArray(existing?.tags)) updateBody.tags = existing.tags.map(tag => String(tag));
+                content: nextContent
+            });
 
             const updatePayload = await fetchCloudflareApiJson(getUrl, cfApiToken, {
                 method: "PUT",
                 body: JSON.stringify(updateBody)
             });
 
-            const updated = updatePayload?.result || null;
-            const record = updated
-              ? {
-                  id: String(updated?.id || recordId),
-                  type: String(updated?.type || updateBody.type),
-                  name: String(updated?.name || updateBody.name),
-                  content: String(updated?.content || updateBody.content),
-                  ttl: Number(updated?.ttl) || updateBody.ttl,
-                  proxied: updated?.proxied === true
-                }
-              : { id: recordId, ...updateBody };
-            const history = await Database.recordDnsRecordHistory(kv, cfZoneId, record.id, {
-              name: record.name,
-              type: record.type,
-              content: record.content,
-              actor: "admin",
-              source: "ui",
-              requestHost: normalizeHostnameText(new URL(request.url).hostname),
-              savedAt: new Date().toISOString()
-            });
+            const updated = normalizeEditableDnsRecord(updatePayload?.result || { id: recordId, ...updateBody });
+            const history = updated.type === "CNAME"
+              ? await Database.recordDnsHostHistory(kv, cfZoneId, updated.name, {
+                  name: updated.name,
+                  type: updated.type,
+                  content: updated.content,
+                  actor: "admin",
+                  source: "ui",
+                  requestHost: normalizeHostnameText(new URL(request.url).hostname),
+                  savedAt: new Date().toISOString()
+                })
+              : await Database.getDnsHostHistory(kv, cfZoneId, updated.name);
             return jsonResponse({
                 ok: true,
-                record,
+                record: updated,
                 history
             });
         } catch (e) {
@@ -3070,6 +3408,159 @@ const Database = {
                 ? "Cloudflare DNS 更新失败：API 令牌无效"
                 : "Cloudflare DNS 更新失败";
             return jsonError("CF_DNS_UPDATE_FAILED", hint, 400, { reason: msg });
+        }
+    },
+
+    async saveDnsRecords(data, { env, kv, request }) {
+        if (request.headers.get("X-Admin-Confirm") !== "saveDnsRecords") {
+            return jsonError("CONFIRMATION_REQUIRED", "敏感 DNS 操作需要显式确认头", 428);
+        }
+
+        const mode = normalizeDnsEditModeValue(data?.mode);
+        const host = normalizeHostnameText(data?.host || "");
+        const rawDesiredRecords = Array.isArray(data?.records) ? data.records : [];
+        if (!host) return jsonError("MISSING_PARAMS", "host 不能为空");
+
+        /** @type {{ type: string, content: string }[]} */
+        const desiredRecords = [];
+        if (mode === "cname") {
+            const content = String(rawDesiredRecords[0]?.content || "").trim();
+            const validationError = getDnsContentValidationError("CNAME", content);
+            if (validationError) return jsonError("INVALID_CONTENT", validationError);
+            desiredRecords.push({ type: "CNAME", content });
+        } else {
+            const normalizedDesiredRecords = rawDesiredRecords
+              .map(item => ({
+                type: String(item?.type || "").trim().toUpperCase(),
+                content: String(item?.content || "").trim()
+              }))
+              .filter(item => item.type || item.content);
+            if (!normalizedDesiredRecords.length) {
+                return jsonError("INVALID_CONTENT", "A 模式至少保留 1 条 A / AAAA 记录");
+            }
+            for (const record of normalizedDesiredRecords) {
+                if (!["A", "AAAA"].includes(record.type)) {
+                    return jsonError("INVALID_TYPE", "A 模式仅允许 A / AAAA");
+                }
+                const validationError = getDnsContentValidationError(record.type, record.content, { allowCname: false });
+                if (validationError) return jsonError("INVALID_CONTENT", validationError);
+                desiredRecords.push(record);
+            }
+        }
+
+        const config = sanitizeRuntimeConfig(await getRuntimeConfig(env));
+        const cfZoneId = String(config.cfZoneId || "").trim();
+        const cfApiToken = String(config.cfApiToken || "").trim();
+        if (!cfZoneId || !cfApiToken) return jsonError("CF_API_ERROR", "请在账号设置中完善 Zone ID 和 API 令牌");
+
+        try {
+            const zone = await fetchCloudflareZoneDetails(cfZoneId, cfApiToken).catch(() => null);
+            const zoneName = String(zone?.name || "").trim() || "";
+            if (zoneName && !isHostnameInsideZone(host, zoneName)) {
+                return jsonError("INVALID_HOST", "当前站点不在该 Zone 下");
+            }
+
+            const requestHost = normalizeHostnameText(new URL(request.url).hostname);
+            const existingRecords = await listCloudflareDnsRecords(cfZoneId, cfApiToken);
+            const hostRecords = existingRecords.filter(record => normalizeHostnameText(record.name) === host && isEditableDnsRecordType(record.type));
+            const baseRecord = hostRecords[0] || { name: host, ttl: 1, proxied: false };
+            const zoneRecordsUrl = `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(cfZoneId)}/dns_records`;
+
+            const deleteRecord = async (record) => {
+                if (!record?.id) return;
+                await fetchCloudflareApiJson(`${zoneRecordsUrl}/${encodeURIComponent(record.id)}`, cfApiToken, { method: "DELETE" });
+            };
+
+            const updateRecord = async (record, nextType, nextContent) => {
+                const body = buildCloudflareDnsRecordBody(record, { host, type: nextType, content: nextContent });
+                const payload = await fetchCloudflareApiJson(`${zoneRecordsUrl}/${encodeURIComponent(record.id)}`, cfApiToken, {
+                    method: "PUT",
+                    body: JSON.stringify(body)
+                });
+                return normalizeEditableDnsRecord(payload?.result || { id: record.id, ...body });
+            };
+
+            const createRecord = async (nextType, nextContent, seedRecord = baseRecord) => {
+                const body = buildCloudflareDnsRecordBody(seedRecord, { host, type: nextType, content: nextContent });
+                const payload = await fetchCloudflareApiJson(zoneRecordsUrl, cfApiToken, {
+                    method: "POST",
+                    body: JSON.stringify(body)
+                });
+                return normalizeEditableDnsRecord(payload?.result || body);
+            };
+
+            const syncRecordsByType = async (type, nextRecords, currentRecords) => {
+                for (let index = nextRecords.length; index < currentRecords.length; index += 1) {
+                    await deleteRecord(currentRecords[index]);
+                }
+                for (let index = 0; index < nextRecords.length; index += 1) {
+                    const desired = nextRecords[index];
+                    const existing = currentRecords[index];
+                    if (existing) {
+                        if (String(existing.content || "").trim() !== desired.content || String(existing.type || "").toUpperCase() !== type) {
+                            await updateRecord(existing, type, desired.content);
+                        }
+                        continue;
+                    }
+                    await createRecord(type, desired.content, currentRecords[0] || baseRecord);
+                }
+            };
+
+            if (mode === "cname") {
+                const currentCnameRecords = hostRecords.filter(record => record.type === "CNAME");
+                const currentAddressRecords = hostRecords.filter(record => record.type === "A" || record.type === "AAAA");
+                for (const record of currentAddressRecords) await deleteRecord(record);
+                for (let index = 1; index < currentCnameRecords.length; index += 1) {
+                    await deleteRecord(currentCnameRecords[index]);
+                }
+                const primaryCname = currentCnameRecords[0] || null;
+                const desiredCname = desiredRecords[0];
+                if (primaryCname) {
+                    if (String(primaryCname.content || "").trim() !== desiredCname.content) {
+                        await updateRecord(primaryCname, "CNAME", desiredCname.content);
+                    }
+                } else {
+                    await createRecord("CNAME", desiredCname.content, baseRecord);
+                }
+                await Database.recordDnsHostHistory(kv, cfZoneId, host, {
+                    name: host,
+                    type: "CNAME",
+                    content: desiredCname.content,
+                    actor: "admin",
+                    source: "ui",
+                    requestHost,
+                    savedAt: new Date().toISOString()
+                });
+            } else {
+                const currentCnameRecords = hostRecords.filter(record => record.type === "CNAME");
+                for (const record of currentCnameRecords) await deleteRecord(record);
+                await syncRecordsByType("A", desiredRecords.filter(record => record.type === "A"), hostRecords.filter(record => record.type === "A"));
+                await syncRecordsByType("AAAA", desiredRecords.filter(record => record.type === "AAAA"), hostRecords.filter(record => record.type === "AAAA"));
+            }
+
+            const refreshedRecords = await listCloudflareDnsRecords(cfZoneId, cfApiToken);
+            const filteredRecords = refreshedRecords.filter(record => normalizeHostnameText(record.name) === host && isEditableDnsRecordType(record.type));
+            const history = await Database.getDnsHostHistory(kv, cfZoneId, host);
+
+            return jsonResponse({
+                ok: true,
+                zoneId: cfZoneId,
+                zoneName,
+                currentHost: host,
+                totalRecords: refreshedRecords.length,
+                filteredCount: filteredRecords.length,
+                records: filteredRecords,
+                history,
+                mode
+            });
+        } catch (e) {
+            const msg = String(e?.message || e || "unknown_error");
+            const hint = msg.includes("cf_api_http_403")
+              ? "Cloudflare DNS 保存失败：API 令牌权限不足（需要 Zone.DNS:Edit）"
+              : msg.includes("cf_api_http_401")
+                ? "Cloudflare DNS 保存失败：API 令牌无效"
+                : "Cloudflare DNS 保存失败";
+            return jsonError("CF_DNS_SAVE_FAILED", hint, 400, { reason: msg });
         }
     },
 
@@ -3179,7 +3670,7 @@ const Database = {
         });
     },
 
-    async getLogs(data, { db }) {
+    async getLogs(data, { db, env }) {
       if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       const { page = 1, pageSize = 50, filters = {} } = data;
       const safePage = Math.max(1, parseInt(page, 10) || 1);
@@ -3204,10 +3695,13 @@ const Database = {
       if (!Number.isFinite(startTs)) startTs = Math.max(0, endTs - defaultWindowMs);
       if (startTs > endTs) [startTs, endTs] = [Math.max(0, endTs - defaultWindowMs), endTs];
 
-      const whereClause = ["timestamp >= ?", "timestamp <= ?"];
+      const runtimeConfig = env ? await getRuntimeConfig(env) : {};
+      const searchMode = normalizeLogSearchMode(filters.searchMode || runtimeConfig.logSearchMode);
+      const whereClause = ["proxy_logs.timestamp >= ?", "proxy_logs.timestamp <= ?"];
       /** @type {(number | string)[]} */
       const params = [startTs, endTs];
       const keyword = String(filters.keyword || "").trim();
+      let useFtsKeyword = false;
       if (keyword) {
         const maxKeywordWindowMs = Config.Defaults.LogKeywordMaxWindowDays * 24 * 60 * 60 * 1000;
         if ((endTs - startTs) > maxKeywordWindowMs) {
@@ -3216,29 +3710,49 @@ const Database = {
           });
         }
         if (/^\d{3}$/.test(keyword)) {
-          whereClause.push("status_code = ?");
+          whereClause.push("proxy_logs.status_code = ?");
           params.push(Number(keyword));
         } else if (isLikelyIpAddress(keyword)) {
-          whereClause.push("client_ip = ?");
+          whereClause.push("proxy_logs.client_ip = ?");
           params.push(keyword);
+        } else if (searchMode === "fts") {
+          whereClause.push(`${Database.LOGS_FTS_TABLE} MATCH ?`);
+          params.push(buildFtsMatchQuery(keyword));
+          useFtsKeyword = true;
         } else {
           const likeKeyword = `%${escapeSqlLike(keyword)}%`;
-          whereClause.push("(node_name LIKE ? ESCAPE '\\' OR request_path LIKE ? ESCAPE '\\' OR user_agent LIKE ? ESCAPE '\\' OR error_detail LIKE ? ESCAPE '\\')");
+          whereClause.push("(proxy_logs.node_name LIKE ? ESCAPE '\\' OR proxy_logs.request_path LIKE ? ESCAPE '\\' OR proxy_logs.user_agent LIKE ? ESCAPE '\\' OR proxy_logs.error_detail LIKE ? ESCAPE '\\')");
           params.push(likeKeyword, likeKeyword, likeKeyword, likeKeyword);
         }
       }
       if (filters.category) {
-        whereClause.push("category = ?");
+        whereClause.push("proxy_logs.category = ?");
         params.push(String(filters.category));
       }
       if (filters.playbackMode) {
-        whereClause.push("error_detail LIKE ? ESCAPE '\\'");
+        whereClause.push("proxy_logs.error_detail LIKE ? ESCAPE '\\'");
         params.push(`%${escapeSqlLike(`Playback=${String(filters.playbackMode)}`)}%`);
       }
 
       const where = "WHERE " + whereClause.join(" AND ");
-      const total = (await db.prepare(`SELECT COUNT(*) as total FROM proxy_logs ${where}`).bind(...params).first())?.total || 0;
-      const logsResult = await db.prepare(`SELECT * FROM proxy_logs ${where} ORDER BY timestamp DESC LIMIT ? OFFSET ?`).bind(...params, safePageSize, offset).all();
+      const fromClause = useFtsKeyword
+        ? `FROM proxy_logs INNER JOIN ${Database.LOGS_FTS_TABLE} ON ${Database.LOGS_FTS_TABLE}.rowid = proxy_logs.id`
+        : "FROM proxy_logs";
+      let total = 0;
+      let logsResult = { results: [] };
+      try {
+        total = (await db.prepare(`SELECT COUNT(*) as total ${fromClause} ${where}`).bind(...params).first())?.total || 0;
+        logsResult = await db.prepare(`SELECT proxy_logs.* ${fromClause} ${where} ORDER BY proxy_logs.timestamp DESC LIMIT ? OFFSET ?`).bind(...params, safePageSize, offset).all();
+      } catch (error) {
+        const message = String(error?.message || error || "");
+        if (useFtsKeyword && /no such table:\s*proxy_logs_fts/i.test(message)) {
+          return jsonError("LOG_FTS_NOT_READY", "FTS5 虚拟表尚未初始化，请先点击“初始化 FTS5”", 400, { searchMode });
+        }
+        if (useFtsKeyword && /fts5/i.test(message)) {
+          return jsonError("LOG_FTS_QUERY_INVALID", "FTS 查询语法无效，请检查引号、布尔表达式或前缀写法", 400, { detail: message });
+        }
+        throw error;
+      }
       
       return new Response(JSON.stringify({
         logs: logsResult.results || [],
@@ -3246,6 +3760,7 @@ const Database = {
         page: safePage,
         pageSize: safePageSize,
         totalPages: Math.ceil(total / safePageSize),
+        searchMode,
         range: {
           startDate: new Date(startTs).toISOString(),
           endDate: new Date(endTs).toISOString()
@@ -3255,6 +3770,7 @@ const Database = {
 
     async clearLogs(data, { db, env, ctx }) {
       if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders } });
+      await Database.ensureLogsBaseSchema(db);
       const clearEpochMs = nowMs();
       GLOBALS.LogClearEpochMs = Math.max(GLOBALS.LogClearEpochMs || 0, clearEpochMs);
       await Database.patchOpsStatus(env || db, {
@@ -3272,41 +3788,35 @@ const Database = {
       GLOBALS.LogQueue.length = 0;
       GLOBALS.LogDedupe.clear();
       GLOBALS.LogLastFlushAt = 0;
-      await db.prepare("DELETE FROM proxy_logs").run();
-      let vacuumed = false;
+      await db.prepare(`DELETE FROM ${Database.LOGS_TABLE}`).run();
+      let ftsRebuilt = false;
       try {
-        vacuumed = await this.vacuumLogsDb(db);
+        ftsRebuilt = await Database.rebuildLogsFts(db);
       } catch (error) {
-        console.warn("clearLogs VACUUM failed", error);
+        console.warn("clearLogs FTS rebuild failed", error);
       }
-      return new Response(JSON.stringify({ success: true, vacuumed }), { headers: { ...corsHeaders } });
+      return new Response(JSON.stringify({ success: true, ftsRebuilt }), { headers: { ...corsHeaders } });
     },
 
     async initLogsDb(data, { db }) {
       if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders } });
-      await db.prepare(`CREATE TABLE IF NOT EXISTS proxy_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, node_name TEXT NOT NULL, request_path TEXT NOT NULL, request_method TEXT NOT NULL, status_code INTEGER NOT NULL, response_time INTEGER NOT NULL, client_ip TEXT NOT NULL, user_agent TEXT, referer TEXT, category TEXT DEFAULT 'api', error_detail TEXT, created_at TEXT NOT NULL)`).run();
-      let existingColumns = new Set();
-      try {
-        const schemaRows = await db.prepare(`PRAGMA table_info(proxy_logs)`).all();
-        existingColumns = new Set((schemaRows?.results || []).map(row => String(row?.name || "").toLowerCase()).filter(Boolean));
-      } catch {}
-      if (!existingColumns.has("category")) {
-        await db.prepare(`ALTER TABLE proxy_logs ADD COLUMN category TEXT DEFAULT 'api'`).run();
-        existingColumns.add("category");
-      }
-      if (!existingColumns.has("error_detail")) {
-        await db.prepare(`ALTER TABLE proxy_logs ADD COLUMN error_detail TEXT`).run();
-      }
-      
-      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_timestamp ON proxy_logs (timestamp)`).run();
-      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_client_ip ON proxy_logs (client_ip)`).run();
-      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_node_time ON proxy_logs (node_name, timestamp)`).run();
-      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_category ON proxy_logs (category)`).run();
-      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_status_time ON proxy_logs (status_code, timestamp)`).run();
-      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_category_time ON proxy_logs (category, timestamp)`).run();
+      await Database.ensureLogsBaseSchema(db);
       await this.ensureSysStatusTable(db);
       
-      return new Response(JSON.stringify({ success: true, schemaVersion: 2, categoryEnabled: true }), { headers: { ...corsHeaders } });
+      return new Response(JSON.stringify({ success: true, schemaVersion: 3, categoryEnabled: true, ftsReady: await Database.hasLogsFtsTable(db) }), { headers: { ...corsHeaders } });
+    },
+
+    async initLogsFts(data, { db }) {
+      if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders } });
+      const result = await Database.ensureLogsFtsSchema(db);
+      await this.ensureSysStatusTable(db);
+      return new Response(JSON.stringify({
+        success: true,
+        ftsReady: true,
+        migratedRows: result.migratedRows,
+        droppedTriggers: result.droppedTriggers,
+        triggerMode: "insert_only"
+      }), { headers: { ...corsHeaders } });
     }
   },
 
@@ -3610,10 +4120,8 @@ const Proxy = {
     const imageCacheMaxAge = clampIntegerConfig(options.imageCacheMaxAge, Config.Defaults.CacheTtlImagesDays * 86400, 0, 365 * 86400);
     if (response.status >= 400 || requestTraits.isManifest) {
       modifiedHeaders.set("Cache-Control", "no-store");
-    } else if (requestTraits.isImage) {
+    } else if (requestTraits.isImage || requestTraits.isStaticFile || requestTraits.isSubtitle) {
       modifiedHeaders.set("Cache-Control", `public, max-age=${imageCacheMaxAge}`);
-    } else if (requestTraits.isStaticFile || requestTraits.isSubtitle) {
-      modifiedHeaders.set("Cache-Control", "public, max-age=86400");
     } else if (options.proxiedExternalRedirect) {
       modifiedHeaders.set("Cache-Control", "no-store");
     }
@@ -3702,10 +4210,8 @@ const Proxy = {
   buildMetadataCacheStorageResponse(response, requestTraits, options = {}) {
     const cacheHeaders = new Headers(response.headers);
     cacheHeaders.delete("Set-Cookie");
-    if (requestTraits.isImage) {
+    if (requestTraits.isImage || requestTraits.isSubtitle) {
       cacheHeaders.set("Cache-Control", `public, max-age=${Math.max(0, Number(options.imageCacheMaxAge) || 0)}`);
-    } else if (requestTraits.isSubtitle) {
-      cacheHeaders.set("Cache-Control", "public, max-age=86400");
     } else if (requestTraits.isManifest) {
       cacheHeaders.set("Cache-Control", `public, max-age=${Math.max(0, Number(options.prewarmCacheTtl) || 0)}`);
     }
@@ -3965,23 +4471,37 @@ const Proxy = {
           if (isLastTarget && isLastPass) throw error;
         }
       }
-    }
+  }
 
     if (lastResponse) return { response: lastResponse, targetBase: lastBase, finalUrl: lastFinalUrl };
     throw lastError || new Error("upstream_fetch_failed");
   },
-  async handle(request, node, path, name, key, env, ctx, options = {}) {
-    // Proxy.handle 阶段图（单文件内的执行主链）：
-    // Phase A. 环境准备：配置、来源、CORS、客户端身份
-    // Phase B. 前置裁决：OPTIONS / 防火墙 / 限流 / 目标源合法性
-    // Phase C. 请求整备：分类、头部整理、body/重试目标准备
-    // Phase D. 上游访问：fetch + 协议回退 + 多目标重试
-    // Phase E. 跳转决策：同源/异源、直连/继续代理
-    // Phase F. 响应整形：缓存头、CORS、Location 改写
-    // Phase G. 观测记录：分类、状态码、错误细节、耗时
+  recordAccessLog(execution, payload = {}) {
+    Logger.record(execution.env, execution.ctx, {
+      nodeName: execution.nodeName,
+      requestPath: execution.proxyPath,
+      requestMethod: execution.request.method,
+      responseTime: Date.now() - execution.startTime,
+      clientIp: execution.clientIp,
+      userAgent: execution.request.headers.get("User-Agent"),
+      referer: execution.request.headers.get("Referer"),
+      ...payload
+    });
+  },
+  buildOptionsResponse(execution) {
+    const headers = new Headers(execution.dynamicCors);
+    applySecurityHeaders(headers);
+    if (execution.finalOrigin !== "*") mergeVaryHeader(headers, "Origin");
+    return new Response(null, { headers });
+  },
+  async prepareExecutionContext(request, node, path, name, key, env, ctx, options = {}) {
     const startTime = Date.now();
     CacheManager.maybeCleanup();
-    if (!node || !node.target) return new Response("Invalid Node", { status: 502, headers: applySecurityHeaders(new Headers()) });
+    if (!node || !node.target) {
+      return {
+        invalidResponse: new Response("Invalid Node", { status: 502, headers: applySecurityHeaders(new Headers()) })
+      };
+    }
 
     const currentConfig = await getRuntimeConfig(env);
     const requestUrl = options.requestUrl || new URL(request.url);
@@ -3990,109 +4510,149 @@ const Proxy = {
     const country = request.cf?.country || "UNKNOWN";
     const finalOrigin = this.resolveCorsOrigin(currentConfig, request);
     const dynamicCors = getCorsHeadersForResponse(env, request, finalOrigin);
-
-    if (request.method === "OPTIONS") {
-      const headers = new Headers(dynamicCors);
-      applySecurityHeaders(headers);
-      if (finalOrigin !== "*") mergeVaryHeader(headers, "Origin");
-      return new Response(null, { headers });
-    }
-
-    const blockedResponse = this.evaluateFirewall(currentConfig, clientIp, country, finalOrigin);
-    if (blockedResponse) return blockedResponse;
-
     const nodeDirectSource = isNodeDirectSourceEnabled(node, currentConfig);
     const requestTraits = this.classifyRequest(request, proxyPath, requestUrl, currentConfig, {
       nodeDirectSource,
       directStaticAssets: currentConfig.directStaticAssets === true,
       directHlsDash: currentConfig.directHlsDash === true
     });
-    const { rangeHeader, prewarmCacheTtl, isImage, isStaticFile, isSubtitle, isManifest, isSegment, isWsUpgrade, isBigStream, isMetadataCacheable, directStaticAssets, directHlsDash, direct307Mode, canStripAuthOnProtocolFallback } = requestTraits;
-
-    const rateLimitResponse = this.applyRateLimit(currentConfig, clientIp, requestTraits, startTime, finalOrigin);
-    if (rateLimitResponse) return rateLimitResponse;
 
     const enableH2 = currentConfig.enableH2 === true;
     const enableH3 = currentConfig.enableH3 === true;
     const peakDowngrade = currentConfig.peakDowngrade !== false;
-    const protocolFallback = currentConfig.protocolFallback !== false; 
+    const protocolFallback = currentConfig.protocolFallback !== false;
     const upstreamTimeoutMs = clampIntegerConfig(currentConfig.upstreamTimeoutMs, Config.Defaults.UpstreamTimeoutMs, 0, 180000);
     const upstreamRetryAttempts = clampIntegerConfig(currentConfig.upstreamRetryAttempts, Config.Defaults.UpstreamRetryAttempts, 0, 3);
     const imageCacheMaxAge = clampIntegerConfig(currentConfig.cacheTtlImages, Config.Defaults.CacheTtlImagesDays, 0, 365) * 86400;
     const utc8Hour = (new Date().getUTCHours() + 8) % 24;
     const isPeakHour = utc8Hour >= 20 && utc8Hour < 24;
     const forceH1 = (peakDowngrade && isPeakHour) || (!enableH2 && !enableH3);
-
-    const metadataCacheKey = (isMetadataCacheable && shouldWorkerCacheMetadataUrl(requestUrl)) ? buildWorkerCacheKey(requestUrl) : null;
+    const metadataCacheKey = (requestTraits.isMetadataCacheable && shouldWorkerCacheMetadataUrl(requestUrl)) ? buildWorkerCacheKey(requestUrl) : null;
     const metadataCache = metadataCacheKey ? getDefaultCacheHandle() : null;
-    if (metadataCache && metadataCacheKey) {
-      try {
-        const cachedResponse = await metadataCache.match(metadataCacheKey);
-        if (cachedResponse) {
-          const modifiedHeaders = this.buildProxyResponseHeaders(cachedResponse, request, dynamicCors, finalOrigin, requestTraits, {
-            enableH3,
-            forceH1,
-            imageCacheMaxAge
-          });
-          Logger.record(env, ctx, {
-            nodeName: name,
-            requestPath: proxyPath,
-            requestMethod: request.method,
-            statusCode: cachedResponse.status,
-            responseTime: Date.now() - startTime,
-            clientIp,
-            userAgent: request.headers.get("User-Agent"),
-            referer: request.headers.get("Referer"),
-            category: this.classifyProxyLogCategory(requestTraits),
-            errorDetail: this.extractProxyErrorDetail(cachedResponse)
-          });
-          return new Response(cachedResponse.body, {
-            status: cachedResponse.status,
-            statusText: cachedResponse.statusText,
-            headers: modifiedHeaders
-          });
-        }
-      } catch {}
-    }
 
-    const { targetBases, invalidResponse } = this.parseTargetBases(node, finalOrigin);
-    if (invalidResponse) return invalidResponse;
-    if (direct307Mode) {
-      const activeTargetBase = targetBases[0];
-      const directRedirectUrl = buildUpstreamProxyUrl(activeTargetBase, proxyPath);
-      directRedirectUrl.search = requestUrl.search;
-      const syntheticRedirect = new Response(null, { status: 307, statusText: "Temporary Redirect" });
-      const modifiedHeaders = this.buildProxyResponseHeaders(syntheticRedirect, request, dynamicCors, finalOrigin, requestTraits, {
-        enableH3,
-        forceH1,
-        imageCacheMaxAge
+    return {
+      request,
+      node,
+      nodeName: name,
+      nodeKey: key,
+      env,
+      ctx,
+      startTime,
+      currentConfig,
+      requestUrl,
+      proxyPath,
+      clientIp,
+      country,
+      finalOrigin,
+      dynamicCors,
+      requestTraits,
+      enableH3,
+      forceH1,
+      protocolFallback,
+      upstreamTimeoutMs,
+      upstreamRetryAttempts,
+      imageCacheMaxAge,
+      metadataCacheKey,
+      metadataCache
+    };
+  },
+  async tryServeMetadataCache(execution) {
+    if (!execution.metadataCache || !execution.metadataCacheKey) return null;
+    try {
+      const cachedResponse = await execution.metadataCache.match(execution.metadataCacheKey);
+      if (!cachedResponse) return null;
+      const modifiedHeaders = this.buildProxyResponseHeaders(
+        cachedResponse,
+        execution.request,
+        execution.dynamicCors,
+        execution.finalOrigin,
+        execution.requestTraits,
+        {
+          enableH3: execution.enableH3,
+          forceH1: execution.forceH1,
+          imageCacheMaxAge: execution.imageCacheMaxAge
+        }
+      );
+      this.recordAccessLog(execution, {
+        statusCode: cachedResponse.status,
+        category: this.classifyProxyLogCategory(execution.requestTraits),
+        errorDetail: this.extractProxyErrorDetail(cachedResponse)
       });
-      this.applyProxyRedirectHeaders(modifiedHeaders, syntheticRedirect, activeTargetBase, name, key, directRedirectUrl, directRedirectUrl);
-      Logger.record(env, ctx, {
-        nodeName: name,
-        requestPath: proxyPath,
-        requestMethod: request.method,
-        statusCode: 307,
-        responseTime: Date.now() - startTime,
-        clientIp,
-        userAgent: request.headers.get("User-Agent"),
-        referer: request.headers.get("Referer"),
-        category: this.classifyProxyLogCategory(requestTraits),
-        errorDetail: null
-      });
-      return new Response(null, {
-        status: 307,
-        statusText: "Temporary Redirect",
+      return new Response(cachedResponse.body, {
+        status: cachedResponse.status,
+        statusText: cachedResponse.statusText,
         headers: modifiedHeaders
       });
+    } catch {
+      return null;
     }
-    const { newHeaders, adminCustomHeaders, preparedBody, preparedBodyMode, retryTargets, allowAutomaticRetry } =
-      await this.buildProxyRequestState(request, node, proxyPath, requestUrl, clientIp, requestTraits, forceH1, targetBases);
+  },
+  async resolveEarlyResponse(execution) {
+    if (execution.request.method === "OPTIONS") {
+      return this.buildOptionsResponse(execution);
+    }
 
-    const sourceSameOriginProxy = currentConfig.sourceSameOriginProxy !== false;
-    const forceExternalProxy = currentConfig.forceExternalProxy !== false;
-    const wangpanDirectKeywords = getWangpanDirectText(currentConfig.wangpandirect || "");
-    const buildFetchOptions = async (targetUrl, options = {}) => {
+    const blockedResponse = this.evaluateFirewall(
+      execution.currentConfig,
+      execution.clientIp,
+      execution.country,
+      execution.finalOrigin
+    );
+    if (blockedResponse) return blockedResponse;
+
+    const rateLimitResponse = this.applyRateLimit(
+      execution.currentConfig,
+      execution.clientIp,
+      execution.requestTraits,
+      execution.startTime,
+      execution.finalOrigin
+    );
+    if (rateLimitResponse) return rateLimitResponse;
+
+    return await this.tryServeMetadataCache(execution);
+  },
+  maybeBuildDirectRedirectResponse(execution, targetBases) {
+    if (execution.requestTraits.direct307Mode !== true) return null;
+    const activeTargetBase = targetBases[0];
+    const directRedirectUrl = buildUpstreamProxyUrl(activeTargetBase, execution.proxyPath);
+    directRedirectUrl.search = execution.requestUrl.search;
+    const syntheticRedirect = new Response(null, { status: 307, statusText: "Temporary Redirect" });
+    const modifiedHeaders = this.buildProxyResponseHeaders(
+      syntheticRedirect,
+      execution.request,
+      execution.dynamicCors,
+      execution.finalOrigin,
+      execution.requestTraits,
+      {
+        enableH3: execution.enableH3,
+        forceH1: execution.forceH1,
+        imageCacheMaxAge: execution.imageCacheMaxAge
+      }
+    );
+    this.applyProxyRedirectHeaders(
+      modifiedHeaders,
+      syntheticRedirect,
+      activeTargetBase,
+      execution.nodeName,
+      execution.nodeKey,
+      directRedirectUrl,
+      directRedirectUrl
+    );
+    this.recordAccessLog(execution, {
+      statusCode: 307,
+      category: this.classifyProxyLogCategory(execution.requestTraits),
+      errorDetail: null
+    });
+    return new Response(null, {
+      status: 307,
+      statusText: "Temporary Redirect",
+      headers: modifiedHeaders
+    });
+  },
+  createBuildFetchOptions(execution, transport) {
+    const { request, requestTraits, protocolFallback } = execution;
+    const { newHeaders, adminCustomHeaders, preparedBody, preparedBodyMode } = transport;
+    return async (targetUrl, options = {}) => {
       const headers = new Headers(newHeaders);
       const finalTargetUrl = targetUrl instanceof URL ? targetUrl : new URL(String(targetUrl));
       const targetOrigin = finalTargetUrl.origin;
@@ -4139,186 +4699,255 @@ const Proxy = {
         headers.delete("Content-Length");
       }
 
-      const canEdgeCacheSubtitle = effectiveMethod === "GET" && !rangeHeader && isSubtitle;
+      const canEdgeCacheSubtitle = effectiveMethod === "GET" && !requestTraits.rangeHeader && requestTraits.isSubtitle;
       /** @type {WorkerRequestInit} */
-      const fetchOptions = { 
-        method: effectiveMethod, 
-        headers, 
+      const fetchOptions = {
+        method: effectiveMethod,
+        headers,
         redirect: "manual"
       };
-      // [字幕优化] 只在明确需要时附加 cf 缓存提示，避免覆盖 Dashboard Cache Rules。
       if (canEdgeCacheSubtitle) fetchOptions.cf = { cacheEverything: true, cacheTtl: 86400 };
       if (effectiveMethod !== "GET" && effectiveMethod !== "HEAD") {
-        if (effectiveBodyMode === "buffered" && effectiveBody !== null && effectiveBody !== undefined) fetchOptions.body = effectiveBody.slice(0);
-        else if (effectiveBodyMode === "stream") fetchOptions.body = effectiveBody;
+        if (effectiveBodyMode === "buffered" && effectiveBody !== null && effectiveBody !== undefined) {
+          fetchOptions.body = effectiveBody.slice(0);
+        } else if (effectiveBodyMode === "stream") {
+          fetchOptions.body = effectiveBody;
+        }
       }
       return fetchOptions;
     };
+  },
+  async executeUpstreamFlow(execution, transport, buildFetchOptions) {
+    const retryableStatuses = new Set([500, 502, 503, 504, 522, 523, 524, 525, 526, 530]);
+    const sourceSameOriginProxy = execution.currentConfig.sourceSameOriginProxy !== false;
+    const forceExternalProxy = execution.currentConfig.forceExternalProxy !== false;
+    const wangpanDirectKeywords = getWangpanDirectText(execution.currentConfig.wangpandirect || "");
 
-    const retryableStatuses = new Set([500, 502, 503, 504, 522, 523, 524, 525, 526, 530]); 
+    const upstream = await this.fetchUpstreamWithRetryLoop({
+      retryTargets: transport.retryTargets,
+      proxyPath: execution.proxyPath,
+      requestUrl: execution.requestUrl,
+      buildFetchOptions,
+      retryableStatuses,
+      protocolFallback: execution.protocolFallback,
+      preparedBodyMode: transport.preparedBodyMode,
+      allowAutomaticRetry: transport.allowAutomaticRetry,
+      stripAuthOnProtocolFallback: execution.requestTraits.canStripAuthOnProtocolFallback,
+      upstreamTimeoutMs: execution.upstreamTimeoutMs,
+      maxExtraAttempts: transport.allowAutomaticRetry ? execution.upstreamRetryAttempts : 0,
+      isRetry: false
+    });
 
-    let response;
-    let finalUrl;
-    let activeTargetBase;
+    let response = upstream.response;
+    let activeTargetBase = upstream.targetBase;
+    let finalUrl = upstream.finalUrl;
     let proxiedExternalRedirect = false;
     let directRedirectUrl = null;
+    let redirectHop = 0;
+    let redirectMethod = String(execution.request.method || "GET").toUpperCase();
+    let redirectBodyMode = transport.preparedBodyMode;
+    let redirectBody = transport.preparedBody;
 
-    try {
-      const upstream = await this.fetchUpstreamWithRetryLoop({
-        retryTargets,
-        proxyPath,
-        requestUrl,
+    while (response.status >= 300 && response.status < 400 && redirectHop < 8) {
+      const location = response.headers.get("Location");
+      const nextUrl = resolveRedirectTarget(location, finalUrl || activeTargetBase);
+      if (!nextUrl) break;
+
+      const redirectDecision = this.evaluateRedirectDecision(nextUrl, activeTargetBase, redirectMethod, redirectBodyMode, {
+        sourceSameOriginProxy,
+        forceExternalProxy,
+        wangpanDirectKeywords,
+        currentStatus: response.status
+      });
+
+      if (redirectDecision.mustDirect) {
+        directRedirectUrl = nextUrl;
+        break;
+      }
+
+      const nextMethod = redirectDecision.nextMethod;
+      const nextBodyMode = redirectDecision.nextBodyMode;
+      const nextBody = nextBodyMode === "none" ? null : redirectBody;
+
+      try { response.body?.cancel?.(); } catch {}
+
+      const redirectUpstream = await this.fetchAbsoluteWithRetryLoop({
+        absoluteUrl: nextUrl,
         buildFetchOptions,
+        fetchOptions: {
+          method: nextMethod,
+          bodyMode: nextBodyMode,
+          body: nextBody,
+          isExternalRedirect: !redirectDecision.isSameOriginRedirect
+        },
         retryableStatuses,
-        protocolFallback,
-        preparedBodyMode,
-        allowAutomaticRetry,
-        stripAuthOnProtocolFallback: canStripAuthOnProtocolFallback,
-        upstreamTimeoutMs,
-        maxExtraAttempts: allowAutomaticRetry ? upstreamRetryAttempts : 0,
+        protocolFallback: execution.protocolFallback,
+        preparedBodyMode: nextBodyMode,
+        allowAutomaticRetry: transport.allowAutomaticRetry,
+        stripAuthOnProtocolFallback: execution.requestTraits.canStripAuthOnProtocolFallback,
+        upstreamTimeoutMs: execution.upstreamTimeoutMs,
+        maxExtraAttempts: transport.allowAutomaticRetry ? execution.upstreamRetryAttempts : 0,
         isRetry: false
       });
-      response = upstream.response;
-      activeTargetBase = upstream.targetBase;
-      finalUrl = upstream.finalUrl;
+      response = redirectUpstream.response;
+      finalUrl = redirectUpstream.finalUrl;
+      redirectMethod = nextMethod;
+      redirectBodyMode = nextBodyMode;
+      redirectBody = nextBody;
+      if (!redirectDecision.isSameOriginRedirect) proxiedExternalRedirect = true;
+      redirectHop += 1;
+    }
 
-      let redirectHop = 0;
-      let redirectMethod = String(request.method || "GET").toUpperCase();
-      let redirectBodyMode = preparedBodyMode;
-      let redirectBody = preparedBody;
-      while (response.status >= 300 && response.status < 400 && redirectHop < 8) {
-        const location = response.headers.get("Location");
-        const nextUrl = resolveRedirectTarget(location, finalUrl || activeTargetBase);
-        if (!nextUrl) break;
-
-        const redirectDecision = this.evaluateRedirectDecision(nextUrl, activeTargetBase, redirectMethod, redirectBodyMode, {
-          sourceSameOriginProxy,
-          forceExternalProxy,
-          wangpanDirectKeywords,
-          currentStatus: response.status
-        });
-
-        if (redirectDecision.mustDirect) {
-          directRedirectUrl = nextUrl;
-          break;
-        }
-
-        const nextMethod = redirectDecision.nextMethod;
-        const nextBodyMode = redirectDecision.nextBodyMode;
-        const nextBody = nextBodyMode === "none" ? null : redirectBody;
-
-        try { response.body?.cancel?.(); } catch {}
-
-        const redirectUpstream = await this.fetchAbsoluteWithRetryLoop({
-          absoluteUrl: nextUrl,
-          buildFetchOptions,
-          fetchOptions: {
-            method: nextMethod,
-            bodyMode: nextBodyMode,
-            body: nextBody,
-            isExternalRedirect: !redirectDecision.isSameOriginRedirect
-          },
-          retryableStatuses,
-          protocolFallback,
-          preparedBodyMode: nextBodyMode,
-          allowAutomaticRetry,
-          stripAuthOnProtocolFallback: canStripAuthOnProtocolFallback,
-          upstreamTimeoutMs,
-          maxExtraAttempts: allowAutomaticRetry ? upstreamRetryAttempts : 0,
-          isRetry: false
-        });
-        response = redirectUpstream.response;
-        finalUrl = redirectUpstream.finalUrl;
-        redirectMethod = nextMethod;
-        redirectBodyMode = nextBodyMode;
-        redirectBody = nextBody;
-        if (!redirectDecision.isSameOriginRedirect) proxiedExternalRedirect = true;
-        redirectHop += 1;
+    return {
+      response,
+      finalUrl,
+      activeTargetBase,
+      proxiedExternalRedirect,
+      directRedirectUrl
+    };
+  },
+  async buildSuccessResponse(execution, buildFetchOptions, upstreamState) {
+    const finalStatus = upstreamState.response.status;
+    const finalStatusText = upstreamState.response.statusText;
+    const modifiedHeaders = this.buildProxyResponseHeaders(
+      upstreamState.response,
+      execution.request,
+      execution.dynamicCors,
+      execution.finalOrigin,
+      execution.requestTraits,
+      {
+        enableH3: execution.enableH3,
+        forceH1: execution.forceH1,
+        proxiedExternalRedirect: upstreamState.proxiedExternalRedirect,
+        imageCacheMaxAge: execution.imageCacheMaxAge
       }
+    );
+    this.applyProxyRedirectHeaders(
+      modifiedHeaders,
+      upstreamState.response,
+      upstreamState.activeTargetBase,
+      execution.nodeName,
+      execution.nodeKey,
+      upstreamState.directRedirectUrl,
+      upstreamState.finalUrl
+    );
 
-      const finalStatus = response.status;
-      const finalStatusText = response.statusText;
-      const modifiedHeaders = this.buildProxyResponseHeaders(response, request, dynamicCors, finalOrigin, requestTraits, {
-        enableH3,
-        forceH1,
-        proxiedExternalRedirect,
-        imageCacheMaxAge
-      });
-      this.applyProxyRedirectHeaders(modifiedHeaders, response, activeTargetBase, name, key, directRedirectUrl, finalUrl);
+    const playbackDiagnostic = await this.extractPlaybackInfoDiagnostic(
+      execution.proxyPath,
+      execution.requestUrl,
+      upstreamState.response
+    );
+    const errorDetail = this.extractProxyErrorDetail(upstreamState.response) || playbackDiagnostic;
+    this.recordAccessLog(execution, {
+      statusCode: finalStatus,
+      category: this.classifyProxyLogCategory(execution.requestTraits),
+      errorDetail
+    });
 
-      const reqCategory = this.classifyProxyLogCategory(requestTraits);
-      const playbackDiagnostic = await this.extractPlaybackInfoDiagnostic(proxyPath, requestUrl, response);
-      const errorDetail = this.extractProxyErrorDetail(response) || playbackDiagnostic;
-
-      Logger.record(env, ctx, {
-        nodeName: name,
-        requestPath: proxyPath,
-        requestMethod: request.method,
-        statusCode: finalStatus,
-        responseTime: Date.now() - startTime,
-        clientIp,
-        userAgent: request.headers.get("User-Agent"),
-        referer: request.headers.get("Referer"),
-        category: reqCategory,
-        errorDetail: errorDetail // [新增]
-      });
-
-      if (metadataCacheKey && ctx && response.status === 200) {
-        const cacheClone = response.clone();
-        ctx.waitUntil(this.storeMetadataCache(metadataCacheKey, cacheClone, requestTraits, {
-          sourceUrl: requestUrl,
-          prewarmCacheTtl,
-          imageCacheMaxAge
-        }));
+    if (execution.metadataCacheKey && execution.ctx && upstreamState.response.status === 200) {
+      const cacheClone = upstreamState.response.clone();
+      execution.ctx.waitUntil(this.storeMetadataCache(execution.metadataCacheKey, cacheClone, execution.requestTraits, {
+        sourceUrl: execution.requestUrl,
+        prewarmCacheTtl: execution.requestTraits.prewarmCacheTtl,
+        imageCacheMaxAge: execution.imageCacheMaxAge
+      }));
+    }
+    await this.maybePrewarmMetadataResponse(
+      execution.request,
+      upstreamState.response,
+      execution.requestTraits,
+      upstreamState.activeTargetBase,
+      buildFetchOptions,
+      execution.nodeName,
+      execution.nodeKey,
+      execution.requestUrl,
+      execution.ctx,
+      {
+        proxyPath: execution.proxyPath,
+        prewarmCacheTtl: execution.requestTraits.prewarmCacheTtl,
+        imageCacheMaxAge: execution.imageCacheMaxAge
       }
-      await this.maybePrewarmMetadataResponse(request, response, requestTraits, activeTargetBase, buildFetchOptions, name, key, requestUrl, ctx, {
-        proxyPath,
-        prewarmCacheTtl,
-        imageCacheMaxAge
-      });
-      /** @type {UpgradeableResponse} */
-      const upgradeResponse = response;
-      if (response.status === 101 && upgradeResponse.webSocket) {
-        /** @type {ResponseInit & { webSocket?: unknown }} */
-        const upgradeInit = {
-          status: 101,
-          statusText: response.statusText,
-          headers: modifiedHeaders,
-          webSocket: upgradeResponse.webSocket
-        };
-        return new Response(null, upgradeInit);
-      }
-      return new Response(response.body, {
-        status: finalStatus,
-        statusText: finalStatusText,
-        headers: modifiedHeaders
-      });
+    );
 
+    /** @type {UpgradeableResponse} */
+    const upgradeResponse = upstreamState.response;
+    if (upstreamState.response.status === 101 && upgradeResponse.webSocket) {
+      /** @type {ResponseInit & { webSocket?: unknown }} */
+      const upgradeInit = {
+        status: 101,
+        statusText: upstreamState.response.statusText,
+        headers: modifiedHeaders,
+        webSocket: upgradeResponse.webSocket
+      };
+      return new Response(null, upgradeInit);
+    }
+
+    return new Response(upstreamState.response.body, {
+      status: finalStatus,
+      statusText: finalStatusText,
+      headers: modifiedHeaders
+    });
+  },
+  buildErrorResponse(execution, err) {
+    const errorMessage = err?.message || String(err || "网关或 CF Workers 内部崩溃");
+    this.recordAccessLog(execution, {
+      statusCode: 502,
+      category: "error",
+      errorDetail: errorMessage
+    });
+
+    const errHeaders = new Headers({
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": execution.finalOrigin || "*",
+      "Cache-Control": "no-store"
+    });
+
+    if (execution.finalOrigin !== "*") mergeVaryHeader(errHeaders, "Origin");
+    applySecurityHeaders(errHeaders);
+
+    return new Response(
+      JSON.stringify({ error: "Bad Gateway", code: 502, message: "All proxy attempts failed." }),
+      { status: 502, headers: errHeaders }
+    );
+  },
+  async handle(request, node, path, name, key, env, ctx, options = {}) {
+    // Proxy.handle 阶段图（单文件内的执行主链）：
+    // Phase A. 环境准备：配置、来源、CORS、客户端身份
+    // Phase B. 前置裁决：OPTIONS / 防火墙 / 限流 / 目标源合法性
+    // Phase C. 请求整备：分类、头部整理、body/重试目标准备
+    // Phase D. 上游访问：fetch + 协议回退 + 多目标重试
+    // Phase E. 跳转决策：同源/异源、直连/继续代理
+    // Phase F. 响应整形：缓存头、CORS、Location 改写
+    // Phase G. 观测记录：分类、状态码、错误细节、耗时
+    const execution = await this.prepareExecutionContext(request, node, path, name, key, env, ctx, options);
+    if (execution.invalidResponse) return execution.invalidResponse;
+
+    const earlyResponse = await this.resolveEarlyResponse(execution);
+    if (earlyResponse) return earlyResponse;
+
+    const { targetBases, invalidResponse } = this.parseTargetBases(execution.node, execution.finalOrigin);
+    if (invalidResponse) return invalidResponse;
+
+    const directResponse = this.maybeBuildDirectRedirectResponse(execution, targetBases);
+    if (directResponse) return directResponse;
+
+    const transport = await this.buildProxyRequestState(
+      execution.request,
+      execution.node,
+      execution.proxyPath,
+      execution.requestUrl,
+      execution.clientIp,
+      execution.requestTraits,
+      execution.forceH1,
+      targetBases
+    );
+    const buildFetchOptions = this.createBuildFetchOptions(execution, transport);
+
+    try {
+      const upstreamState = await this.executeUpstreamFlow(execution, transport, buildFetchOptions);
+      return await this.buildSuccessResponse(execution, buildFetchOptions, upstreamState);
     } catch (err) {
-      Logger.record(env, ctx, {
-        nodeName: name,
-        requestPath: proxyPath,
-        requestMethod: request.method,
-        statusCode: 502,
-        responseTime: Date.now() - startTime,
-        clientIp,
-        category: "error",
-        errorDetail: err.message || "网关或 CF Workers 内部崩溃" // [新增]
-      });
-
-      const errHeaders = new Headers({
-        "Content-Type": "application/json; charset=utf-8",
-        "Access-Control-Allow-Origin": finalOrigin || "*",
-        "Cache-Control": "no-store"
-      });
-
-      if (finalOrigin !== "*") mergeVaryHeader(errHeaders, "Origin");
-      applySecurityHeaders(errHeaders);
-
-      return new Response(
-        JSON.stringify({ error: "Bad Gateway", code: 502, message: "All proxy attempts failed." }),
-        { status: 502, headers: errHeaders }
-      );
+      return this.buildErrorResponse(execution, err);
     }
   }
 };
@@ -4496,9 +5125,9 @@ const UI_HTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <title>Emby Proxy V18.5 - SaaS Dashboard</title>
+  <title>Emby Proxy V18.6 - SaaS Dashboard</title>
   <script>
-    window.__ADMIN_BOOTSTRAP__ = __ADMIN_BOOTSTRAP__;
+    window.__ADMIN_BOOTSTRAP__ = __ADMIN_BOOTSTRAP_JSON__;
     window.__ADMIN_UI_BOOTED__ = false;
     window.__ADMIN_UI_DEPENDENCY_TIMEOUT__ = setTimeout(function watchdog() {
       if (window.__ADMIN_UI_BOOTED__ || window.Vue) return;
@@ -4524,11 +5153,10 @@ const UI_HTML = `<!DOCTYPE html>
     [v-cloak] { display: none; }
     .glass-card { background: #ffffff; border: 1px solid #e2e8f0; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04); }
     .dark .glass-card { background: #020617; border: 1px solid #1e293b; box-shadow: none; }
-    :root { --ui-radius-px: 24px; }
+    :root { --ui-radius-px: 10px; }
     .glass-card,
     .ui-radius-card,
     #view-settings .settings-nav-shell,
-    #view-settings .settings-panel,
     #view-settings .settings-block,
     #view-settings .settings-list-shell,
     #node-modal > div {
@@ -4539,28 +5167,254 @@ const UI_HTML = `<!DOCTYPE html>
     @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
     aside { transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
     #view-settings .settings-nav-shell,
-    #view-settings .settings-panel,
     #view-settings .settings-block,
     #view-settings .settings-list-shell {
       box-shadow: none !important;
       backdrop-filter: none;
       -webkit-backdrop-filter: none;
+      background-image: none !important;
     }
-    #view-settings .settings-nav-shell,
-    #view-settings .settings-panel {
+    #view-settings .settings-nav-shell {
       background: #ffffff !important;
+      border-color: #cbd5e1 !important;
     }
     #view-settings .settings-block,
     #view-settings .settings-list-shell {
-      background: #f8fafc !important;
+      background: #ffffff !important;
+      border-color: #d7e1ee !important;
     }
-    .dark #view-settings .settings-nav-shell,
-    .dark #view-settings .settings-panel {
-      background: #0f172a !important;
+    .dark #view-settings .settings-nav-shell {
+      background: #111827 !important;
+      border-color: #334155 !important;
+      background-image: none !important;
     }
     .dark #view-settings .settings-block,
     .dark #view-settings .settings-list-shell {
-      background: #020617 !important;
+      background: #111827 !important;
+      border-color: #314154 !important;
+      background-image: none !important;
+    }
+    #view-settings .settings-nav-shell,
+    #view-settings .settings-block {
+      color: #0f172a;
+    }
+    #view-settings .settings-nav-shell .text-slate-400,
+    #view-settings .settings-nav-shell .text-slate-500,
+    #view-settings .settings-block .text-slate-400,
+    #view-settings .settings-block .text-slate-500,
+    #view-settings .settings-block p,
+    #view-settings .settings-block label {
+      color: #52627a !important;
+    }
+    #view-settings .settings-nav-shell .text-slate-900,
+    #view-settings .settings-block .text-slate-900,
+    #view-settings .settings-block .text-slate-800 {
+      color: #0f172a !important;
+    }
+    #view-settings .settings-nav-shell .border-b,
+    #view-settings .settings-block .border-b {
+      border-color: #d9e3ef !important;
+    }
+    #view-settings .settings-block input:not([type="checkbox"]):not([type="radio"]),
+    #view-settings .settings-block textarea,
+    #view-settings .settings-block select,
+    #view-settings .settings-list-shell {
+      background: #ffffff !important;
+      border-color: #c8d3e0 !important;
+      color: #0f172a !important;
+      box-shadow: none !important;
+    }
+    #view-settings .settings-block input::placeholder,
+    #view-settings .settings-block textarea::placeholder {
+      color: #7c8aa0 !important;
+    }
+    #view-settings .settings-block input:not([type="checkbox"]):not([type="radio"]):focus,
+    #view-settings .settings-block textarea:focus,
+    #view-settings .settings-block select:focus {
+      border-color: #60a5fa !important;
+      box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.18) !important;
+    }
+    #view-settings .settings-block .pointer-events-none {
+      color: #64748b !important;
+    }
+    #view-settings .settings-block .inline-flex.rounded-full {
+      background: #f8fafc !important;
+      border-color: #cbd5e1 !important;
+      color: #5b6b80 !important;
+    }
+    .dark #view-settings .settings-nav-shell,
+    .dark #view-settings .settings-block {
+      color: #e5edf8;
+    }
+    .dark #view-settings .settings-nav-shell .text-slate-400,
+    .dark #view-settings .settings-nav-shell .text-slate-500,
+    .dark #view-settings .settings-block .text-slate-400,
+    .dark #view-settings .settings-block .text-slate-500,
+    .dark #view-settings .settings-block p,
+    .dark #view-settings .settings-block label {
+      color: #b7c3d7 !important;
+    }
+    .dark #view-settings .settings-nav-shell .text-slate-900,
+    .dark #view-settings .settings-nav-shell .text-slate-800,
+    .dark #view-settings .settings-block .text-slate-900,
+    .dark #view-settings .settings-block .text-slate-800 {
+      color: #f8fbff !important;
+    }
+    .dark #view-settings .settings-nav-shell .border-b,
+    .dark #view-settings .settings-block .border-b {
+      border-color: #263548 !important;
+    }
+    .dark #view-settings .settings-block input:not([type="checkbox"]):not([type="radio"]),
+    .dark #view-settings .settings-block textarea,
+    .dark #view-settings .settings-block select,
+    .dark #view-settings .settings-list-shell {
+      background: #0f172a !important;
+      border-color: #3b4a60 !important;
+      color: #f8fbff !important;
+      box-shadow: none !important;
+    }
+    .dark #view-settings .settings-block input::placeholder,
+    .dark #view-settings .settings-block textarea::placeholder {
+      color: #8da0bc !important;
+    }
+    .dark #view-settings .settings-block input:not([type="checkbox"]):not([type="radio"]):focus,
+    .dark #view-settings .settings-block textarea:focus,
+    .dark #view-settings .settings-block select:focus {
+      border-color: #60a5fa !important;
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.26) !important;
+    }
+    .dark #view-settings .settings-block .pointer-events-none {
+      color: #9fb0c7 !important;
+    }
+    .dark #view-settings .settings-block .inline-flex.rounded-full {
+      background: #1f2937 !important;
+      border-color: #40506a !important;
+      color: #d1dbeb !important;
+      background-image: none !important;
+    }
+    .dark #view-settings .set-tab,
+    .dark #view-settings .settings-block input:not([type="checkbox"]):not([type="radio"]),
+    .dark #view-settings .settings-block textarea,
+    .dark #view-settings .settings-block select {
+      background-image: none !important;
+    }
+    #view-nodes .node-toolbar-primary-btn,
+    #view-nodes .node-tag-filter-trigger,
+    #view-nodes .node-toolbar-search,
+    #view-nodes .node-card-shell {
+      transition:
+        transform 240ms cubic-bezier(0.22, 1, 0.36, 1),
+        box-shadow 260ms ease,
+        border-color 220ms ease,
+        background-color 220ms ease,
+        color 220ms ease;
+    }
+    #view-nodes .node-tag-filter-trigger,
+    #view-nodes .node-toolbar-search {
+      transform: translateY(0);
+      box-shadow:
+        0 0 0 1px rgba(226, 232, 240, 0.92),
+        0 10px 22px rgba(15, 23, 42, 0.05);
+    }
+    .dark #view-nodes .node-tag-filter-trigger,
+    .dark #view-nodes .node-toolbar-search {
+      box-shadow:
+        0 0 0 1px rgba(51, 65, 85, 0.88),
+        0 10px 22px rgba(2, 6, 23, 0.3);
+    }
+    #view-nodes .node-toolbar-primary-btn {
+      box-shadow: 0 10px 22px rgba(37, 99, 235, 0.16);
+    }
+    #view-nodes .node-toolbar-primary-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 14px 28px rgba(37, 99, 235, 0.18);
+    }
+    #view-nodes .node-toolbar-primary-btn svg {
+      transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease;
+    }
+    #view-nodes .node-toolbar-primary-btn:hover svg {
+      transform: translateY(-1px) scale(1.04);
+    }
+    #view-nodes .node-tag-filter-trigger svg {
+      transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease;
+    }
+    #view-nodes .node-tag-filter-trigger:hover,
+    #view-nodes .node-toolbar-search:hover,
+    #view-nodes .node-tag-filter-trigger:focus-visible,
+    #view-nodes .node-toolbar-search:focus {
+      transform: translateY(-1px);
+      border-color: #cbd5e1;
+      background-color: #ffffff;
+      box-shadow:
+        0 0 0 1px rgba(203, 213, 225, 0.98),
+        0 14px 28px rgba(15, 23, 42, 0.08);
+    }
+    #view-nodes .node-tag-filter-trigger:hover svg,
+    #view-nodes .node-tag-filter-trigger:focus-visible svg {
+      transform: translateY(-1px) scale(1.03);
+    }
+    .dark #view-nodes .node-tag-filter-trigger:hover,
+    .dark #view-nodes .node-toolbar-search:hover,
+    .dark #view-nodes .node-tag-filter-trigger:focus-visible,
+    .dark #view-nodes .node-toolbar-search:focus {
+      border-color: #334155;
+      background-color: #0f172a;
+      box-shadow:
+        0 0 0 1px rgba(71, 85, 105, 0.92),
+        0 16px 30px rgba(2, 6, 23, 0.38);
+    }
+    #view-nodes .node-tag-filter-panel-shell {
+      overflow: hidden;
+      max-height: 0;
+      opacity: 0;
+      transform: translateY(-6px);
+      pointer-events: none;
+      transition:
+        max-height 260ms cubic-bezier(0.22, 1, 0.36, 1),
+        opacity 180ms ease,
+        transform 220ms ease;
+    }
+    #view-nodes .node-tag-filter-panel-shell.is-open {
+      max-height: 12rem;
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+    #view-nodes .node-tag-filter-chip {
+      transition:
+        transform 220ms cubic-bezier(0.22, 1, 0.36, 1),
+        border-color 220ms ease,
+        background-color 220ms ease,
+        color 220ms ease,
+        box-shadow 220ms ease;
+    }
+    #view-nodes .node-tag-filter-chip:hover {
+      transform: translateY(-1px);
+      border-color: #cbd5e1;
+    }
+    .dark #view-nodes .node-tag-filter-chip:hover {
+      border-color: #334155;
+    }
+    #view-nodes .node-card-shell {
+      transform: translateY(0);
+    }
+    #view-nodes .node-card-shell:hover {
+      transform: translateY(-2px);
+      border-color: #cbd5e1;
+      box-shadow: 0 18px 36px rgba(15, 23, 42, 0.07);
+    }
+    .dark #view-nodes .node-card-shell:hover {
+      border-color: #334155;
+      box-shadow: 0 16px 32px rgba(2, 6, 23, 0.34);
+    }
+    #view-nodes .node-card-title {
+      transition: color 220ms ease;
+    }
+    #view-nodes .node-card-shell:hover .node-card-title {
+      color: #0f172a;
+    }
+    .dark #view-nodes .node-card-shell:hover .node-card-title {
+      color: #e2e8f0;
     }
     @media (min-width: 768px) {
       #app-shell.settings-split-layout #content-area {
@@ -4601,14 +5455,22 @@ const UI_HTML = `<!DOCTYPE html>
   </template>
 
   <template id="tpl-node-card">
-    <div class="glass-card p-6 rounded-3xl flex flex-col justify-between">
+    <div class="glass-card node-card-shell group p-6 rounded-3xl flex flex-col justify-between">
       <div>
         <div class="flex items-end mb-2 w-full gap-3">
           <div class="inline-flex items-center justify-center rounded-full px-2.5 py-1 text-sm leading-5 font-semibold border truncate max-w-[7rem]" :class="tagToneClass">{{ hasTag ? hydratedNode.tag : '无标签' }}</div>
-          <div class="flex-1 min-w-0 flex items-end gap-2">
-            <h3 class="font-bold text-xl md:text-2xl transition-colors min-w-0 truncate" :class="statusMeta.titleClass">{{ displayName }}</h3>
+          <div class="flex-1 min-w-0 flex items-end gap-2 flex-wrap">
+            <h3 class="node-card-title font-bold text-xl md:text-2xl transition-colors min-w-0 truncate" :class="statusMeta.titleClass">{{ displayName }}</h3>
             <span class="inline-flex max-w-full flex-shrink-0 items-center rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-800 dark:border-emerald-700 dark:bg-emerald-900 dark:text-emerald-100" title="当前启用线路">
               <span class="truncate max-w-[9rem]">{{ activeLineName }}</span>
+            </span>
+            <span v-if="isSyncing" class="inline-flex max-w-full flex-shrink-0 items-center gap-1 rounded-lg border border-sky-200 bg-sky-50 px-2.5 py-1 text-xs font-semibold text-sky-700 dark:border-sky-800 dark:bg-sky-950/40 dark:text-sky-300" title="节点变更正在同步到 KV">
+              <span class="h-1.5 w-1.5 rounded-full bg-sky-500 animate-pulse"></span>
+              <span>同步中</span>
+            </span>
+            <span v-else-if="hasSyncFailure" class="inline-flex max-w-full flex-shrink-0 items-center gap-1 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1 text-xs font-semibold text-red-700 dark:border-red-900/70 dark:bg-red-950/40 dark:text-red-300" :title="'最近一次同步失败：' + syncError">
+              <span class="h-1.5 w-1.5 rounded-full bg-red-500"></span>
+              <span>同步失败</span>
             </span>
           </div>
         </div>
@@ -4624,6 +5486,13 @@ const UI_HTML = `<!DOCTYPE html>
         <div class="mt-2 mb-3 border-t border-dashed border-slate-200/80 dark:border-slate-700/70"></div>
 
         <div class="text-xs text-slate-500 dark:text-slate-400 mb-3 space-y-1">
+          <div v-if="hasSyncFailure" class="flex items-start gap-2 rounded-2xl border border-red-200 bg-red-50/90 px-3 py-2.5 dark:border-red-900/60 dark:bg-red-950/30">
+            <span class="mt-1.5 h-2 w-2 rounded-full bg-red-500 flex-shrink-0"></span>
+            <div class="min-w-0 flex-1">
+              <div class="text-[11px] font-semibold uppercase tracking-[0.14em] text-red-500 dark:text-red-300">保存失败</div>
+              <div class="mt-0.5 break-words text-sm md:text-[15px] leading-5 font-medium text-red-700 dark:text-red-300" :title="syncError">{{ syncError }}</div>
+            </div>
+          </div>
           <div v-if="remarkValue" class="flex items-center min-w-0">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4 mr-1.5 flex-shrink-0 text-red-500 dark:text-red-400">
               <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
@@ -4669,7 +5538,7 @@ const UI_HTML = `<!DOCTYPE html>
       <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-500 to-indigo-600 flex items-center justify-center text-white font-bold text-lg flex-shrink-0">E</div>
       <h1 class="ml-3 font-semibold tracking-tight text-lg flex items-center gap-2">
         Emby Proxy 
-        <span class="px-1.5 py-0.5 rounded bg-brand-100 text-brand-600 dark:bg-brand-500/20 dark:text-brand-400 text-[10px] font-bold mt-0.5">V18.5</span>
+        <span class="px-1.5 py-0.5 rounded bg-brand-100 text-brand-600 dark:bg-brand-500/20 dark:text-brand-400 text-[10px] font-bold mt-0.5">V18.6</span>
       </h1>
     </div>
     <nav class="flex-1 overflow-y-auto py-4 px-3 space-y-1">
@@ -4725,10 +5594,40 @@ const UI_HTML = `<!DOCTYPE html>
       </div>
 
       <div id="view-nodes" class="view-section w-full mx-auto space-y-6" :class="{ active: App.currentHash === '#nodes' }">
-        <div class="flex flex-col xl:flex-row justify-between items-center gap-4">
-          <div class="flex items-center gap-2 w-full xl:w-auto">
-            <button @click="App.showNodeModal()" class="px-4 py-2 bg-brand-600 text-white rounded-xl text-sm font-medium hover:bg-brand-700 flex items-center transition whitespace-nowrap"><i data-lucide="plus" class="w-4 h-4 mr-2"></i> 新建节点</button>
-            <input type="text" id="node-search" v-model="App.nodeSearchKeyword" @input="App.syncFilteredNodes()" placeholder="搜索节点名称或标签..." class="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white w-full sm:w-64 transition">
+        <div class="flex flex-col xl:flex-row justify-between items-start gap-4">
+          <div v-auto-animate="{ duration: 220 }" class="flex flex-col gap-3 w-full xl:flex-1 xl:max-w-3xl">
+            <div class="flex flex-wrap items-center gap-2 w-full">
+              <button @click="App.showNodeModal()" class="node-toolbar-primary-btn px-4 py-2 bg-brand-600 text-white rounded-xl text-sm font-medium hover:bg-brand-700 flex items-center transition whitespace-nowrap"><i data-lucide="plus" class="w-4 h-4 mr-2"></i> 新建节点</button>
+              <button @click="App.toggleNodeTagFilterPanel()" :disabled="!App.hasNodeTagFilterOptions()" class="node-tag-filter-trigger px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white/90 dark:bg-slate-900/90 text-sm font-medium text-slate-700 dark:text-slate-200 flex items-center gap-2 transition whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed" :class="App.getNodeTagFilterTriggerClass()">
+                <i data-lucide="tags" class="w-4 h-4"></i>
+                <span>{{ App.getNodeTagFilterTriggerText() }}</span>
+                <span class="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold" :class="App.getNodeTagFilterCounterClass()">{{ App.getNodeTagFilterCounterText() }}</span>
+                <i data-lucide="chevron-down" class="w-4 h-4 transition-transform duration-200" :class="App.nodeTagFilterPanelOpen ? 'rotate-180' : ''"></i>
+              </button>
+              <input type="text" id="node-search" v-model="App.nodeSearchKeyword" @input="App.syncFilteredNodes()" placeholder="搜索节点名称或标签..." class="node-toolbar-search flex-1 min-w-[15rem] px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white w-full transition">
+            </div>
+            <div class="node-tag-filter-panel-shell" :class="{ 'is-open': App.nodeTagFilterPanelOpen && App.hasNodeTagFilterOptions() }">
+              <div class="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white/85 dark:bg-slate-950/70 px-4 py-3">
+                <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <div class="text-[11px] font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Tag Filter</div>
+                    <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">按标签快速收束节点列表；切回“全部标签”即可清除筛选。</p>
+                  </div>
+                  <button v-if="App.hasActiveNodeTagFilter()" @click="App.clearNodeTagFilter()" class="self-start sm:self-auto text-xs font-medium text-slate-500 hover:text-brand-600 dark:text-slate-400 dark:hover:text-brand-400 transition">清除筛选</button>
+                </div>
+                <div v-auto-animate="{ duration: 180 }" class="mt-3 flex flex-wrap gap-2">
+                  <button @click="App.clearNodeTagFilter()" class="node-tag-filter-chip inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition" :class="App.getNodeTagFilterChipClass('')">
+                    <span>全部标签</span>
+                    <span class="rounded-full px-1.5 py-0.5 text-[10px] font-semibold" :class="App.getNodeTagFilterChipCountClass('')">{{ App.getNodeTagFilterAllCount() }}</span>
+                  </button>
+                  <button v-for="option in App.getNodeTagFilterOptions()" :key="'node-tag-filter-' + option.value" @click="App.setNodeTagFilter(option.value)" class="node-tag-filter-chip inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition" :class="App.getNodeTagFilterChipClass(option.value)">
+                    <span class="h-2 w-2 rounded-full" :class="App.getNodeTagFilterDotClass(option.colorKey)"></span>
+                    <span>{{ option.label }}</span>
+                    <span class="rounded-full px-1.5 py-0.5 text-[10px] font-semibold" :class="App.getNodeTagFilterChipCountClass(option.value)">{{ option.count }}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
           <div class="flex flex-wrap gap-2 w-full xl:w-auto">
             <label class="flex-1 sm:flex-none px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm font-medium hover:bg-slate-300 dark:hover:bg-slate-700 transition flex items-center justify-center"><i data-lucide="upload" class="w-4 h-4 mr-2"></i> 导入配置<input type="file" id="import-nodes-file" class="hidden" accept=".json" @change="App.importNodes($event)"></label>
@@ -4751,9 +5650,9 @@ const UI_HTML = `<!DOCTYPE html>
               <input type="date" id="log-start-date-input" v-model="App.logStartDate" class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
               <span class="text-xs text-slate-400">至</span>
               <input type="date" id="log-end-date-input" v-model="App.logEndDate" class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
-              <input type="text" id="log-search-input" v-model="App.logSearchKeyword" placeholder="搜索节点、IP、路径或状态码(如200)..." class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white flex-1 md:w-56" @keydown.enter="App.loadLogs(1)">
+	              <input type="text" id="log-search-input" v-model="App.logSearchKeyword" :placeholder="App.getLogSearchInputPlaceholder()" class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white flex-1 md:w-56" @keydown.enter="App.loadLogs(1)">
               <button @click="App.loadLogs(1)" class="text-brand-500 text-sm px-2 hover:text-brand-600"><i data-lucide="search" class="w-4 h-4 inline"></i></button>
-              <div class="flex flex-wrap items-center gap-1.5">
+              <div v-if="App.isSettingsExpertMode()" class="flex flex-wrap items-center gap-1.5">
                 <button data-log-playback-filter="" @click="App.setLogsPlaybackModeFilter('')" class="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium transition" :class="App.getLogsPlaybackFilterClass('')">全部模式</button>
                 <button data-log-playback-filter="transcode" @click="App.setLogsPlaybackModeFilter('transcode')" class="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium transition" :class="App.getLogsPlaybackFilterClass('transcode')">只看转码</button>
                 <button data-log-playback-filter="direct_stream" @click="App.setLogsPlaybackModeFilter('direct_stream')" class="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium transition" :class="App.getLogsPlaybackFilterClass('direct_stream')">只看直串</button>
@@ -4762,12 +5661,14 @@ const UI_HTML = `<!DOCTYPE html>
               
               <div class="w-px h-5 bg-slate-300 dark:bg-slate-700 mx-1 hidden md:block"></div>
               
-              <button @click="App.initLogsDbFromUi()" class="text-slate-500 text-sm hover:text-brand-500"><i data-lucide="database" class="w-4 h-4 inline mr-1"></i>初始化 DB</button>
-              <button @click="App.clearLogsFromUi()" class="text-red-500 text-sm hover:text-red-600 ml-2"><i data-lucide="trash-2" class="w-4 h-4 inline mr-1"></i>清空日志</button>
-              <button @click="App.loadLogs()" class="text-brand-500 text-sm ml-2"><i data-lucide="refresh-cw" class="w-4 h-4 inline mr-1"></i>刷新</button>
-            </div>
-          </div>
-          <div class="overflow-x-auto min-h-0 w-full mb-4">
+	              <button @click="App.initLogsDbFromUi()" class="text-slate-500 text-sm hover:text-brand-500"><i data-lucide="database" class="w-4 h-4 inline mr-1"></i>初始化 DB</button>
+	              <button v-if="App.isSettingsExpertMode()" @click="App.initLogsFtsFromUi()" class="text-slate-500 text-sm hover:text-brand-500"><i data-lucide="search" class="w-4 h-4 inline mr-1"></i>初始化 FTS5</button>
+	              <button @click="App.clearLogsFromUi()" class="text-red-500 text-sm hover:text-red-600 ml-2"><i data-lucide="trash-2" class="w-4 h-4 inline mr-1"></i>清空日志</button>
+	              <button @click="App.loadLogs()" class="text-brand-500 text-sm ml-2"><i data-lucide="refresh-cw" class="w-4 h-4 inline mr-1"></i>刷新</button>
+	            </div>
+	          </div>
+	          <p class="text-xs text-slate-500 mb-4">{{ App.getRuntimeLogSearchModeHint() }}</p>
+	          <div class="overflow-x-auto min-h-0 w-full mb-4">
             <table class="w-full text-left border-collapse table-fixed min-w-[900px]">
               <thead><tr class="text-sm text-slate-500 border-b border-slate-200 dark:border-slate-800"><th class="py-3 px-4 w-24 md:w-28">节点</th><th class="py-3 px-4 w-28 md:w-32">资源类别</th><th class="py-3 px-4 w-16 md:w-20">状态</th><th class="py-3 px-4 w-32">IP</th><th class="py-3 px-4">UA</th><th class="py-3 px-4 w-28">时间锥</th></tr></thead>
               <tbody id="logs-tbody" class="text-sm">
@@ -4801,12 +5702,17 @@ const UI_HTML = `<!DOCTYPE html>
             <div class="min-w-0">
               <h3 class="font-semibold text-lg flex-shrink-0">DNS编辑</h3>
               <p id="dns-zone-hint" class="text-xs text-slate-500 mt-1 break-all">{{ App.dnsZoneHintText }}</p>
-              <p class="text-[11px] text-slate-500 mt-1">提示：当前仅展示当前站点对应记录；名称只读；类型仅允许 A / AAAA / CNAME；修改历史会保存到 KV，最多保留 {{ App.dnsHistoryLimit }} 条且相同值不重复记录。</p>
+              <p class="text-[11px] text-slate-500 mt-1">提示：当前仅展示当前站点对应的 A / AAAA / CNAME 记录；CNAME 与 A / AAAA 不能共存；切换模式只会修改当前草稿，点击“保存 DNS”后才会同步到 Cloudflare；DNS 历史仅记录 CNAME，最多保留 {{ App.dnsHistoryLimit }} 条。</p>
             </div>
             <div class="flex flex-wrap items-center gap-2 w-full md:w-auto">
               <button @click="App.loadDnsRecords()" class="text-brand-500 text-sm"><i data-lucide="refresh-cw" class="w-4 h-4 inline mr-1"></i>刷新</button>
               <button id="dns-save-all-btn" @click="App.saveAllDnsRecords()" :disabled="App.isDnsSaveAllDisabled()" :title="App.getDnsSaveAllTitle()" class="px-4 py-2 bg-brand-600 text-white rounded-xl text-sm font-medium hover:bg-brand-700 flex items-center transition whitespace-nowrap disabled:opacity-40 disabled:pointer-events-none"><i data-lucide="save" class="w-4 h-4 mr-2"></i>{{ App.getDnsSaveAllButtonText() }}</button>
             </div>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 mb-4">
+            <button type="button" @click="App.switchDnsEditMode('cname')" class="px-4 py-2 rounded-xl border text-sm font-medium transition" :class="App.getDnsEditModeButtonClass('cname')">CNAME模式</button>
+            <button type="button" @click="App.switchDnsEditMode('a')" class="px-4 py-2 rounded-xl border text-sm font-medium transition" :class="App.getDnsEditModeButtonClass('a')">A模式</button>
+            <span class="inline-flex items-center rounded-full bg-white px-3 py-1 text-[11px] font-medium text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">{{ App.getDnsModeHintText() }}</span>
           </div>
           <div class="overflow-x-auto min-h-0 w-full mb-4">
             <table class="w-full text-left border-collapse table-fixed min-w-[900px]">
@@ -4818,41 +5724,107 @@ const UI_HTML = `<!DOCTYPE html>
                   <th class="py-3 px-4 w-28">操作</th>
                 </tr>
               </thead>
-              <tbody id="dns-tbody" class="text-sm">
-                <tr v-for="record in App.dnsRecords" :key="record.id" class="border-b border-slate-200 dark:border-slate-800 hover:bg-slate-50/60 dark:hover:bg-slate-900/40">
+              <tbody v-if="App.dnsEditMode === 'cname'" id="dns-tbody-cname" class="text-sm">
+                <tr class="border-b border-slate-200 dark:border-slate-800 hover:bg-slate-50/60 dark:hover:bg-slate-900/40">
                   <td class="py-3 px-4">
-                    <select v-if="record.editable" v-model="record.type" @change="record.type = String(record.type || '').toUpperCase(); App.updateDnsSaveAllButtonState()" class="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white disabled:opacity-50" :disabled="!!record._saving">
+                    <div class="text-xs font-mono text-slate-500 dark:text-slate-400 px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">CNAME</div>
+                  </td>
+                  <td class="py-3 px-4">
+                    <input type="text" :value="App.getDnsEditorHostLabel()" disabled class="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 outline-none text-sm text-slate-500 dark:text-slate-400">
+                  </td>
+                  <td class="py-3 px-4">
+                    <input type="text" v-model="App.dnsDraftCname.content" @input="App.updateDnsSaveAllButtonState()" :disabled="App.dnsBatchSaving" placeholder="请输入 CNAME 内容" class="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white disabled:bg-slate-100 disabled:dark:bg-slate-800 disabled:text-slate-500 disabled:dark:text-slate-400 disabled:opacity-70">
+                  </td>
+                  <td class="py-3 px-4">
+                    <span class="text-xs text-slate-400">保存时会清理 A / AAAA</span>
+                  </td>
+                </tr>
+              </tbody>
+              <tbody v-else id="dns-tbody-a" class="text-sm">
+                <tr v-for="(record, index) in App.dnsAddressDrafts" :key="record.uid" class="border-b border-slate-200 dark:border-slate-800 hover:bg-slate-50/60 dark:hover:bg-slate-900/40">
+                  <td class="py-3 px-4">
+                    <select v-model="record.type" @change="record.type = String(record.type || '').toUpperCase(); App.updateDnsSaveAllButtonState()" class="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white disabled:opacity-50" :disabled="App.dnsBatchSaving">
                       <option value="A">A</option>
                       <option value="AAAA">AAAA</option>
-                      <option value="CNAME">CNAME</option>
                     </select>
-                    <div v-else class="text-xs font-mono text-slate-500 dark:text-slate-400 px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700" title="该类型不在受限编辑范围内">{{ (record.type || '-').toUpperCase() }}</div>
                   </td>
                   <td class="py-3 px-4">
-                    <input type="text" :value="record.name || ''" disabled class="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 outline-none text-sm text-slate-500 dark:text-slate-400">
+                    <input type="text" :value="App.getDnsEditorHostLabel()" disabled class="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 outline-none text-sm text-slate-500 dark:text-slate-400">
                   </td>
                   <td class="py-3 px-4">
-                    <input type="text" v-model="record.content" @input="App.updateDnsSaveAllButtonState()" :disabled="!record.editable || !!record._saving" :placeholder="record.editable ? '请输入记录内容' : '只读'" class="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white disabled:bg-slate-100 disabled:dark:bg-slate-800 disabled:text-slate-500 disabled:dark:text-slate-400 disabled:opacity-70">
-                    <div v-if="record.history && record.history.length" v-auto-animate class="mt-2 flex flex-wrap gap-2">
-                      <button v-for="(entry, historyIndex) in record.history" :key="App.getDnsHistoryEntryKey(record, entry, historyIndex)" type="button" @click="App.applyDnsHistoryEntry(record.id, entry)" :title="App.getDnsHistoryEntryTitle(entry)" class="inline-flex max-w-full items-center gap-1.5 rounded-lg border px-2 py-1 text-[11px] transition" :class="App.isDnsHistoryEntryCurrent(record, entry) ? 'border-brand-200 bg-brand-50 text-brand-600 dark:border-brand-500/30 dark:bg-brand-500/10 dark:text-brand-300' : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-300 dark:hover:bg-slate-800'">
-                        <span class="font-semibold">{{ entry.type }}</span>
-                        <span class="font-mono truncate max-w-[15rem]">{{ entry.content }}</span>
-                        <span class="opacity-70 whitespace-nowrap">{{ App.formatDnsHistoryTimestamp(entry.savedAt) }}</span>
-                      </button>
-                    </div>
-                    <p v-else class="mt-2 text-[11px] text-slate-400">KV 历史：暂无记录</p>
+                    <input type="text" v-model="record.content" @input="App.updateDnsSaveAllButtonState()" :disabled="App.dnsBatchSaving" :placeholder="record.type === 'AAAA' ? '请输入 IPv6 地址' : '请输入 IPv4 地址'" class="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white disabled:bg-slate-100 disabled:dark:bg-slate-800 disabled:text-slate-500 disabled:dark:text-slate-400 disabled:opacity-70">
                   </td>
                   <td class="py-3 px-4">
-                    <button v-if="record.editable" type="button" class="px-3 py-1.5 rounded-lg bg-brand-600 text-white text-sm font-medium hover:bg-brand-700 transition disabled:opacity-40 disabled:pointer-events-none" :disabled="!!record._saving || !App.isDnsRecordDirty(record)" @click="App.saveDnsRecord(record.id)">{{ record._saving ? '保存中...' : '保存' }}</button>
-                    <span v-else class="text-xs text-slate-400">只读</span>
+                    <button type="button" class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition disabled:opacity-40 disabled:pointer-events-none" :disabled="App.dnsBatchSaving || !App.canRemoveDnsAddressDraft()" @click="App.removeDnsAddressDraft(index)">删除</button>
                   </td>
                 </tr>
               </tbody>
             </table>
           </div>
-          <div id="dns-empty" class="text-sm text-slate-500 text-center py-10" :class="{ hidden: App.dnsRecords.length > 0 }">{{ App.dnsEmptyText }}</div>
+          <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+            <p class="text-xs text-slate-500">{{ App.getDnsEditorFooterHint() }}</p>
+            <button v-if="App.dnsEditMode === 'a'" type="button" @click="App.addDnsAddressDraft()" :disabled="App.dnsBatchSaving" class="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-4 py-2 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition disabled:opacity-40 disabled:pointer-events-none">
+              <i data-lucide="plus" class="w-4 h-4"></i>新增记录
+            </button>
+          </div>
+          <div v-if="!App.dnsRecords.length" id="dns-empty" class="text-sm text-slate-500 text-center py-4">{{ App.dnsEmptyText }}</div>
 
-          <div class="mt-auto pt-6 border-t border-slate-200 dark:border-slate-800">
+          <div class="mt-auto pt-6 border-t border-slate-200 dark:border-slate-800 space-y-4">
+            <div v-if="App.hasDnsHistoryCards()" class="ui-radius-card rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm">
+              <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                <div>
+                  <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">DNS History</div>
+                  <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">DNS 历史记录</div>
+                </div>
+                <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">点击会切换到 CNAME 模式并回填</span>
+              </div>
+              <div v-auto-animate class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                <button
+                  v-for="card in App.getDnsHistoryCards()"
+                  :key="App.getDnsHistoryEntryKey(card.entry, card.index)"
+                  type="button"
+                  @click="App.applyDnsHistoryEntry(card.entry)"
+                  :title="App.getDnsHistoryEntryTitle(card.entry)"
+                  class="ui-radius-card block w-full rounded-2xl border px-4 py-3 text-left transition"
+                  :class="App.getDnsHistoryCardClass(card.entry)"
+                >
+                  <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0 flex-1">
+                      <div class="flex flex-wrap items-center gap-2 text-[11px] font-semibold tracking-[0.08em] uppercase">
+                        <span>{{ card.entry.type }}</span>
+                        <span class="opacity-70 normal-case font-medium tracking-normal">{{ App.formatDnsHistoryTimestamp(card.entry.savedAt) }}</span>
+                      </div>
+                      <div class="mt-3 font-mono text-base font-semibold text-slate-900 dark:text-white break-all leading-7">{{ card.entry.content }}</div>
+                    </div>
+                    <span class="shrink-0 text-[11px] font-medium opacity-70">{{ App.isDnsHistoryEntryCurrent(card.entry) ? '当前草稿' : '点击回填' }}</span>
+                  </div>
+                </button>
+              </div>
+            </div>
+            <div class="ui-radius-card rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm">
+              <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                <div>
+                  <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">CNAME Shortcut</div>
+                  <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">推荐优选域名</div>
+                </div>
+                <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">点击回填后仍需保存</span>
+              </div>
+              <p class="text-xs text-slate-500 mb-4">{{ App.getDnsRecommendedDomainHint() }}</p>
+              <div v-auto-animate="{ duration: 180 }" class="flex flex-wrap gap-2">
+                <button
+                  v-for="domain in App.getDnsRecommendedDomains()"
+                  :key="'dns-recommended-domain-' + domain"
+                  type="button"
+                  @click="App.applyDnsRecommendedDomain(domain)"
+                  :disabled="!App.canUseDnsRecommendedDomains() || App.dnsBatchSaving"
+                  class="ui-radius-card inline-flex items-center gap-2 rounded-2xl border px-4 py-3 text-sm font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed"
+                  :class="App.getDnsRecommendedDomainClass(domain)"
+                >
+                  <span class="font-mono">{{ domain }}</span>
+                  <i data-lucide="wand-sparkles" class="w-4 h-4"></i>
+                </button>
+              </div>
+            </div>
             <div class="ui-radius-card rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm">
               <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
                 <div>
@@ -4861,25 +5833,29 @@ const UI_HTML = `<!DOCTYPE html>
                 </div>
                 <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">快捷入口</span>
               </div>
-              <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
+              <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2">
                 <a href="https://cf.090227.xyz/" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
                   <span class="text-sm font-semibold">优选域名</span>
+                  <i data-lucide="arrow-up-right" class="w-4 h-4 text-brand-600 dark:text-brand-400"></i>
+                </a>
+                <a href="https://api.uouin.com/cloudflare.html" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
+                  <span class="text-sm font-semibold">麒麟优选</span>
                   <i data-lucide="arrow-up-right" class="w-4 h-4 text-brand-600 dark:text-brand-400"></i>
                 </a>
                 <a href="https://vps789.com/" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
                   <span class="text-sm font-semibold">VPS789</span>
                   <i data-lucide="arrow-up-right" class="w-4 h-4 text-brand-600 dark:text-brand-400"></i>
                 </a>
-                <a href="https://www.wetest.vip/page/cloudflare/address_v4.html" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
-                  <span class="text-sm font-semibold">WeTest.Vip</span>
+                <a href="https://ip.164746.xyz/" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
+                  <span class="text-sm font-semibold">CFST优选IP</span>
                   <i data-lucide="arrow-up-right" class="w-4 h-4 text-brand-600 dark:text-brand-400"></i>
                 </a>
-                <a href="https://stock.hostmonit.com/CloudFlareYes" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
-                  <span class="text-sm font-semibold">CloudFlareYes</span>
+                <a href="https://github.com/XIU2/CloudflareSpeedTest" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
+                  <span class="text-sm font-semibold">CFST测速</span>
                   <i data-lucide="arrow-up-right" class="w-4 h-4 text-brand-600 dark:text-brand-400"></i>
                 </a>
-                <a href="https://ipdb.api.030101.xyz/" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
-                  <span class="text-sm font-semibold">IPDB API</span>
+                <a href="https://github.com/Leo-Mu/montecarlo-ip-searcher" target="_blank" rel="noopener noreferrer" class="ui-radius-card group inline-flex items-center justify-between gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-950/40 px-4 py-3 text-slate-700 dark:text-slate-200 hover:bg-brand-50/80 dark:hover:bg-brand-500/10 transition">
+                  <span class="text-sm font-semibold">Montecarlo-IP测速</span>
                   <i data-lucide="arrow-up-right" class="w-4 h-4 text-brand-600 dark:text-brand-400"></i>
                 </a>
               </div>
@@ -4890,51 +5866,54 @@ const UI_HTML = `<!DOCTYPE html>
 
       <div id="view-settings" class="view-section max-w-6xl mx-auto space-y-6" :class="{ active: App.currentHash === '#settings' }">
            <div class="settings-view-layout flex flex-col gap-4 md:flex-row md:items-start md:gap-5">
-              <div class="md:w-64 md:flex-shrink-0 md:self-start">
-                <div class="settings-nav-shell w-full rounded-[24px] border border-slate-200 dark:border-slate-800 bg-slate-50/90 dark:bg-slate-950/70 p-3 md:p-3.5 shadow-sm shadow-slate-200/60 dark:shadow-none">
-                  <div class="px-1 pb-2.5 mb-2.5 border-b border-slate-200/80 dark:border-slate-800">
+              <div class="md:w-52 md:flex-shrink-0 md:self-start">
+                <div class="settings-nav-shell w-full rounded-[24px] border border-slate-200 dark:border-slate-800 bg-slate-50/90 dark:bg-slate-950/70 p-2.5 md:p-3 shadow-sm shadow-slate-200/60 dark:shadow-none">
+                  <div class="px-1 pb-2 mb-2 border-b border-slate-200/80 dark:border-slate-800">
                     <div class="text-[11px] font-semibold tracking-[0.16em] text-slate-400 dark:text-slate-500 uppercase">Settings</div>
                     <div class="text-[13px] font-semibold text-slate-900 dark:text-white mt-1">全局设置导航</div>
-                    <p class="mt-1.5 text-[11px] leading-4 text-slate-500 dark:text-slate-400">PC 端左侧分区导航，移动端可横向滑动切换。</p>
                   </div>
                   <div class="flex flex-row gap-1.5 overflow-x-auto whitespace-nowrap md:flex-col md:overflow-visible md:whitespace-normal" role="tablist" aria-label="全局设置导航">
-                    <button class="set-tab min-w-[10rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2.5 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('ui')" @click="App.switchSetTab('ui')" role="tab" aria-controls="set-ui" :aria-selected="App.activeSettingsTab === 'ui'">
+                    <button class="set-tab min-w-[8.75rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('ui')" @click="App.switchSetTab('ui')" role="tab" aria-controls="set-ui" :aria-selected="App.activeSettingsTab === 'ui'">
                       <span class="block font-semibold">系统 UI</span>
-                      <span class="hidden md:block mt-0.5 text-[11px] leading-4 text-slate-500 dark:text-slate-400">主题与基础界面参数</span>
                     </button>
-                    <button class="set-tab min-w-[10rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2.5 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('proxy')" @click="App.switchSetTab('proxy')" role="tab" aria-controls="set-proxy" :aria-selected="App.activeSettingsTab === 'proxy'">
+                    <button v-if="App.isSettingsTabVisible('proxy')" class="set-tab min-w-[8.75rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('proxy')" @click="App.switchSetTab('proxy')" role="tab" aria-controls="set-proxy" :aria-selected="App.activeSettingsTab === 'proxy'">
                       <span class="block font-semibold">代理与网络</span>
-                      <span class="hidden md:block mt-0.5 text-[11px] leading-4 text-slate-500 dark:text-slate-400">播放稳定性与链路策略</span>
                     </button>
-                    <button class="set-tab min-w-[10rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2.5 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('security')" @click="App.switchSetTab('security')" role="tab" aria-controls="set-security" :aria-selected="App.activeSettingsTab === 'security'">
-                      <span class="block font-semibold">缓存与安全</span>
-                      <span class="hidden md:block mt-0.5 text-[11px] leading-4 text-slate-500 dark:text-slate-400">访问控制、限速与跨域</span>
+                    <button v-if="App.isSettingsTabVisible('cache')" class="set-tab min-w-[8.75rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('cache')" @click="App.switchSetTab('cache')" role="tab" aria-controls="set-cache" :aria-selected="App.activeSettingsTab === 'cache'">
+                      <span class="block font-semibold">静态资源策略</span>
                     </button>
-                    <button class="set-tab min-w-[10rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2.5 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('logs')" @click="App.switchSetTab('logs')" role="tab" aria-controls="set-logs" :aria-selected="App.activeSettingsTab === 'logs'">
-                      <span class="block font-semibold">日志与监控</span>
-                      <span class="hidden md:block mt-0.5 text-[11px] leading-4 text-slate-500 dark:text-slate-400">日志写入、告警与日报</span>
+                    <button v-if="App.isSettingsTabVisible('security')" class="set-tab min-w-[8.75rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('security')" @click="App.switchSetTab('security')" role="tab" aria-controls="set-security" :aria-selected="App.activeSettingsTab === 'security'">
+                      <span class="block font-semibold">安全防护</span>
                     </button>
-                    <button class="set-tab min-w-[10rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2.5 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('account')" @click="App.switchSetTab('account')" role="tab" aria-controls="set-account" :aria-selected="App.activeSettingsTab === 'account'">
-                      <span class="block font-semibold">账号与备份</span>
-                      <span class="hidden md:block mt-0.5 text-[11px] leading-4 text-slate-500 dark:text-slate-400">Cloudflare 联动与恢复保底</span>
+                    <button class="set-tab min-w-[8.75rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('logs')" @click="App.switchSetTab('logs')" role="tab" aria-controls="set-logs" :aria-selected="App.activeSettingsTab === 'logs'">
+                      <span class="block font-semibold">日志设置</span>
+                    </button>
+                    <button class="set-tab min-w-[8.75rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('monitoring')" @click="App.switchSetTab('monitoring')" role="tab" aria-controls="set-monitoring" :aria-selected="App.activeSettingsTab === 'monitoring'">
+                      <span class="block font-semibold">监控告警</span>
+                    </button>
+                    <button class="set-tab min-w-[8.75rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('account')" @click="App.switchSetTab('account')" role="tab" aria-controls="set-account" :aria-selected="App.activeSettingsTab === 'account'">
+                      <span class="block font-semibold">账号设置</span>
+                    </button>
+                    <button class="set-tab min-w-[8.75rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('backup')" @click="App.switchSetTab('backup')" role="tab" aria-controls="set-backup" :aria-selected="App.activeSettingsTab === 'backup'">
+                      <span class="block font-semibold">备份与恢复</span>
                     </button>
                   </div>
                 </div>
               </div>
               <div class="flex-1 min-w-0" id="settings-forms" v-scroll-reset="App.settingsScrollResetKey">
-              
-              <div id="set-ui" v-show="App.activeSettingsTab === 'ui'" class="space-y-4">
-                <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 p-5 shadow-sm settings-panel">
-                  <div class="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-                    <div class="max-w-2xl">
-                      <span class="inline-flex items-center rounded-full border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-[11px] font-semibold tracking-[0.12em] uppercase text-indigo-600 dark:border-indigo-500/30 dark:bg-indigo-500/10 dark:text-indigo-300">UI</span>
-                      <h3 class="mt-3 text-lg font-semibold text-slate-900 dark:text-white">UI 基础设置</h3>
-                      <p class="text-sm text-slate-600 dark:text-slate-300 mt-2">深浅模式仍然只保存在当前浏览器；这里仅保留与界面结构直接相关的基础参数，不再提供 Dashboard 自动刷新和液态玻璃协调效果。</p>
+                <div id="set-ui" v-show="App.activeSettingsTab === 'ui'" class="space-y-4">
+                <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-5 shadow-sm settings-block">
+                  <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                    <div>
+                      <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Mode</div>
+                      <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">设置操作视图</div>
                     </div>
-                    <div class="flex flex-wrap gap-2 md:max-w-[240px]">
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">本地主题</span>
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">纯净面板</span>
-                    </div>
+                    <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">默认新手模式</span>
+                  </div>
+                  <p class="text-xs text-slate-500 mb-3 ml-6">新手模式会隐藏代理与网络、安全防护、静态资源策略分区，以及日志调优和修复工具；切到高手模式后可展开完整控制面。</p>
+                  <div class="ml-6 flex flex-wrap gap-2">
+                    <button type="button" @click="App.setSettingsExperienceMode('novice')" class="px-4 py-2 rounded-xl border text-sm font-medium transition" :class="App.getSettingsModeButtonClass('novice')">新手模式</button>
+                    <button type="button" @click="App.setSettingsExperienceMode('expert')" class="px-4 py-2 rounded-xl border text-sm font-medium transition" :class="App.getSettingsModeButtonClass('expert')">高手模式</button>
                   </div>
                 </div>
                 <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-5 shadow-sm settings-block">
@@ -4948,7 +5927,7 @@ const UI_HTML = `<!DOCTYPE html>
                   <p class="text-xs text-slate-500 mb-3 ml-6">控制管理界面主要卡片/面板的圆角弧度；设置为 0 可关闭圆角（更接近矩形 UI）。</p>
                   <label class="block text-sm text-slate-500 mb-1 ml-6">圆角弧度</label>
                   <div class="relative w-[calc(100%-1.5rem)] ml-6">
-                    <input type="number" min="0" max="48" step="1" id="cfg-ui-radius-px" v-model="App.settingsForm.uiRadiusPx" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="24">
+                    <input type="number" min="0" max="48" step="1" id="cfg-ui-radius-px" v-model="App.settingsForm.uiRadiusPx" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="10">
                     <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">px</span>
                   </div>
                   <p class="text-xs text-slate-500 ml-6">推荐 16-24；保存后会立即应用到所有管理员界面（仅 UI，不影响代理业务逻辑）。</p>
@@ -4958,22 +5937,7 @@ const UI_HTML = `<!DOCTYPE html>
                 </div>
               </div>
               
-              <div id="set-proxy" v-show="App.activeSettingsTab === 'proxy'" class="space-y-4">
-                <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-white/90 dark:bg-slate-950/70 p-5 shadow-sm settings-panel">
-                  <div class="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-                    <div class="max-w-2xl">
-                      <span class="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2.5 py-1 text-[11px] font-semibold tracking-[0.12em] uppercase text-sky-600 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-300">Network</span>
-                      <h3 class="mt-3 text-lg font-semibold text-slate-900 dark:text-white">网络协议与优化</h3>
-                      <p class="text-sm text-slate-600 dark:text-slate-300 mt-2">默认仍以 HTTP/1.1 稳定链路为基线，再按需打开预热、直连与回退策略。这里更适合小步调参，不建议一次改很多项。</p>
-                    </div>
-                    <div class="flex flex-wrap gap-2 md:max-w-[280px]">
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">H1.1 优先</span>
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">预热拦截</span>
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">307 直连</span>
-                    </div>
-                  </div>
-                </div>
-
+              <div v-if="App.isSettingsTabVisible('proxy')" id="set-proxy" v-show="App.activeSettingsTab === 'proxy'" class="space-y-4">
                 <div class="grid gap-4">
                   <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
                     <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
@@ -5005,10 +5969,10 @@ const UI_HTML = `<!DOCTYPE html>
                     <p class="text-xs text-slate-500 mb-3 ml-6">仅预热索引文件、字幕和海报，大幅提升起播感知速度，同时避免 Worker 参与视频字节流的长时间 I/O。</p>
                     <label class="block text-sm text-slate-500 mb-1 ml-6">元数据预热缓存时长</label>
                     <div class="relative w-[calc(100%-1.5rem)] ml-6">
-                      <input type="number" min="0" max="3600" step="1" id="cfg-prewarm-ttl" v-model="App.settingsForm.prewarmCacheTtl" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="180">
+                      <input type="number" min="0" max="3600" step="1" id="cfg-prewarm-ttl" v-model="App.settingsForm.prewarmCacheTtl" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="120">
                       <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">秒</span>
                     </div>
-                    <p class="text-xs text-slate-500 mb-4 ml-6">该 TTL 只作用于 <code>.m3u8</code>、<code>.vtt/.srt</code> 等轻量元数据；海报仍沿用图片缓存策略。检测到 <code>.mp4</code>、<code>.mkv</code>、<code>.ts</code>、<code>.m4s</code> 等视频字节流时，会立即跳过异步预热。</p>
+                    <p class="text-xs text-slate-500 mb-4 ml-6">该 TTL 只作用于 <code>.m3u8</code>、<code>.vtt/.srt</code> 等轻量元数据；海报仍沿用静态资源策略。检测到 <code>.mp4</code>、<code>.mkv</code>、<code>.ts</code>、<code>.m4s</code> 等视频字节流时，会立即跳过异步预热。</p>
                     <label class="block text-sm text-slate-500 mb-1 ml-6">预热深度</label>
                     <select id="cfg-prewarm-depth" v-model="App.settingsForm.prewarmDepth" @change="App.syncProxySettingsGuardrails()" class="w-[calc(100%-1.5rem)] ml-6 p-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white">
                       <option value="poster">仅预热海报</option>
@@ -5021,7 +5985,7 @@ const UI_HTML = `<!DOCTYPE html>
                     </div>
                   </div>
 
-                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
+                  <div v-if="App.isSettingsExpertMode()" class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
                     <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
                       <div>
                         <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Direct</div>
@@ -5036,7 +6000,7 @@ const UI_HTML = `<!DOCTYPE html>
                     <p id="cfg-direct-mode-hint" class="text-xs text-cyan-700 dark:text-cyan-300 mt-3">{{ App.proxySettingsGuardrails.directHint }}</p>
                   </div>
 
-                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
+                  <div v-if="App.isSettingsExpertMode()" class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
                     <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
                       <div>
                         <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Relay</div>
@@ -5077,7 +6041,7 @@ const UI_HTML = `<!DOCTYPE html>
                     </div>
                   </div>
 
-                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
+                  <div v-if="App.isSettingsExpertMode()" class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
                     <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
                       <div>
                         <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Probe</div>
@@ -5104,7 +6068,7 @@ const UI_HTML = `<!DOCTYPE html>
                     <p class="text-xs text-slate-500 mt-2">默认关闭。仅影响“新建节点 / 编辑节点”面板的一键测试延迟；全局 Ping 与节点卡片 Ping 只测试当前启用线路，不自动排序。</p>
                   </div>
 
-                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
+                  <div v-if="App.isSettingsExpertMode()" class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
                     <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
                       <div>
                         <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Upstream</div>
@@ -5114,7 +6078,7 @@ const UI_HTML = `<!DOCTYPE html>
                     </div>
                     <label class="block text-sm text-slate-500 mb-1">上游握手超时</label>
                     <div class="relative">
-                      <input type="number" min="0" max="180000" step="500" id="cfg-upstream-timeout-ms" v-model="App.settingsForm.upstreamTimeoutMs" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="0">
+                      <input type="number" min="0" max="180000" step="500" id="cfg-upstream-timeout-ms" v-model="App.settingsForm.upstreamTimeoutMs" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="8000">
                       <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">ms</span>
                     </div>
                     <p class="text-xs text-slate-500 mb-3">系统会限制在 0 到 180000 毫秒之间，避免把超时配置得过大导致失败请求长期占用连接。</p>
@@ -5133,22 +6097,44 @@ const UI_HTML = `<!DOCTYPE html>
                 </div>
               </div>
               
-              <div id="set-security" v-show="App.activeSettingsTab === 'security'" class="space-y-4">
-                <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-white/90 dark:bg-slate-950/70 p-5 shadow-sm settings-panel">
-                  <div class="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-                    <div class="max-w-2xl">
-                      <span class="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold tracking-[0.12em] uppercase text-amber-600 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">Security</span>
-                      <h3 class="mt-3 text-lg font-semibold text-slate-900 dark:text-white">安全防火墙与缓存引擎</h3>
-                      <p class="text-sm text-slate-600 dark:text-slate-300 mt-2">这一栏主要决定“谁可以访问”和“图片等静态资源缓存多久”。如果你不确定某条限制会不会误伤正常用户，建议先留空或保持默认值。</p>
+              <div v-if="App.isSettingsTabVisible('cache')" id="set-cache" v-show="App.activeSettingsTab === 'cache'" class="space-y-4">
+                <div class="grid gap-4">
+                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
+                    <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                      <div>
+                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-sky-500 dark:text-sky-300">Static Asset Cache</div>
+                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">静态资源策略</div>
+                      </div>
+                      <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">0-365 天</span>
                     </div>
-                    <div class="flex flex-wrap gap-2 md:max-w-[280px]">
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">Geo / IP</span>
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">海报缓存</span>
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">CORS</span>
+                    <p class="text-xs text-slate-500 mt-2 mb-3">统一描述海报、封面、字幕、JS、CSS 等静态资源的缓存策略入口；高手模式下可进一步细调直连与跨域规则。</p>
+                    <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">静态资源缓存时长</label>
+                    <div class="relative">
+                      <input type="number" min="0" max="365" id="cfg-cache-ttl" v-model="App.settingsForm.cacheTtlImages" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="30">
+                      <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">天</span>
                     </div>
+                  </div>
+
+                  <div v-if="App.isSettingsExpertMode()" class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
+                    <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                      <div>
+                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-emerald-500 dark:text-emerald-300">CORS</div>
+                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">浏览器跨域策略</div>
+                      </div>
+                      <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">留空为 *</span>
+                    </div>
+                    <p class="text-xs text-slate-500 mt-2 mb-3">用于限制哪些网页前端可以在浏览器里跨域调用本 Worker API；它主要影响浏览器环境，不影响服务器到服务器的直连请求。</p>
+                    <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">CORS 跨域白名单 (留空为 *，如 https://emby.com)</label>
+                    <input type="text" id="cfg-cors" v-model="App.settingsForm.corsOrigins" class="w-full p-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white">
                   </div>
                 </div>
 
+                <div class="flex flex-wrap gap-2">
+                  <button @click="App.saveSettings('security', 'cache')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存静态资源策略</button>
+                </div>
+              </div>
+
+              <div v-if="App.isSettingsTabVisible('security')" id="set-security" v-show="App.activeSettingsTab === 'security'" class="space-y-4">
                 <div class="grid gap-4">
                   <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block">
                     <div class="flex items-start justify-between gap-3 mb-4 pb-3 border-b border-slate-200/80 dark:border-slate-800">
@@ -5160,14 +6146,15 @@ const UI_HTML = `<!DOCTYPE html>
                       <span class="inline-flex items-center rounded-full bg-white text-slate-500 border border-slate-200 px-2.5 py-1 text-[10px] font-semibold dark:bg-slate-900 dark:text-slate-300 dark:border-slate-700">Geo + IP + Rate</span>
                     </div>
                     <div class="grid gap-4">
-                      <div>
-                        <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">国家/地区访问模式</label>
-                        <p class="text-xs text-slate-500 mb-2">在白名单模式和黑名单模式之间二选一，统一使用同一份国家/地区列表，避免同时填两边造成规则冲突。</p>
-                        <select id="cfg-geo-mode" v-model="App.settingsForm.geoMode" class="w-full p-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white">
-                          <option value="allowlist">白名单模式</option>
-                          <option value="blocklist">黑名单模式</option>
-                        </select>
-                      </div>
+	                      <div>
+	                        <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">国家/地区访问模式</label>
+	                        <p class="text-xs text-slate-500 mb-2">在白名单模式和黑名单模式之间二选一，统一使用同一份国家/地区列表，避免同时填两边造成规则冲突。</p>
+	                        <p v-if="App.hasGeoFirewallConflict()" class="text-xs text-amber-700 dark:text-amber-300 mb-2">{{ App.getGeoFirewallConflictHint() }}</p>
+	                        <div class="flex flex-wrap gap-2">
+	                          <button type="button" @click="App.setGeoMode('allowlist')" class="px-3 py-2 rounded-xl border text-sm font-medium transition" :class="App.getGeoModeButtonClass('allowlist')">白名单模式</button>
+	                          <button type="button" @click="App.setGeoMode('blocklist')" class="px-3 py-2 rounded-xl border text-sm font-medium transition" :class="App.getGeoModeButtonClass('blocklist')">黑名单模式</button>
+	                        </div>
+	                      </div>
                       <div>
                         <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">国家/地区名单 (逗号分隔，如: CN,HK)</label>
                         <p class="text-xs text-slate-500 mb-2">{{ App.settingsForm.geoMode === 'blocklist' ? '当前为黑名单模式：命中的国家/地区会被直接拦截。' : '当前为白名单模式：只有命中的国家/地区允许访问；留空则等同于关闭 Geo 限制。' }}</p>
@@ -5187,35 +6174,6 @@ const UI_HTML = `<!DOCTYPE html>
                         </div>
                       </div>
                     </div>
-                  </div>
-
-                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
-                    <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
-                      <div>
-                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-sky-500 dark:text-sky-300">Image Cache</div>
-                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">图片缓存策略</div>
-                      </div>
-                      <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">0-365 天</span>
-                    </div>
-                    <p class="text-xs text-slate-500 mt-2 mb-3">主要影响海报、封面等轻资源，缓存得当能显著降低后台浏览时的重复回源。</p>
-                    <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">图片海报缓存时长</label>
-                    <div class="relative">
-                      <input type="number" min="0" max="365" id="cfg-cache-ttl" v-model="App.settingsForm.cacheTtlImages" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="30">
-                      <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">天</span>
-                    </div>
-                  </div>
-
-                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
-                    <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
-                      <div>
-                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-emerald-500 dark:text-emerald-300">CORS</div>
-                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">浏览器跨域策略</div>
-                      </div>
-                      <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">留空为 *</span>
-                    </div>
-                    <p class="text-xs text-slate-500 mt-2 mb-3">用于限制哪些网页前端可以在浏览器里跨域调用本 Worker API；它主要影响浏览器环境，不影响服务器到服务器的直连请求。</p>
-                    <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">CORS 跨域白名单 (留空为 *，如 https://emby.com)</label>
-                    <input type="text" id="cfg-cors" v-model="App.settingsForm.corsOrigins" class="w-full p-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white">
                   </div>
 
                   <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-white/70 dark:bg-slate-900/50 p-5 shadow-sm settings-block">
@@ -5240,22 +6198,22 @@ const UI_HTML = `<!DOCTYPE html>
               </div>
               
               <div id="set-logs" v-show="App.activeSettingsTab === 'logs'" class="space-y-4">
-                <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-white/90 dark:bg-slate-950/70 p-5 shadow-sm settings-panel">
-                  <div class="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-                    <div class="max-w-2xl">
-                      <span class="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold tracking-[0.12em] uppercase text-emerald-600 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-300">Ops</span>
-                      <h3 class="mt-3 text-lg font-semibold text-slate-900 dark:text-white">监控与日志配置</h3>
-                      <p class="text-sm text-slate-600 dark:text-slate-300 mt-2">这一栏决定日志如何写入、多久保留，以及 Telegram 如何通知你。小白通常只需要关心“日志保存天数”和“测试通知能不能收到”。</p>
-                    </div>
-                    <div class="flex flex-wrap gap-2 md:max-w-[280px]">
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">D1 写入</span>
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">Cron</span>
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">Telegram</span>
-                    </div>
-                  </div>
-                </div>
-                <div class="grid gap-4">
-                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block">
+	                <div class="grid gap-4">
+	                  <div v-if="App.isSettingsExpertMode()" class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block">
+	                    <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+	                      <div>
+	                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Search</div>
+	                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">日志搜索模式</div>
+	                      </div>
+	                      <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">LIKE / FTS5</span>
+	                    </div>
+	                    <div class="flex flex-wrap gap-2">
+	                      <button type="button" @click="App.setSettingsLogSearchMode('like')" class="px-3 py-2 rounded-xl border text-sm font-medium transition" :class="App.getSettingsLogSearchModeButtonClass('like')">LIKE 模糊匹配</button>
+	                      <button type="button" @click="App.setSettingsLogSearchMode('fts')" class="px-3 py-2 rounded-xl border text-sm font-medium transition" :class="App.getSettingsLogSearchModeButtonClass('fts')">FTS 语法查询</button>
+	                    </div>
+	                    <p class="text-xs text-slate-500 mt-3">{{ App.getSettingsLogSearchModeHint() }}</p>
+	                  </div>
+	                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block">
                     <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
                       <div>
                         <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Storage</div>
@@ -5285,28 +6243,28 @@ const UI_HTML = `<!DOCTYPE html>
                           <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">条</span>
                         </div>
                       </div>
-                      <div>
+                      <div v-if="App.isSettingsExpertMode()">
                         <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">D1 切片大小</label>
                         <div class="relative">
                           <input type="number" min="1" max="100" step="1" id="cfg-log-batch-size" v-model="App.settingsForm.logBatchChunkSize" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="50">
                           <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">条</span>
                         </div>
                       </div>
-                      <div>
+                      <div v-if="App.isSettingsExpertMode()">
                         <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">D1 重试次数</label>
                         <div class="relative">
                           <input type="number" min="0" max="5" step="1" id="cfg-log-retry-count" v-model="App.settingsForm.logBatchRetryCount" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="2">
                           <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">次</span>
                         </div>
                       </div>
-                      <div>
+                      <div v-if="App.isSettingsExpertMode()">
                         <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">重试退避</label>
                         <div class="relative">
                           <input type="number" min="0" max="5000" step="25" id="cfg-log-retry-backoff" v-model="App.settingsForm.logBatchRetryBackoffMs" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="75">
                           <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">ms</span>
                         </div>
                       </div>
-                      <div class="md:col-span-2">
+                      <div v-if="App.isSettingsExpertMode()" class="md:col-span-2">
                         <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">定时任务租约时长</label>
                         <div class="relative">
                           <input type="number" min="30000" max="900000" step="1000" id="cfg-scheduled-lease-ms" v-model="App.settingsForm.scheduledLeaseMs" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="300000">
@@ -5351,7 +6309,16 @@ const UI_HTML = `<!DOCTYPE html>
                       只想快速止血：优先保留默认值，再逐项小步调整。
                     </div>
                   </div>
+                </div>
 
+                <div class="flex flex-wrap gap-2">
+                    <button @click="App.applyRecommendedSettings('logs')" class="px-4 py-2 border border-emerald-200 text-emerald-600 rounded-xl text-sm transition hover:bg-emerald-50 dark:border-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/20">恢复推荐值</button>
+                    <button @click="App.saveSettings('logs')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存日志设置</button>
+                </div>
+              </div>
+
+              <div id="set-monitoring" v-show="App.activeSettingsTab === 'monitoring'" class="space-y-4">
+                <div class="grid gap-4">
                   <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
                     <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
                       <div>
@@ -5395,29 +6362,13 @@ const UI_HTML = `<!DOCTYPE html>
                 </div>
 
                 <div class="flex flex-wrap gap-2">
-                    <button @click="App.applyRecommendedSettings('logs')" class="px-4 py-2 border border-emerald-200 text-emerald-600 rounded-xl text-sm transition hover:bg-emerald-50 dark:border-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/20">恢复推荐值</button>
-                    <button @click="App.saveSettings('logs')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存监控设置</button>
+                    <button @click="App.saveSettings('logs', 'monitoring')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存监控设置</button>
                     <button @click="App.testTelegram()" class="px-4 py-2 border border-blue-200 text-blue-600 rounded-xl text-sm transition hover:bg-blue-50 dark:border-blue-900/30 dark:text-blue-400 dark:hover:bg-blue-900/20 flex items-center justify-center"><i data-lucide="send" class="w-4 h-4 mr-1"></i> 发送测试通知</button>
                     <button @click="App.sendDailyReport()" class="px-4 py-2 border border-emerald-200 text-emerald-600 rounded-xl text-sm transition hover:bg-emerald-50 dark:border-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/20 flex items-center justify-center"><i data-lucide="file-bar-chart" class="w-4 h-4 mr-1"></i> 手动发送日报</button>
                 </div>
               </div>
               
               <div id="set-account" v-show="App.activeSettingsTab === 'account'" class="space-y-4">
-                <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-white/90 dark:bg-slate-950/70 p-5 shadow-sm settings-panel">
-                  <div class="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-                    <div class="max-w-2xl">
-                      <span class="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2.5 py-1 text-[11px] font-semibold tracking-[0.12em] uppercase text-sky-600 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-300">Account</span>
-                      <h3 class="mt-3 text-lg font-semibold text-slate-900 dark:text-white">系统账号与安全</h3>
-                      <p class="text-sm text-slate-600 dark:text-slate-300 mt-2">这一栏主要管理后台登录有效期、Cloudflare 联动参数，以及备份、导入和快照恢复。准备做大改动前，建议先导出一份完整备份。</p>
-                    </div>
-                    <div class="flex flex-wrap gap-2 md:max-w-[280px]">
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">后台登录</span>
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">Cloudflare</span>
-                      <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">快照恢复</span>
-                    </div>
-                  </div>
-                </div>
-
                 <div class="grid gap-4">
                   <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
                     <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
@@ -5455,52 +6406,10 @@ const UI_HTML = `<!DOCTYPE html>
                     </div>
                   </div>
                 </div>
+              </div>
 
+              <div id="set-backup" v-show="App.activeSettingsTab === 'backup'" class="space-y-4">
                 <div class="grid gap-4">
-                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
-                    <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
-                      <div>
-                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Settings Only</div>
-                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">全局设置专用迁移</div>
-                      </div>
-                      <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">不含节点</span>
-                    </div>
-                    <p class="text-sm text-slate-500 mb-4">只导出 / 导入 settings，不包含节点清单。适合多环境同步代理、监控、账号与 Dashboard 策略。</p>
-                    <div class="flex gap-4 flex-wrap">
-                      <label class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm transition font-medium"><i data-lucide="upload-cloud" class="w-4 h-4 inline mr-1"></i> 导入全局设置<input type="file" id="import-settings-file" class="hidden" accept=".json" @change="App.importSettings($event)"></label>
-                      <button @click="App.exportSettings()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition font-medium"><i data-lucide="download-cloud" class="w-4 h-4 inline mr-1"></i> 导出全局设置</button>
-                    </div>
-                  </div>
-
-                  <div class="rounded-3xl border border-amber-200 dark:border-amber-900/40 bg-amber-50/70 dark:bg-amber-950/20 p-5 shadow-sm settings-block h-full">
-                    <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-amber-200/80 dark:border-amber-900/40">
-                      <div>
-                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-amber-500 dark:text-amber-400">Advanced Repair</div>
-                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">一键整理 KV 数据</div>
-                      </div>
-                      <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-amber-700 border border-amber-200 dark:bg-slate-900 dark:border-amber-900/40 dark:text-amber-300">谨慎使用</span>
-                    </div>
-                    <p class="text-sm text-slate-500 mb-4">用于旧版本升级后出现 <code>sys:theme</code> 脏值、<code>sys:nodes_index</code> 错乱或遗留 Cloudflare 仪表盘缓存键时的整理修复。不会删除 <code>node:*</code> 节点实体；定时任务也会在上次整理成功 1 小时后自动兜底执行一次。</p>
-                    <div class="flex gap-4 flex-wrap">
-                      <button @click="App.tidyKvData()" class="px-4 py-2 border border-amber-300 text-amber-700 rounded-xl text-sm transition hover:bg-amber-100 dark:border-amber-900/40 dark:text-amber-300 dark:hover:bg-amber-900/20"><i data-lucide="database" class="w-4 h-4 inline mr-1"></i> 一键整理 KV 数据</button>
-                    </div>
-                  </div>
-
-                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
-                    <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
-                      <div>
-                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Full Backup</div>
-                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">备份与恢复 (全量 KV 数据)</div>
-                      </div>
-                      <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">节点 + 设置</span>
-                    </div>
-                    <p class="text-sm text-slate-500 mb-4">导出或导入系统内的所有节点以及全局设置数据（单文件）。</p>
-                    <div class="flex gap-4 flex-wrap">
-                      <label class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm transition font-medium"><i data-lucide="upload" class="w-4 h-4 inline mr-1"></i> 导入完整备份<input type="file" id="import-full-file" class="hidden" accept=".json" @change="App.importFull($event)"></label>
-                      <button @click="App.exportFull()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition font-medium"><i data-lucide="download" class="w-4 h-4 inline mr-1"></i> 导出完整备份</button>
-                    </div>
-                  </div>
-                  
                   <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block">
                     <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
                       <div>
@@ -5526,6 +6435,50 @@ const UI_HTML = `<!DOCTYPE html>
                           <button @click="App.restoreConfigSnapshot(snapshot.id)" class="px-3 py-2 border border-brand-200 text-brand-600 rounded-xl text-sm transition hover:bg-brand-50 dark:border-brand-900/30 dark:text-brand-400 dark:hover:bg-brand-900/20 whitespace-nowrap">恢复此快照</button>
                         </div>
                       </div>
+                    </div>
+                  </div>
+
+                  <div v-if="App.isSettingsExpertMode()" class="rounded-3xl border border-amber-200 dark:border-amber-900/40 bg-amber-50/70 dark:bg-amber-950/20 p-5 shadow-sm settings-block h-full">
+                    <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-amber-200/80 dark:border-amber-900/40">
+                      <div>
+                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-amber-500 dark:text-amber-400">Advanced Repair</div>
+                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">一键整理 KV 数据</div>
+                      </div>
+                      <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-amber-700 border border-amber-200 dark:bg-slate-900 dark:border-amber-900/40 dark:text-amber-300">谨慎使用</span>
+                    </div>
+                    <p class="text-sm text-slate-500 mb-4">用于旧版本升级后出现 <code>sys:theme</code> 脏值、<code>sys:nodes_index</code> 错乱或遗留 Cloudflare 仪表盘缓存键时的整理修复。不会删除 <code>node:*</code> 节点实体；定时任务也会在上次整理成功 1 小时后自动兜底执行一次。</p>
+                    <div class="flex gap-4 flex-wrap">
+                      <button @click="App.tidyKvData()" class="px-4 py-2 border border-amber-300 text-amber-700 rounded-xl text-sm transition hover:bg-amber-100 dark:border-amber-900/40 dark:text-amber-300 dark:hover:bg-amber-900/20"><i data-lucide="database" class="w-4 h-4 inline mr-1"></i> 一键整理 KV 数据</button>
+                    </div>
+                  </div>
+
+                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
+                    <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                      <div>
+                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Settings Only</div>
+                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">全局设置专用迁移</div>
+                      </div>
+                      <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">不含节点</span>
+                    </div>
+                    <p class="text-sm text-slate-500 mb-4">只导出 / 导入 settings，不包含节点清单。适合多环境同步代理、监控、账号与 Dashboard 策略。</p>
+                    <div class="flex gap-4 flex-wrap">
+                      <label class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm transition font-medium"><i data-lucide="upload-cloud" class="w-4 h-4 inline mr-1"></i> 导入全局设置<input type="file" id="import-settings-file" class="hidden" accept=".json" @change="App.importSettings($event)"></label>
+                      <button @click="App.exportSettings()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition font-medium"><i data-lucide="download-cloud" class="w-4 h-4 inline mr-1"></i> 导出全局设置</button>
+                    </div>
+                  </div>
+
+                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
+                    <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                      <div>
+                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Full Backup</div>
+                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">备份与恢复 (全量 KV 数据)</div>
+                      </div>
+                      <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">节点 + 设置</span>
+                    </div>
+                    <p class="text-sm text-slate-500 mb-4">导出或导入系统内的所有节点以及全局设置数据（单文件）。</p>
+                    <div class="flex gap-4 flex-wrap">
+                      <label class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm transition font-medium"><i data-lucide="upload" class="w-4 h-4 inline mr-1"></i> 导入完整备份<input type="file" id="import-full-file" class="hidden" accept=".json" @change="App.importFull($event)"></label>
+                      <button @click="App.exportFull()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition font-medium"><i data-lucide="download" class="w-4 h-4 inline mr-1"></i> 导出完整备份</button>
                     </div>
                   </div>
                 </div>
@@ -5683,17 +6636,19 @@ const UI_HTML = `<!DOCTYPE html>
 
   <script>
     const UI_DEFAULTS = {
-      uiRadiusPx: 24,
+      uiRadiusPx: 10,
+      settingsExperienceMode: 'novice',
       directStaticAssets: false,
       directHlsDash: false,
-      prewarmDepth: 'poster_manifest',
-      prewarmCacheTtl: 180,
+      prewarmDepth: 'poster',
+      prewarmCacheTtl: 120,
       prewarmPrefetchBytes: 4194304,
       pingTimeout: 5000,
       pingCacheMinutes: 10,
       nodePanelPingAutoSort: false,
-      upstreamTimeoutMs: 0,
+      upstreamTimeoutMs: 8000,
       upstreamRetryAttempts: 0,
+      logSearchMode: 'like',
       logRetentionDays: 7,
       logWriteDelayMinutes: 20,
       logFlushCountThreshold: 50,
@@ -5707,19 +6662,58 @@ const UI_HTML = `<!DOCTYPE html>
       tgAlertOnScheduledFailure: false
     };
 
-    function normalizeRegionCodeCsv(value = '') {
-      return [...new Set(String(value || '')
-        .split(',')
-        .map(item => item.trim().toUpperCase())
-        .filter(Boolean))]
-        .join(',');
+    const DNS_RECOMMENDED_CNAME_OPTIONS = [
+      'saas.sin.fan',
+      'mfa.gov.ua',
+      'www.shopify.com'
+    ];
+
+    function normalizeDnsEditorMode(value = '') {
+      return String(value || '').trim().toLowerCase() === 'a' ? 'a' : 'cname';
     }
 
-    const CONFIG_PREVIEW_SANITIZE_RULES = ${JSON.stringify(CONFIG_SANITIZE_RULES)};
+    function normalizeDnsDraftType(value = '', fallbackType = 'A') {
+      const upper = String(value || fallbackType || '').trim().toUpperCase();
+      if (upper === 'AAAA') return 'AAAA';
+      if (upper === 'CNAME') return 'CNAME';
+      return 'A';
+    }
+
+    function createDnsEditorDraftRecord(type = 'A', overrides = {}) {
+      const source = overrides && typeof overrides === 'object' ? overrides : {};
+      return {
+        uid: String(source.uid || ('dns-draft-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8))),
+        id: String(source.id || ''),
+        type: normalizeDnsDraftType(type, source.type),
+        name: String(source.name || ''),
+        content: String(source.content || ''),
+        ttl: Number(source.ttl) || 1,
+        proxied: source.proxied === true
+      };
+    }
+
+    function cloneDnsEditorDraftRecord(record = {}, fallbackType = 'A') {
+      return createDnsEditorDraftRecord(normalizeDnsDraftType(record?.type, fallbackType), record);
+    }
+
+	    function normalizeRegionCodeCsv(value = '') {
+	      return [...new Set(String(value || '')
+	        .split(',')
+	        .map(item => item.trim().toUpperCase())
+	        .filter(Boolean))]
+	        .join(',');
+	    }
+
+	    function normalizeLogSearchMode(value = '') {
+	      return String(value || '').trim().toLowerCase() === 'fts' ? 'fts' : UI_DEFAULTS.logSearchMode;
+	    }
+
+	    const CONFIG_PREVIEW_SANITIZE_RULES = ${JSON.stringify(CONFIG_SANITIZE_RULES)};
 
     const CONFIG_FORM_BINDINGS = {
       ui: [
-        { key: 'uiRadiusPx', id: 'cfg-ui-radius-px', kind: 'int-finite', defaultValue: UI_DEFAULTS.uiRadiusPx }
+        { key: 'uiRadiusPx', id: 'cfg-ui-radius-px', kind: 'int-finite', defaultValue: UI_DEFAULTS.uiRadiusPx },
+        { key: 'settingsExperienceMode', id: 'cfg-settings-experience-mode', kind: 'or-default', defaultValue: UI_DEFAULTS.settingsExperienceMode }
       ],
       proxy: [
         { key: 'enableH2', id: 'cfg-enable-h2', kind: 'checkbox', checkboxMode: 'truthy' },
@@ -5728,14 +6722,14 @@ const UI_HTML = `<!DOCTYPE html>
         { key: 'protocolFallback', id: 'cfg-protocol-fallback', kind: 'checkbox', checkboxMode: 'defaultTrue' },
         { key: 'enablePrewarm', id: 'cfg-enable-prewarm', kind: 'checkbox', checkboxMode: 'defaultTrue' },
         { key: 'prewarmDepth', id: 'cfg-prewarm-depth', kind: 'or-default', defaultValue: UI_DEFAULTS.prewarmDepth },
-        { key: 'prewarmCacheTtl', id: 'cfg-prewarm-ttl', kind: 'int-or-default', loadMode: 'number-finite', defaultValue: UI_DEFAULTS.prewarmCacheTtl },
+        { key: 'prewarmCacheTtl', id: 'cfg-prewarm-ttl', kind: 'int-or-default', loadMode: 'number-finite', saveMode: 'int-finite', defaultValue: UI_DEFAULTS.prewarmCacheTtl },
         { key: 'directStaticAssets', id: 'cfg-direct-static-assets', kind: 'checkbox', checkboxMode: 'strictTrue' },
         { key: 'directHlsDash', id: 'cfg-direct-hls-dash', kind: 'checkbox', checkboxMode: 'strictTrue' },
         { key: 'sourceSameOriginProxy', id: 'cfg-source-same-origin-proxy', kind: 'checkbox', checkboxMode: 'defaultTrue' },
         { key: 'forceExternalProxy', id: 'cfg-force-external-proxy', kind: 'checkbox', checkboxMode: 'defaultTrue' },
         { key: 'wangpandirect', id: 'cfg-wangpandirect', kind: 'trim', loadMode: 'or-default', defaultValue: '${DEFAULT_WANGPAN_DIRECT_TEXT}' },
-        { key: 'pingTimeout', id: 'cfg-ping-timeout', kind: 'int-or-default', loadMode: 'number-finite', defaultValue: UI_DEFAULTS.pingTimeout },
-        { key: 'pingCacheMinutes', id: 'cfg-ping-cache-minutes', kind: 'int-or-default', loadMode: 'number-finite', defaultValue: UI_DEFAULTS.pingCacheMinutes },
+        { key: 'pingTimeout', id: 'cfg-ping-timeout', kind: 'int-or-default', loadMode: 'number-finite', saveMode: 'int-finite', defaultValue: UI_DEFAULTS.pingTimeout },
+        { key: 'pingCacheMinutes', id: 'cfg-ping-cache-minutes', kind: 'int-or-default', loadMode: 'number-finite', saveMode: 'int-finite', defaultValue: UI_DEFAULTS.pingCacheMinutes },
         { key: 'nodePanelPingAutoSort', id: 'cfg-node-panel-ping-auto-sort', kind: 'checkbox', checkboxMode: 'strictTrue' },
         { key: 'upstreamTimeoutMs', id: 'cfg-upstream-timeout-ms', kind: 'int-finite', defaultValue: UI_DEFAULTS.upstreamTimeoutMs },
         { key: 'upstreamRetryAttempts', id: 'cfg-upstream-retry-attempts', kind: 'int-finite', defaultValue: UI_DEFAULTS.upstreamRetryAttempts }
@@ -5745,10 +6739,11 @@ const UI_HTML = `<!DOCTYPE html>
         { key: 'geoBlocklist', id: 'cfg-geo-block', kind: 'text', defaultValue: '' },
         { key: 'ipBlacklist', id: 'cfg-ip-black', kind: 'text', defaultValue: '' },
         { key: 'rateLimitRpm', id: 'cfg-rate-limit', kind: 'int-or-default', loadMode: 'or-default', defaultValue: 0, loadDefaultValue: '' },
-        { key: 'cacheTtlImages', id: 'cfg-cache-ttl', kind: 'int-or-default', defaultValue: 30 },
+        { key: 'cacheTtlImages', id: 'cfg-cache-ttl', kind: 'int-or-default', loadMode: 'number-finite', saveMode: 'int-finite', defaultValue: 30 },
         { key: 'corsOrigins', id: 'cfg-cors', kind: 'text', defaultValue: '' }
       ],
       logs: [
+        { key: 'logSearchMode', id: 'cfg-log-search-mode', kind: 'or-default', defaultValue: UI_DEFAULTS.logSearchMode },
         { key: 'logRetentionDays', id: 'cfg-log-days', kind: 'int-finite', defaultValue: UI_DEFAULTS.logRetentionDays },
         { key: 'logWriteDelayMinutes', id: 'cfg-log-delay', kind: 'float-finite', defaultValue: UI_DEFAULTS.logWriteDelayMinutes },
         { key: 'logFlushCountThreshold', id: 'cfg-log-flush-count', kind: 'int-finite', defaultValue: UI_DEFAULTS.logFlushCountThreshold },
@@ -5779,8 +6774,20 @@ const UI_HTML = `<!DOCTYPE html>
       account: CONFIG_FORM_BINDINGS.account.map(item => item.key)
     };
 
+    const CONFIG_PANEL_FIELDS = {
+      ui: CONFIG_SECTION_FIELDS.ui,
+      proxy: CONFIG_SECTION_FIELDS.proxy,
+      cache: ['cacheTtlImages', 'corsOrigins'],
+      security: ['geoAllowlist', 'geoBlocklist', 'ipBlacklist', 'rateLimitRpm'],
+      logs: ['logSearchMode', 'logRetentionDays', 'logWriteDelayMinutes', 'logFlushCountThreshold', 'logBatchChunkSize', 'logBatchRetryCount', 'logBatchRetryBackoffMs', 'scheduledLeaseMs'],
+      monitoring: ['tgBotToken', 'tgChatId', 'tgAlertDroppedBatchThreshold', 'tgAlertFlushRetryThreshold', 'tgAlertOnScheduledFailure', 'tgAlertCooldownMinutes'],
+      account: CONFIG_SECTION_FIELDS.account,
+      backup: []
+    };
+
     const CONFIG_FIELD_LABELS = {
       uiRadiusPx: 'UI 圆角弧度（px）',
+      settingsExperienceMode: '设置操作视图',
       enableH2: 'HTTP/2',
       enableH3: 'HTTP/3',
       peakDowngrade: '晚高峰降级兜底',
@@ -5803,8 +6810,9 @@ const UI_HTML = `<!DOCTYPE html>
       geoBlocklist: '国家/地区黑名单',
       ipBlacklist: 'IP 黑名单',
       rateLimitRpm: '单 IP 限速',
-      cacheTtlImages: '图片缓存时长',
+      cacheTtlImages: '静态资源缓存时长',
       corsOrigins: 'CORS 白名单',
+      logSearchMode: '日志搜索模式',
       logRetentionDays: '日志保存天数',
       logWriteDelayMinutes: '日志写入延迟',
       logFlushCountThreshold: '日志提前写入阈值',
@@ -5839,19 +6847,20 @@ const UI_HTML = `<!DOCTYPE html>
         peakDowngrade: true,
         protocolFallback: true,
         enablePrewarm: true,
-        prewarmDepth: 'poster_manifest',
-        prewarmCacheTtl: 180,
-        directStaticAssets: true,
-        directHlsDash: true,
+        prewarmDepth: 'poster',
+        prewarmCacheTtl: 120,
+        directStaticAssets: false,
+        directHlsDash: false,
         sourceSameOriginProxy: true,
         forceExternalProxy: true,
         pingTimeout: 5000,
         pingCacheMinutes: 10,
         nodePanelPingAutoSort: false,
-        upstreamTimeoutMs: 30000,
-        upstreamRetryAttempts: 1
+        upstreamTimeoutMs: 8000,
+        upstreamRetryAttempts: 0
       },
       logs: {
+        logSearchMode: 'like',
         logRetentionDays: 7,
         logWriteDelayMinutes: 20,
         logFlushCountThreshold: 50,
@@ -5975,770 +6984,920 @@ const UI_HTML = `<!DOCTYPE html>
       };
     }
 
-    const UiBridge = {
-      navItems: NAV_ITEMS,
-      currentHash: '#dashboard',
-      pageTitle: '加载中...',
-      sidebarOpen: false,
-      isDarkTheme: false,
-      isDesktopViewport: false,
-      isDesktopSettingsLayout: false,
-      contentScrollResetKey: 0,
-      settingsScrollResetKey: 0,
-      uiRadiusCssValue: '24px',
-      activeSettingsTab: 'ui',
-      nodeSearchKeyword: '',
-      nodes: [],
-      filteredNodes: [],
-      settingsForm: {},
-      settingsDirectNodeSearch: '',
-      settingsSourceDirectNodes: [],
-      proxySettingsGuardrails: { ...DEFAULT_PROXY_GUARDRAILS },
-      nodeHealth: {},
-      nodesHealthCheckPending: false,
-      nodePingPending: {},
-      nodeMutationSeq: 0,
-      nodeMutationVersion: {},
-      pageLoadSeq: 0,
-      logPage: 1,
-      logTotalPages: 1,
-      logRows: [],
-      logSearchKeyword: '',
-      logStartDate: '',
-      logEndDate: '',
-      logTimeTick: 0,
-      logsPlaybackModeFilter: '',
-      dnsRecords: [],
-      dnsZone: null,
-      dnsZoneHintText: '当前站点：加载中...',
-      dnsCurrentHost: '',
-      dnsTotalRecordCount: 0,
-      dnsEmptyText: '暂无 DNS 记录',
-      dnsHistoryLimit: 10,
-      dnsBatchSaving: false,
-      dnsLoadSeq: 0,
-      dashboardSeries: [],
-      dashboardLoadSeq: 0,
-      dashboardView: {
-        requests: {
-          count: '0',
-          hint: ' ',
-          title: '',
-          badges: [{ label: '待加载', tone: 'slate' }],
-          embyMetrics: '请求: 播放请求 0 次 | 获取播放信息 0 次'
+    function createGeoFirewallConflictState() {
+      return {
+        active: false,
+        allowlist: '',
+        blocklist: '',
+        baselineMode: 'allowlist',
+        baselineRegions: ''
+      };
+    }
+
+    function createUiFoundationStore() {
+      return {
+        navItems: NAV_ITEMS,
+        currentHash: '#dashboard',
+        pageTitle: '加载中...',
+        sidebarOpen: false,
+        isDarkTheme: false,
+        isDesktopViewport: false,
+        isDesktopSettingsLayout: false,
+        contentScrollResetKey: 0,
+        settingsScrollResetKey: 0,
+        settingsExperienceMode: 'novice',
+        uiRadiusCssValue: '10px',
+        activeSettingsTab: 'ui',
+        nodeSearchKeyword: '',
+        nodeTagFilterPanelOpen: false,
+        activeNodeTagFilter: '',
+        nodeTagFilterOptions: [],
+        nodes: [],
+        filteredNodes: [],
+        settingsForm: {},
+        settingsGeoConflictState: createGeoFirewallConflictState(),
+        settingsDirectNodeSearch: '',
+        settingsSourceDirectNodes: [],
+        proxySettingsGuardrails: { ...DEFAULT_PROXY_GUARDRAILS },
+        nodeHealth: {},
+        nodesHealthCheckPending: false,
+        nodePingPending: {},
+        nodeMutationSeq: 0,
+        nodeMutationVersion: {},
+        pageLoadSeq: 0,
+        logPage: 1,
+        logTotalPages: 1,
+        logRows: [],
+        logSearchKeyword: '',
+        logStartDate: '',
+        logEndDate: '',
+        logTimeTick: 0,
+        logsPlaybackModeFilter: '',
+        dnsRecords: [],
+        dnsEditMode: 'cname',
+        dnsOriginalEditMode: 'cname',
+        dnsDraftCname: createDnsEditorDraftRecord('CNAME'),
+        dnsOriginalCname: createDnsEditorDraftRecord('CNAME'),
+        dnsAddressDrafts: [createDnsEditorDraftRecord('A')],
+        dnsOriginalAddressDrafts: [],
+        dnsHistoryEntries: [],
+        dnsZone: null,
+        dnsZoneHintText: '当前站点：加载中...',
+        dnsCurrentHost: '',
+        dnsTotalRecordCount: 0,
+        dnsEmptyText: '暂无 DNS 记录',
+        dnsHistoryLimit: 5,
+        dnsBatchSaving: false,
+        dnsLoadSeq: 0,
+        runtimeConfig: {},
+        configSnapshots: [],
+        runtimeStatus: {},
+        loginPromise: null
+      };
+    }
+
+    function createUiDashboardStore() {
+      return {
+        dashboardSeries: [],
+        dashboardLoadSeq: 0,
+        dashboardView: {
+          requests: {
+            count: '0',
+            hint: ' ',
+            title: '',
+            badges: [{ label: '待加载', tone: 'slate' }],
+            embyMetrics: '请求: 播放请求 0 次 | 获取播放信息 0 次'
+          },
+          traffic: {
+            count: '0 B',
+            hint: ' ',
+            title: '',
+            badges: [{ label: '待加载', tone: 'slate' }],
+            detail: ' '
+          },
+          nodes: {
+            count: '0',
+            meta: ' ',
+            badges: [{ label: '待加载', tone: 'slate' }]
+          }
         },
-        traffic: {
-          count: '0 B',
-          hint: ' ',
-          title: '',
-          badges: [{ label: '待加载', tone: 'slate' }],
-          detail: ' '
-        },
-        nodes: {
-          count: '0',
-          meta: ' ',
-          badges: [{ label: '待加载', tone: 'slate' }]
-        }
-      },
-      dashboardRuntimeView: {
-        updatedText: '最近同步：未加载',
-        logCard: {
-          title: '日志写入',
-          status: 'idle',
-          summary: '日志写入状态加载中...',
-          lines: [],
-          detail: ''
-        },
-        scheduledCard: {
-          title: '定时任务',
-          status: 'idle',
-          summary: '定时任务状态加载中...',
-          lines: [],
-          detail: ''
-        }
-      },
-      runtimeConfig: {},
-      configSnapshots: [],
-      runtimeStatus: {},
-      loginPromise: null,
-      downloadHref: '',
-      downloadFilename: '',
-      downloadTriggerKey: 0,
-      downloadCleanupTimer: null,
-      nodeModalOpen: false,
-      nodeModalSubmitting: false,
-      nodeModalPingAllPending: false,
-      nodeModalPingAllText: '一键测试延迟',
-      nodeModalForm: createEmptyNodeModalForm(),
-      nodeModalFeedback: createNodeModalFeedbackState(),
-      nodeModalValidation: createNodeModalValidationState(),
-      nodeModalPathManual: false,
-      nodeModalLastDisplayName: '',
-      nodeModalLines: [],
-      nodeLineDragId: '',
-      nodeLineDropHint: null,
-      toastState: createToastState(),
-      toastTimer: null,
-      messageDialog: createMessageDialogState(),
-      messageDialogResolver: null,
-      confirmDialog: createConfirmDialogState(),
-      confirmDialogResolver: null,
-      promptDialog: createPromptDialogState(),
-      promptDialogResolver: null,
-
-      normalizeUiMessage(message) {
-        return String(message == null ? '' : message).trim();
-      },
-
-      getToastToneClass(tone = 'info') {
-        const palette = {
-          info: 'border-slate-200 bg-white/95 text-slate-700 dark:border-slate-700 dark:bg-slate-900/95 dark:text-slate-100',
-          success: 'border-emerald-200 bg-emerald-50/95 text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/90 dark:text-emerald-200',
-          warning: 'border-amber-200 bg-amber-50/95 text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/90 dark:text-amber-200',
-          error: 'border-red-200 bg-red-50/95 text-red-700 dark:border-red-900/40 dark:bg-red-950/90 dark:text-red-200'
-        };
-        return palette[tone] || palette.info;
-      },
-
-      getNodeModalFeedbackClass(tone = 'info') {
-        const palette = {
-          info: 'border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-900/40 dark:bg-sky-950/40 dark:text-sky-200',
-          success: 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/40 dark:text-emerald-200',
-          warning: 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/40 dark:text-amber-200',
-          error: 'border-red-200 bg-red-50 text-red-700 dark:border-red-900/40 dark:bg-red-950/40 dark:text-red-200'
-        };
-        return palette[tone] || palette.info;
-      },
-
-      clearNodeModalFeedback() {
-        this.nodeModalFeedback = createNodeModalFeedbackState();
-      },
-
-      clearNodeModalValidation() {
-        this.nodeModalValidation = createNodeModalValidationState();
-      },
-
-      setNodeModalFieldError(field, message) {
-        const text = this.normalizeUiMessage(message);
-        const nextValidation = {
-          ...createNodeModalValidationState(),
-          ...(this.nodeModalValidation && typeof this.nodeModalValidation === 'object' ? this.nodeModalValidation : {})
-        };
-        if (field === 'lineTargets') {
-          nextValidation.lineTargets = text && message && typeof message === 'object'
-            ? { ...message }
-            : { ...(nextValidation.lineTargets || {}) };
-        } else if (field === 'lineTargetsMap' && message && typeof message === 'object') {
-          nextValidation.lineTargets = { ...message };
-        } else {
-          nextValidation[field] = text;
-        }
-        this.nodeModalValidation = nextValidation;
-        return text;
-      },
-
-      clearNodeModalFieldError(field, lineId = '') {
-        const nextValidation = {
-          ...createNodeModalValidationState(),
-          ...(this.nodeModalValidation && typeof this.nodeModalValidation === 'object' ? this.nodeModalValidation : {})
-        };
-        if (field === 'lineTarget') {
-          const nextLineTargets = { ...(nextValidation.lineTargets || {}) };
-          delete nextLineTargets[String(lineId || '')];
-          nextValidation.lineTargets = nextLineTargets;
-          if (!Object.keys(nextLineTargets).length && nextValidation.lines) nextValidation.lines = '';
-        } else {
-          nextValidation[field] = '';
-        }
-        this.nodeModalValidation = nextValidation;
-      },
-
-      getNodeModalFieldError(field) {
-        return String(this.nodeModalValidation?.[field] || '').trim();
-      },
-
-      getNodeModalLineTargetError(lineId) {
-        return String(this.nodeModalValidation?.lineTargets?.[String(lineId || '')] || '').trim();
-      },
-
-      getNodeModalFieldClass(field) {
-        return this.getNodeModalFieldError(field)
-          ? 'border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-950/30'
-          : '';
-      },
-
-      getNodeModalLineTargetClass(lineId) {
-        return this.getNodeModalLineTargetError(lineId)
-          ? 'border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-950/30'
-          : '';
-      },
-
-      getNodeModalLinesPanelClass() {
-        return this.getNodeModalFieldError('lines')
-          ? 'border-red-300 dark:border-red-800 bg-red-50/70 dark:bg-red-950/20'
-          : 'border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-950/50';
-      },
-
-      setNodeModalFeedback(message, tone = 'info') {
-        const text = this.normalizeUiMessage(message);
-        this.nodeModalFeedback = {
-          message: text,
-          tone: String(tone || 'info') || 'info'
-        };
-        return text;
-      },
-
-      getNodeModalSubmitText() {
-        if (this.nodeModalSubmitting) return '正在保存到 KV...';
-        return this.nodeModalForm.originalName ? '保存修改' : '创建节点';
-      },
-
-      normalizeNodePathInput(value) {
-        return String(value || '').trim().toLowerCase();
-      },
-
-      validateNodePath(value) {
-        return /^[a-z0-9_-]+$/.test(this.normalizeNodePathInput(value));
-      },
-
-      getNodePathRuleText() {
-        return '节点路径仅支持小写字母、数字、-、_，且不能包含斜杠或空格';
-      },
-
-      getDialogConfirmButtonClass(tone = 'info') {
-        const palette = {
-          info: 'bg-brand-600 hover:bg-brand-700 text-white',
-          success: 'bg-emerald-600 hover:bg-emerald-700 text-white',
-          warning: 'bg-amber-600 hover:bg-amber-700 text-white',
-          error: 'bg-red-600 hover:bg-red-700 text-white',
-          danger: 'bg-red-600 hover:bg-red-700 text-white'
-        };
-        return palette[tone] || palette.info;
-      },
-
-      clearToastTimer() {
-        if (this.toastTimer) {
-          uiBrowserBridge.clearTimer(this.toastTimer);
-          this.toastTimer = null;
-        }
-      },
-
-      dismissToast() {
-        this.clearToastTimer();
-        this.toastState = createToastState();
-      },
-
-      showToast(message, tone = 'info', duration = 2600) {
-        const text = this.normalizeUiMessage(message);
-        if (!text) return Promise.resolve(false);
-        this.clearToastTimer();
-        this.toastState = {
-          visible: true,
-          message: text,
-          tone: String(tone || 'info') || 'info'
-        };
-        this.toastTimer = uiBrowserBridge.startTimer(() => this.dismissToast(), Math.max(1200, Number(duration) || 2600));
-        return Promise.resolve(true);
-      },
-
-      closeMessageDialog(result = true) {
-        const resolve = this.messageDialogResolver;
-        this.messageDialogResolver = null;
-        this.messageDialog = createMessageDialogState();
-        if (typeof resolve === 'function') resolve(result);
-        return result;
-      },
-
-      openMessageDialog(message, options = {}) {
-        const text = this.normalizeUiMessage(message);
-        if (!text) return Promise.resolve(false);
-        if (typeof this.messageDialogResolver === 'function') this.messageDialogResolver(true);
-        this.messageDialog = {
-          ...createMessageDialogState(),
-          open: true,
-          title: this.normalizeUiMessage(options.title) || '提示',
-          message: text,
-          tone: String(options.tone || 'info') || 'info',
-          confirmText: this.normalizeUiMessage(options.confirmText) || '知道了'
-        };
-        return new Promise(resolve => {
-          this.messageDialogResolver = resolve;
-        });
-      },
-
-      showMessage(message, options = {}) {
-        const text = this.normalizeUiMessage(message);
-        if (!text) return Promise.resolve(false);
-        const useModal = options.modal === true || text.includes('\\n') || text.length > 96;
-        if (!useModal) return this.showToast(text, options.tone || 'info', options.duration);
-        return this.openMessageDialog(text, options);
-      },
-
-      resolveConfirmDialog(result = false) {
-        const resolve = this.confirmDialogResolver;
-        this.confirmDialogResolver = null;
-        this.confirmDialog = createConfirmDialogState();
-        if (typeof resolve === 'function') resolve(result === true);
-        return result === true;
-      },
-
-      askConfirm(message, options = {}) {
-        const text = this.normalizeUiMessage(message);
-        if (!text) return Promise.resolve(false);
-        if (typeof this.confirmDialogResolver === 'function') this.confirmDialogResolver(false);
-        this.confirmDialog = {
-          ...createConfirmDialogState(),
-          open: true,
-          title: this.normalizeUiMessage(options.title) || '请确认',
-          message: text,
-          tone: String(options.tone || 'warning') || 'warning',
-          confirmText: this.normalizeUiMessage(options.confirmText) || '确认',
-          cancelText: this.normalizeUiMessage(options.cancelText) || '取消'
-        };
-        return new Promise(resolve => {
-          this.confirmDialogResolver = resolve;
-        });
-      },
-
-      closePromptDialog(result = null) {
-        const resolve = this.promptDialogResolver;
-        this.promptDialogResolver = null;
-        const finalValue = result == null ? null : String(result);
-        this.promptDialog = createPromptDialogState();
-        if (typeof resolve === 'function') resolve(finalValue);
-        return finalValue;
-      },
-
-      askPrompt(options = {}) {
-        if (typeof this.promptDialogResolver === 'function') this.promptDialogResolver(null);
-        this.promptDialog = {
-          ...createPromptDialogState(),
-          open: true,
-          title: this.normalizeUiMessage(options.title) || '请输入',
-          message: this.normalizeUiMessage(options.message) || '请输入内容',
-          value: String(options.defaultValue || ''),
-          placeholder: String(options.placeholder || ''),
-          tone: String(options.tone || 'info') || 'info',
-          inputType: options.inputType === 'password' ? 'password' : 'text',
-          confirmText: this.normalizeUiMessage(options.confirmText) || '确认',
-          cancelText: this.normalizeUiMessage(options.cancelText) || '取消',
-          required: options.required === true
-        };
-        return new Promise(resolve => {
-          this.promptDialogResolver = resolve;
-        });
-      },
-
-      submitPromptDialog() {
-        const value = String(this.promptDialog.value || '');
-        if (this.promptDialog.required && !value.trim()) {
-          this.showToast('请输入必填内容', 'warning');
-          return;
-        }
-        this.closePromptDialog(value);
-      },
-
-      revokeDownloadUrl() {
-        if (this.downloadCleanupTimer) {
-          uiBrowserBridge.clearTimer(this.downloadCleanupTimer);
-          this.downloadCleanupTimer = null;
-        }
-        const currentHref = String(this.downloadHref || '');
-        if (currentHref.startsWith('blob:')) {
-          uiBrowserBridge.revokeObjectUrl(currentHref);
-        }
-        this.downloadHref = '';
-        this.downloadFilename = '';
-      },
-
-      triggerDownload(url, filename) {
-        this.revokeDownloadUrl();
-        this.downloadHref = String(url || '');
-        this.downloadFilename = String(filename || '');
-        this.downloadTriggerKey += 1;
-        this.downloadCleanupTimer = uiBrowserBridge.startTimer(() => this.revokeDownloadUrl(), 1000);
-        return Promise.resolve({
-          href: this.downloadHref,
-          filename: this.downloadFilename
-        });
-      },
-
-      getConfigBindingByKey(key) {
-        return CONFIG_BINDING_BY_KEY[key] || null;
-      },
-
-      getCurrentRouteHash(fallback = '#dashboard') {
-        return String(this.currentHash || uiBrowserBridge.readHash(fallback) || fallback || '#dashboard');
-      },
-
-      hasSettingsFieldValue(key) {
-        return Object.prototype.hasOwnProperty.call(this.settingsForm || {}, key);
-      },
-
-      getEffectiveSettingValue(key) {
-        const binding = this.getConfigBindingByKey(key);
-        if (!binding) return undefined;
-        if (this.hasSettingsFieldValue(key)) return this.readConfigBindingFromState(binding);
-        return this.resolveConfigBindingInputValue(binding, this.runtimeConfig || {});
-      },
-
-      clampSettingsNumberInput(element) {
-        if (!element) return;
-        const raw = String(element.value || '').trim();
-        if (!raw) return;
-        let next = Number(raw);
-        if (!Number.isFinite(next)) {
-          element.value = '';
-          return;
-        }
-        const min = Number(element.min);
-        const max = Number(element.max);
-        if (Number.isFinite(min)) next = Math.max(min, next);
-        if (Number.isFinite(max)) next = Math.min(max, next);
-        const step = String(element.step || '').trim();
-        if (step && step !== 'any') {
-          const stepValue = Number(step);
-          if (Number.isFinite(stepValue) && stepValue > 0) {
-            const base = Number.isFinite(min) ? min : 0;
-            const steps = Math.round((next - base) / stepValue);
-            next = base + (steps * stepValue);
-            if (Number.isFinite(min)) next = Math.max(min, next);
-            if (Number.isFinite(max)) next = Math.min(max, next);
+        dashboardRuntimeView: {
+          updatedText: '最近同步：未加载',
+          logCard: {
+            title: '日志写入',
+            status: 'idle',
+            summary: '日志写入状态加载中...',
+            lines: [],
+            detail: ''
+          },
+          scheduledCard: {
+            title: '定时任务',
+            status: 'idle',
+            summary: '定时任务状态加载中...',
+            lines: [],
+            detail: ''
           }
         }
-        element.value = step.includes('.') ? String(next) : String(Math.trunc(next));
-      },
+      };
+    }
 
-      normalizeSettingsNumberInputs() {
-        this.settingsForm = { ...this.settingsForm };
-      },
+    function createUiDialogStore() {
+      return {
+        downloadHref: '',
+        downloadFilename: '',
+        downloadTriggerKey: 0,
+        downloadCleanupTimer: null,
+        toastState: createToastState(),
+        toastTimer: null,
+        messageDialog: createMessageDialogState(),
+        messageDialogResolver: null,
+        confirmDialog: createConfirmDialogState(),
+        confirmDialogResolver: null,
+        promptDialog: createPromptDialogState(),
+        promptDialogResolver: null,
 
-      syncProxySettingsGuardrails() {
-        const directStatic = this.readConfigBindingFromState(this.getConfigBindingByKey('directStaticAssets')) === true;
-        const directHlsDash = this.readConfigBindingFromState(this.getConfigBindingByKey('directHlsDash')) === true;
-        const prewarmDepthBinding = this.getConfigBindingByKey('prewarmDepth');
-        const rawPrewarmDepth = this.readConfigBindingFromState(prewarmDepthBinding);
-        const prewarmDepth = String(rawPrewarmDepth || UI_DEFAULTS.prewarmDepth).trim().toLowerCase() === 'poster' ? 'poster' : 'poster_manifest';
-        const direct307Enabled = directStatic || directHlsDash;
+        normalizeUiMessage(message) {
+          return String(message == null ? '' : message).trim();
+        },
 
-        if (direct307Enabled) {
+        getToastToneClass(tone = 'info') {
+          const palette = {
+            info: 'border-slate-200 bg-white/95 text-slate-700 dark:border-slate-700 dark:bg-slate-900/95 dark:text-slate-100',
+            success: 'border-emerald-200 bg-emerald-50/95 text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/90 dark:text-emerald-200',
+            warning: 'border-amber-200 bg-amber-50/95 text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/90 dark:text-amber-200',
+            error: 'border-red-200 bg-red-50/95 text-red-700 dark:border-red-900/40 dark:bg-red-950/90 dark:text-red-200'
+          };
+          return palette[tone] || palette.info;
+        },
+
+        getDialogConfirmButtonClass(tone = 'info') {
+          const palette = {
+            info: 'bg-brand-600 hover:bg-brand-700 text-white',
+            success: 'bg-emerald-600 hover:bg-emerald-700 text-white',
+            warning: 'bg-amber-600 hover:bg-amber-700 text-white',
+            error: 'bg-red-600 hover:bg-red-700 text-white',
+            danger: 'bg-red-600 hover:bg-red-700 text-white'
+          };
+          return palette[tone] || palette.info;
+        },
+
+        clearToastTimer() {
+          if (this.toastTimer) {
+            uiBrowserBridge.clearTimer(this.toastTimer);
+            this.toastTimer = null;
+          }
+        },
+
+        dismissToast() {
+          this.clearToastTimer();
+          this.toastState = createToastState();
+        },
+
+        showToast(message, tone = 'info', duration = 2600) {
+          const text = this.normalizeUiMessage(message);
+          if (!text) return Promise.resolve(false);
+          this.clearToastTimer();
+          this.toastState = {
+            visible: true,
+            message: text,
+            tone: String(tone || 'info') || 'info'
+          };
+          this.toastTimer = uiBrowserBridge.startTimer(() => this.dismissToast(), Math.max(1200, Number(duration) || 2600));
+          return Promise.resolve(true);
+        },
+
+        closeMessageDialog(result = true) {
+          const resolve = this.messageDialogResolver;
+          this.messageDialogResolver = null;
+          this.messageDialog = createMessageDialogState();
+          if (typeof resolve === 'function') resolve(result);
+          return result;
+        },
+
+        openMessageDialog(message, options = {}) {
+          const text = this.normalizeUiMessage(message);
+          if (!text) return Promise.resolve(false);
+          if (typeof this.messageDialogResolver === 'function') this.messageDialogResolver(true);
+          this.messageDialog = {
+            ...createMessageDialogState(),
+            open: true,
+            title: this.normalizeUiMessage(options.title) || '提示',
+            message: text,
+            tone: String(options.tone || 'info') || 'info',
+            confirmText: this.normalizeUiMessage(options.confirmText) || '知道了'
+          };
+          return new Promise(resolve => {
+            this.messageDialogResolver = resolve;
+          });
+        },
+
+        showMessage(message, options = {}) {
+          const text = this.normalizeUiMessage(message);
+          if (!text) return Promise.resolve(false);
+          const useModal = options.modal === true || text.includes('\\n') || text.length > 96;
+          if (!useModal) return this.showToast(text, options.tone || 'info', options.duration);
+          return this.openMessageDialog(text, options);
+        },
+
+        resolveConfirmDialog(result = false) {
+          const resolve = this.confirmDialogResolver;
+          this.confirmDialogResolver = null;
+          this.confirmDialog = createConfirmDialogState();
+          if (typeof resolve === 'function') resolve(result === true);
+          return result === true;
+        },
+
+        askConfirm(message, options = {}) {
+          const text = this.normalizeUiMessage(message);
+          if (!text) return Promise.resolve(false);
+          if (typeof this.confirmDialogResolver === 'function') this.confirmDialogResolver(false);
+          this.confirmDialog = {
+            ...createConfirmDialogState(),
+            open: true,
+            title: this.normalizeUiMessage(options.title) || '请确认',
+            message: text,
+            tone: String(options.tone || 'warning') || 'warning',
+            confirmText: this.normalizeUiMessage(options.confirmText) || '确认',
+            cancelText: this.normalizeUiMessage(options.cancelText) || '取消'
+          };
+          return new Promise(resolve => {
+            this.confirmDialogResolver = resolve;
+          });
+        },
+
+        closePromptDialog(result = null) {
+          const resolve = this.promptDialogResolver;
+          this.promptDialogResolver = null;
+          const finalValue = result == null ? null : String(result);
+          this.promptDialog = createPromptDialogState();
+          if (typeof resolve === 'function') resolve(finalValue);
+          return finalValue;
+        },
+
+        askPrompt(options = {}) {
+          if (typeof this.promptDialogResolver === 'function') this.promptDialogResolver(null);
+          this.promptDialog = {
+            ...createPromptDialogState(),
+            open: true,
+            title: this.normalizeUiMessage(options.title) || '请输入',
+            message: this.normalizeUiMessage(options.message) || '请输入内容',
+            value: String(options.defaultValue || ''),
+            placeholder: String(options.placeholder || ''),
+            tone: String(options.tone || 'info') || 'info',
+            inputType: options.inputType === 'password' ? 'password' : 'text',
+            confirmText: this.normalizeUiMessage(options.confirmText) || '确认',
+            cancelText: this.normalizeUiMessage(options.cancelText) || '取消',
+            required: options.required === true
+          };
+          return new Promise(resolve => {
+            this.promptDialogResolver = resolve;
+          });
+        },
+
+        submitPromptDialog() {
+          const value = String(this.promptDialog.value || '');
+          if (this.promptDialog.required && !value.trim()) {
+            this.showToast('请输入必填内容', 'warning');
+            return;
+          }
+          this.closePromptDialog(value);
+        },
+
+        revokeDownloadUrl() {
+          if (this.downloadCleanupTimer) {
+            uiBrowserBridge.clearTimer(this.downloadCleanupTimer);
+            this.downloadCleanupTimer = null;
+          }
+          const currentHref = String(this.downloadHref || '');
+          if (currentHref.startsWith('blob:')) {
+            uiBrowserBridge.revokeObjectUrl(currentHref);
+          }
+          this.downloadHref = '';
+          this.downloadFilename = '';
+        },
+
+        triggerDownload(url, filename) {
+          this.revokeDownloadUrl();
+          this.downloadHref = String(url || '');
+          this.downloadFilename = String(filename || '');
+          this.downloadTriggerKey += 1;
+          this.downloadCleanupTimer = uiBrowserBridge.startTimer(() => this.revokeDownloadUrl(), 1000);
+          return Promise.resolve({
+            href: this.downloadHref,
+            filename: this.downloadFilename
+          });
+        }
+      };
+    }
+
+    function createUiNodeModalStore() {
+      return {
+        nodeModalOpen: false,
+        nodeModalSubmitting: false,
+        nodeModalPingAllPending: false,
+        nodeModalPingAllText: '一键测试延迟',
+        nodeModalForm: createEmptyNodeModalForm(),
+        nodeModalFeedback: createNodeModalFeedbackState(),
+        nodeModalValidation: createNodeModalValidationState(),
+        nodeModalPathManual: false,
+        nodeModalLastDisplayName: '',
+        nodeModalLines: [],
+        nodeLineDragId: '',
+        nodeLineDropHint: null,
+
+        getNodeModalFeedbackClass(tone = 'info') {
+          const palette = {
+            info: 'border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-900/40 dark:bg-sky-950/40 dark:text-sky-200',
+            success: 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/40 dark:text-emerald-200',
+            warning: 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/40 dark:text-amber-200',
+            error: 'border-red-200 bg-red-50 text-red-700 dark:border-red-900/40 dark:bg-red-950/40 dark:text-red-200'
+          };
+          return palette[tone] || palette.info;
+        },
+
+        clearNodeModalFeedback() {
+          this.nodeModalFeedback = createNodeModalFeedbackState();
+        },
+
+        clearNodeModalValidation() {
+          this.nodeModalValidation = createNodeModalValidationState();
+        },
+
+        setNodeModalFieldError(field, message) {
+          const text = this.normalizeUiMessage(message);
+          const nextValidation = {
+            ...createNodeModalValidationState(),
+            ...(this.nodeModalValidation && typeof this.nodeModalValidation === 'object' ? this.nodeModalValidation : {})
+          };
+          if (field === 'lineTargets') {
+            nextValidation.lineTargets = text && message && typeof message === 'object'
+              ? { ...message }
+              : { ...(nextValidation.lineTargets || {}) };
+          } else if (field === 'lineTargetsMap' && message && typeof message === 'object') {
+            nextValidation.lineTargets = { ...message };
+          } else {
+            nextValidation[field] = text;
+          }
+          this.nodeModalValidation = nextValidation;
+          return text;
+        },
+
+        clearNodeModalFieldError(field, lineId = '') {
+          const nextValidation = {
+            ...createNodeModalValidationState(),
+            ...(this.nodeModalValidation && typeof this.nodeModalValidation === 'object' ? this.nodeModalValidation : {})
+          };
+          if (field === 'lineTarget') {
+            const nextLineTargets = { ...(nextValidation.lineTargets || {}) };
+            delete nextLineTargets[String(lineId || '')];
+            nextValidation.lineTargets = nextLineTargets;
+            if (!Object.keys(nextLineTargets).length && nextValidation.lines) nextValidation.lines = '';
+          } else {
+            nextValidation[field] = '';
+          }
+          this.nodeModalValidation = nextValidation;
+        },
+
+        getNodeModalFieldError(field) {
+          return String(this.nodeModalValidation?.[field] || '').trim();
+        },
+
+        getNodeModalLineTargetError(lineId) {
+          return String(this.nodeModalValidation?.lineTargets?.[String(lineId || '')] || '').trim();
+        },
+
+        getNodeModalFieldClass(field) {
+          return this.getNodeModalFieldError(field)
+            ? 'border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-950/30'
+            : '';
+        },
+
+        getNodeModalLineTargetClass(lineId) {
+          return this.getNodeModalLineTargetError(lineId)
+            ? 'border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-950/30'
+            : '';
+        },
+
+        getNodeModalLinesPanelClass() {
+          return this.getNodeModalFieldError('lines')
+            ? 'border-red-300 dark:border-red-800 bg-red-50/70 dark:bg-red-950/20'
+            : 'border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-950/50';
+        },
+
+        setNodeModalFeedback(message, tone = 'info') {
+          const text = this.normalizeUiMessage(message);
+          this.nodeModalFeedback = {
+            message: text,
+            tone: String(tone || 'info') || 'info'
+          };
+          return text;
+        },
+
+        getNodeModalSubmitText() {
+          if (this.nodeModalSubmitting) return '正在保存到 KV...';
+          return this.nodeModalForm.originalName ? '保存修改' : '创建节点';
+        },
+
+        normalizeNodePathInput(value) {
+          return String(value || '').trim().toLowerCase();
+        },
+
+        validateNodePath(value) {
+          return /^[a-z0-9_-]+$/.test(this.normalizeNodePathInput(value));
+        },
+
+        getNodePathRuleText() {
+          return '节点路径仅支持小写字母、数字、-、_，且不能包含斜杠或空格';
+        }
+      };
+    }
+
+    function createUiConfigStore() {
+      return {
+        getConfigBindingByKey(key) {
+          return CONFIG_BINDING_BY_KEY[key] || null;
+        },
+
+        getCurrentRouteHash(fallback = '#dashboard') {
+          return String(this.currentHash || uiBrowserBridge.readHash(fallback) || fallback || '#dashboard');
+        },
+
+        hasSettingsFieldValue(key) {
+          return Object.prototype.hasOwnProperty.call(this.settingsForm || {}, key);
+        },
+
+        getEffectiveSettingValue(key) {
+          const binding = this.getConfigBindingByKey(key);
+          if (!binding) return undefined;
+          if (this.hasSettingsFieldValue(key)) return this.readConfigBindingFromState(binding);
+          return this.resolveConfigBindingInputValue(binding, this.runtimeConfig || {});
+        },
+
+        clampSettingsNumberInput(element) {
+          if (!element) return;
+          const raw = String(element.value || '').trim();
+          if (!raw) return;
+          let next = Number(raw);
+          if (!Number.isFinite(next)) {
+            element.value = '';
+            return;
+          }
+          const min = Number(element.min);
+          const max = Number(element.max);
+          if (Number.isFinite(min)) next = Math.max(min, next);
+          if (Number.isFinite(max)) next = Math.min(max, next);
+          const step = String(element.step || '').trim();
+          if (step && step !== 'any') {
+            const stepValue = Number(step);
+            if (Number.isFinite(stepValue) && stepValue > 0) {
+              const base = Number.isFinite(min) ? min : 0;
+              const steps = Math.round((next - base) / stepValue);
+              next = base + (steps * stepValue);
+              if (Number.isFinite(min)) next = Math.max(min, next);
+              if (Number.isFinite(max)) next = Math.min(max, next);
+            }
+          }
+          element.value = step.includes('.') ? String(next) : String(Math.trunc(next));
+        },
+
+        normalizeSettingsNumberInputs() {
+          this.settingsForm = { ...this.settingsForm };
+        },
+
+        syncProxySettingsGuardrails() {
+          const directStatic = this.readConfigBindingFromState(this.getConfigBindingByKey('directStaticAssets')) === true;
+          const directHlsDash = this.readConfigBindingFromState(this.getConfigBindingByKey('directHlsDash')) === true;
+          const prewarmDepthBinding = this.getConfigBindingByKey('prewarmDepth');
+          const rawPrewarmDepth = this.readConfigBindingFromState(prewarmDepthBinding);
+          const prewarmDepth = String(rawPrewarmDepth || UI_DEFAULTS.prewarmDepth).trim().toLowerCase() === 'poster' ? 'poster' : 'poster_manifest';
+          const direct307Enabled = directStatic || directHlsDash;
+
+          if (direct307Enabled) {
+            this.proxySettingsGuardrails = {
+              directHint: '已启用 307 直连分流。命中的静态 / HLS / DASH 资源会自动下沉到数据面直传，减少 Worker 长连接负担。',
+              prewarmHint: prewarmDepth === 'poster'
+                ? '当前只预热海报；由于已启用 HLS / DASH 直连，播放列表会直接走 307 分流，不再进入 Worker 元数据缓存。'
+                : '已启用 HLS / DASH 直连。海报与字幕仍可按需预热，但命中的播放列表会直接走 307 分流，不再占用 Worker 缓存通道。',
+              prefetchDisabled: false
+            };
+            return;
+          }
           this.proxySettingsGuardrails = {
-            directHint: '已启用 307 直连分流。命中的静态 / HLS / DASH 资源会自动下沉到数据面直传，减少 Worker 长连接负担。',
+            directHint: DEFAULT_PROXY_GUARDRAILS.directHint,
             prewarmHint: prewarmDepth === 'poster'
-              ? '当前只预热海报；由于已启用 HLS / DASH 直连，播放列表会直接走 307 分流，不再进入 Worker 元数据缓存。'
-              : '已启用 HLS / DASH 直连。海报与字幕仍可按需预热，但命中的播放列表会直接走 307 分流，不再占用 Worker 缓存通道。',
+              ? '当前只预热海报，不会额外拉取 m3u8 或字幕索引，更适合极度克制的 Worker 负载策略。'
+              : DEFAULT_PROXY_GUARDRAILS.prewarmHint,
             prefetchDisabled: false
           };
-          return;
-        }
-        this.proxySettingsGuardrails = {
-          directHint: DEFAULT_PROXY_GUARDRAILS.directHint,
-          prewarmHint: prewarmDepth === 'poster'
-            ? '当前只预热海报，不会额外拉取 m3u8 或字幕索引，更适合极度克制的 Worker 负载策略。'
-            : DEFAULT_PROXY_GUARDRAILS.prewarmHint,
-          prefetchDisabled: false
-        };
-      },
+        },
 
-      applyRuntimeConfig(cfg) {
-        this.runtimeConfig = cfg && typeof cfg === 'object' ? { ...cfg } : {};
-        this.applyUiRadius();
-      },
+        applyRuntimeConfig(cfg) {
+          this.runtimeConfig = cfg && typeof cfg === 'object' ? { ...cfg } : {};
+          this.settingsExperienceMode = this.normalizeSettingsExperienceMode(this.runtimeConfig?.settingsExperienceMode);
+          this.applyUiRadius();
+        },
 
-      applyUiRadius() {
-        const raw = Number(this.runtimeConfig?.uiRadiusPx);
-        const fallback = Number(UI_DEFAULTS.uiRadiusPx);
-        let next = Number.isFinite(raw) ? Math.trunc(raw) : fallback;
-        if (!Number.isFinite(next)) next = 24;
-        next = Math.max(0, Math.min(48, next));
-        this.uiRadiusCssValue = String(next) + 'px';
-      },
+        applyUiRadius() {
+          const raw = Number(this.runtimeConfig?.uiRadiusPx);
+          const fallback = Number(UI_DEFAULTS.uiRadiusPx);
+          let next = Number.isFinite(raw) ? Math.trunc(raw) : fallback;
+          if (!Number.isFinite(next)) next = 24;
+          next = Math.max(0, Math.min(48, next));
+          this.uiRadiusCssValue = String(next) + 'px';
+        },
 
-      getSettingsSectionLabel(section) {
-        const labels = {
-          ui: '系统 UI',
-          proxy: '代理与网络',
-          security: '缓存与安全',
-          logs: '日志与监控',
-          account: '账号与备份',
-          all: '全部分区'
-        };
-        return labels[section] || section || '未知分区';
-      },
-
-      getConfigFieldLabel(key) {
-        return CONFIG_FIELD_LABELS[key] || key;
-      },
-
-      getConfigFormBindings(section) {
-        return CONFIG_FORM_BINDINGS[section] || [];
-      },
-
-      getConfigBindingDefaultValue(binding, phase = 'save') {
-        if (phase === 'load' && Object.prototype.hasOwnProperty.call(binding || {}, 'loadDefaultValue')) {
-          return binding.loadDefaultValue;
-        }
-        return Object.prototype.hasOwnProperty.call(binding || {}, 'defaultValue') ? binding.defaultValue : '';
-      },
-
-      getConfigBindingMode(binding, phase = 'save') {
-        if (phase === 'load' && binding?.loadMode) return binding.loadMode;
-        if (phase === 'save' && binding?.saveMode) return binding.saveMode;
-        return binding?.kind || 'text';
-      },
-
-      resolveConfigBindingInputValue(binding, source = {}) {
-        const rawValue = source?.[binding.key];
-        const mode = this.getConfigBindingMode(binding, 'load');
-        const fallback = this.getConfigBindingDefaultValue(binding, 'load');
-        if (mode === 'checkbox') {
-          if (binding.checkboxMode === 'defaultTrue') return rawValue !== false;
-          if (binding.checkboxMode === 'truthy') return !!rawValue;
-          return rawValue === true;
-        }
-        if (mode === 'or-default') return rawValue || fallback;
-        if (mode === 'int-or-default') {
-          const num = parseInt(rawValue, 10);
-          return num || fallback;
-        }
-        if (mode === 'int-finite' || mode === 'number-finite') {
-          const num = Number(rawValue);
-          return Number.isFinite(num) ? num : fallback;
-        }
-        if (mode === 'float-finite') {
-          const num = Number(rawValue);
-          return Number.isFinite(num) ? num : fallback;
-        }
-        if (rawValue === undefined || rawValue === null) return fallback;
-        return String(rawValue);
-      },
-
-      resolveGeoFirewallFormState(source = {}) {
-        const geoAllowlist = normalizeRegionCodeCsv(source?.geoAllowlist || '');
-        const geoBlocklist = normalizeRegionCodeCsv(source?.geoBlocklist || '');
-        if (geoAllowlist) return { geoMode: 'allowlist', geoRegions: geoAllowlist };
-        if (geoBlocklist) return { geoMode: 'blocklist', geoRegions: geoBlocklist };
-        return {
-          geoMode: String(this.settingsForm?.geoMode || 'allowlist') === 'blocklist' ? 'blocklist' : 'allowlist',
-          geoRegions: ''
-        };
-      },
-
-      applyConfigSectionToForm(section, source = {}, options = {}) {
-        const onlyPresent = options.onlyPresent === true;
-        const nextSettingsForm = { ...this.settingsForm };
-        this.getConfigFormBindings(section).forEach(binding => {
-          if (onlyPresent && !Object.prototype.hasOwnProperty.call(source || {}, binding.key)) return;
-          nextSettingsForm[binding.key] = this.resolveConfigBindingInputValue(binding, source);
-        });
-        if (section === 'security') Object.assign(nextSettingsForm, this.resolveGeoFirewallFormState(source));
-        this.settingsForm = nextSettingsForm;
-      },
-
-      readConfigBindingFromState(binding) {
-        if (!binding) return undefined;
-        const rawValue = this.settingsForm?.[binding.key];
-        const mode = this.getConfigBindingMode(binding, 'save');
-        const fallback = this.getConfigBindingDefaultValue(binding, 'save');
-        if (mode === 'checkbox') return rawValue === true;
-        if (mode === 'int-or-default') {
-          const num = parseInt(rawValue, 10);
-          return num || fallback;
-        }
-        if (mode === 'int-finite' || mode === 'number-finite') {
-          const num = parseInt(rawValue, 10);
-          return Number.isFinite(num) ? num : fallback;
-        }
-        if (mode === 'float-finite') {
-          const num = parseFloat(rawValue);
-          return Number.isFinite(num) ? num : fallback;
-        }
-        if (mode === 'trim') return String(rawValue || '').trim();
-        if (rawValue === undefined || rawValue === null) return '';
-        return rawValue;
-      },
-
-      collectConfigSectionFromForm(section) {
-        const collected = this.getConfigFormBindings(section).reduce((acc, binding) => {
-          const value = this.readConfigBindingFromState(binding);
-          if (value !== undefined) acc[binding.key] = value;
-          return acc;
-        }, {});
-        if (section === 'security') {
-          const geoMode = String(this.settingsForm?.geoMode || 'allowlist').trim().toLowerCase() === 'blocklist' ? 'blocklist' : 'allowlist';
-          const geoRegions = normalizeRegionCodeCsv(this.settingsForm?.geoRegions || '');
-          collected.geoAllowlist = geoMode === 'allowlist' ? geoRegions : '';
-          collected.geoBlocklist = geoMode === 'blocklist' ? geoRegions : '';
-        }
-        return collected;
-      },
-
-      formatConfigPreviewValue(key, value) {
-        if (Array.isArray(value)) return value.length ? value.join(', ') : '空';
-        if (typeof value === 'boolean') return value ? '开启' : '关闭';
-        if (value === undefined || value === null || value === '') return '空';
-        return String(value);
-      },
-
-      getSettingsRiskHints(section, nextConfig) {
-        const hints = [];
-        if ((section === 'proxy' || section === 'all') && nextConfig.enableH2 === true && nextConfig.enableH3 === true && nextConfig.peakDowngrade === false) {
-          hints.push('H2/H3 同时开启且关闭晚高峰降级，在复杂链路下更容易放大协议抖动。');
-        }
-        if ((section === 'proxy' || section === 'all') && Number(nextConfig.upstreamTimeoutMs) > 0 && Number(nextConfig.upstreamTimeoutMs) < 5000) {
-          hints.push('上游握手超时低于 5000 毫秒，慢源或弱网容易被过早判定失败。');
-        }
-        if ((section === 'logs' || section === 'all') && Number(nextConfig.logBatchRetryCount) === 0) {
-          hints.push('D1 重试次数为 0，瞬时抖动时会直接丢弃日志批次。');
-        }
-        if ((section === 'logs' || section === 'all') && Number(nextConfig.scheduledLeaseMs) > 0 && Number(nextConfig.scheduledLeaseMs) < 60000) {
-          hints.push('定时任务租约低于 60 秒，慢清理或网络抖动时更容易出现并发重入。');
-        }
-        if ((section === 'logs' || section === 'all') && nextConfig.tgAlertOnScheduledFailure === true && (!String(nextConfig.tgBotToken || '').trim() || !String(nextConfig.tgChatId || '').trim())) {
-          hints.push('已启用 Telegram 异常告警，但 Bot Token / Chat ID 还未完整配置。');
-        }
-        return hints;
-      },
-
-      buildConfigChangePreview(section, prevConfig, nextConfig) {
-        const fields = CONFIG_SECTION_FIELDS[section] || [...new Set([...Object.keys(prevConfig || {}), ...Object.keys(nextConfig || {})])];
-        const diffLines = [];
-        fields.forEach(key => {
-          const before = JSON.stringify(prevConfig?.[key]);
-          const after = JSON.stringify(nextConfig?.[key]);
-          if (before === after) return;
-          diffLines.push('• ' + this.getConfigFieldLabel(key) + ': ' + this.formatConfigPreviewValue(key, prevConfig?.[key]) + ' -> ' + this.formatConfigPreviewValue(key, nextConfig?.[key]));
-        });
-        if (!diffLines.length) {
-          return {
-            hasChanges: false,
-            message: '当前分区没有检测到变更，无需保存。'
+        getSettingsSectionLabel(section) {
+          const labels = {
+            ui: '系统 UI',
+            proxy: '代理与网络',
+            cache: '静态资源策略',
+            security: '安全防护',
+            logs: '日志设置',
+            monitoring: '监控告警',
+            account: '账号设置',
+            backup: '备份与恢复',
+            all: '全部分区'
           };
-        }
-        const riskHints = this.getSettingsRiskHints(section, nextConfig);
-        let message = '即将保存「' + this.getSettingsSectionLabel(section) + '」以下变更：\\n\\n' + diffLines.join('\\n');
-        if (riskHints.length) {
-          message += '\\n\\n风险提示：\\n' + riskHints.map(item => '• ' + item).join('\\n');
-        }
-        message += '\\n\\n是否继续？';
-        return { hasChanges: true, message, riskHints };
-      },
+          return labels[section] || section || '未知分区';
+        },
 
-      clampPreviewValue(value, fallback, min, max, integer = false) {
-        let next = Number.isFinite(Number(value)) ? Number(value) : Number(fallback);
-        if (integer) next = Math.trunc(next);
-        if (Number.isFinite(min)) next = Math.max(min, next);
-        if (Number.isFinite(max)) next = Math.min(max, next);
-        return next;
-      },
+        getConfigFieldLabel(key) {
+          return CONFIG_FIELD_LABELS[key] || key;
+        },
 
-      sanitizeConfigByRules(input, rules) {
-        const config = input && typeof input === 'object' && !Array.isArray(input) ? { ...input } : {};
-        (rules?.trimFields || []).forEach(key => {
-          if (config[key] === undefined || config[key] === null) return;
-          config[key] = String(config[key]).trim();
-        });
-        Object.entries(rules?.arrayNormalizers || {}).forEach(([key, normalizerName]) => {
-          if (!Array.isArray(config[key])) return;
-          if (normalizerName === 'nodeNameList') config[key] = this.normalizeNodeNameList(config[key]);
-        });
-        Object.entries(rules?.integerFields || {}).forEach(([key, rule]) => {
-          config[key] = this.clampPreviewValue(config[key], rule.fallback, rule.min, rule.max, true);
-        });
-        Object.entries(rules?.numberFields || {}).forEach(([key, rule]) => {
-          config[key] = this.clampPreviewValue(config[key], rule.fallback, rule.min, rule.max, false);
-        });
-        (rules?.booleanTrueFields || []).forEach(key => {
-          config[key] = config[key] !== false;
-        });
-        (rules?.booleanFalseFields || []).forEach(key => {
-          config[key] = config[key] === true;
-        });
-        return config;
-      },
+        getConfigFormBindings(section) {
+          return CONFIG_FORM_BINDINGS[section] || [];
+        },
 
-      sanitizeConfigPreviewCompat(input) {
-        return this.sanitizeConfigByRules(input, CONFIG_PREVIEW_SANITIZE_RULES);
-      },
+        getConfigPanelFieldKeys(section, fallbackSection = '') {
+          const panelKeys = [...(CONFIG_PANEL_FIELDS[section] || CONFIG_SECTION_FIELDS[fallbackSection] || [])];
+          if (this.isSettingsExpertMode()) return panelKeys;
+          if (section === 'proxy') {
+            const hiddenKeys = new Set([
+              'directStaticAssets',
+              'directHlsDash',
+              'sourceSameOriginProxy',
+              'forceExternalProxy',
+              'wangpandirect',
+              'pingTimeout',
+              'pingCacheMinutes',
+              'nodePanelPingAutoSort',
+              'upstreamTimeoutMs',
+              'upstreamRetryAttempts'
+            ]);
+            return panelKeys.filter(key => !hiddenKeys.has(key));
+          }
+          if (section === 'logs') {
+            const hiddenKeys = new Set([
+              'logSearchMode',
+              'logBatchChunkSize',
+              'logBatchRetryCount',
+              'logBatchRetryBackoffMs',
+              'scheduledLeaseMs'
+            ]);
+            return panelKeys.filter(key => !hiddenKeys.has(key));
+          }
+          return panelKeys;
+        },
 
-      async finalizePersistedSettings(savedConfig, options = {}) {
-        const appliedConfig = savedConfig && typeof savedConfig === 'object' && !Array.isArray(savedConfig) ? savedConfig : {};
-        this.applyRuntimeConfig(appliedConfig);
-        try {
+        getConfigBindingDefaultValue(binding, phase = 'save') {
+          if (phase === 'load' && Object.prototype.hasOwnProperty.call(binding || {}, 'loadDefaultValue')) {
+            return binding.loadDefaultValue;
+          }
+          return Object.prototype.hasOwnProperty.call(binding || {}, 'defaultValue') ? binding.defaultValue : '';
+        },
+
+        getConfigBindingMode(binding, phase = 'save') {
+          if (phase === 'load' && binding?.loadMode) return binding.loadMode;
+          if (phase === 'save' && binding?.saveMode) return binding.saveMode;
+          return binding?.kind || 'text';
+        },
+
+        resolveConfigBindingInputValue(binding, source = {}) {
+          const rawValue = source?.[binding.key];
+          const mode = this.getConfigBindingMode(binding, 'load');
+          const fallback = this.getConfigBindingDefaultValue(binding, 'load');
+          if (mode === 'checkbox') {
+            if (binding.checkboxMode === 'defaultTrue') return rawValue !== false;
+            if (binding.checkboxMode === 'truthy') return !!rawValue;
+            return rawValue === true;
+          }
+          if (mode === 'or-default') return rawValue || fallback;
+          if (mode === 'int-or-default') {
+            const num = parseInt(rawValue, 10);
+            return num || fallback;
+          }
+          if (mode === 'int-finite' || mode === 'number-finite') {
+            const num = Number(rawValue);
+            return Number.isFinite(num) ? num : fallback;
+          }
+          if (mode === 'float-finite') {
+            const num = Number(rawValue);
+            return Number.isFinite(num) ? num : fallback;
+          }
+          if (rawValue === undefined || rawValue === null) return fallback;
+          return String(rawValue);
+        },
+
+        resolveGeoFirewallFormState(source = {}) {
+          const geoAllowlist = normalizeRegionCodeCsv(source?.geoAllowlist || '');
+          const geoBlocklist = normalizeRegionCodeCsv(source?.geoBlocklist || '');
+          if (geoAllowlist && geoBlocklist) {
+            this.settingsGeoConflictState = {
+              active: true,
+              allowlist: geoAllowlist,
+              blocklist: geoBlocklist,
+              baselineMode: 'allowlist',
+              baselineRegions: geoAllowlist
+            };
+            return { geoMode: 'allowlist', geoRegions: geoAllowlist };
+          }
+          this.settingsGeoConflictState = createGeoFirewallConflictState();
+          if (geoAllowlist) return { geoMode: 'allowlist', geoRegions: geoAllowlist };
+          if (geoBlocklist) return { geoMode: 'blocklist', geoRegions: geoBlocklist };
+          return {
+            geoMode: String(this.settingsForm?.geoMode || 'allowlist') === 'blocklist' ? 'blocklist' : 'allowlist',
+            geoRegions: ''
+          };
+        },
+
+        hasGeoFirewallConflict() {
+          return this.settingsGeoConflictState?.active === true;
+        },
+
+        getGeoFirewallConflictHint() {
+          if (!this.hasGeoFirewallConflict()) return '';
+          return '检测到当前配置同时包含 Geo 白名单和黑名单。当前表单只展示白名单；如果你不修改这一区域直接保存，系统会保留原始双规则。若修改模式或国家列表，则会按当前表单重写为单一模式。';
+        },
+
+        applyConfigSectionToForm(section, source = {}, options = {}) {
+          const onlyPresent = options.onlyPresent === true;
+          const nextSettingsForm = { ...this.settingsForm };
+          this.getConfigFormBindings(section).forEach(binding => {
+            if (onlyPresent && !Object.prototype.hasOwnProperty.call(source || {}, binding.key)) return;
+            nextSettingsForm[binding.key] = this.resolveConfigBindingInputValue(binding, source);
+          });
+          if (section === 'security') Object.assign(nextSettingsForm, this.resolveGeoFirewallFormState(source));
+          this.settingsForm = nextSettingsForm;
+        },
+
+        readConfigBindingFromState(binding) {
+          if (!binding) return undefined;
+          const rawValue = this.settingsForm?.[binding.key];
+          const mode = this.getConfigBindingMode(binding, 'save');
+          const fallback = this.getConfigBindingDefaultValue(binding, 'save');
+          if (mode === 'checkbox') return rawValue === true;
+          if (mode === 'int-or-default') {
+            const num = parseInt(rawValue, 10);
+            return num || fallback;
+          }
+          if (mode === 'int-finite' || mode === 'number-finite') {
+            const num = parseInt(rawValue, 10);
+            return Number.isFinite(num) ? num : fallback;
+          }
+          if (mode === 'float-finite') {
+            const num = parseFloat(rawValue);
+            return Number.isFinite(num) ? num : fallback;
+          }
+          if (mode === 'trim') return String(rawValue || '').trim();
+          if (rawValue === undefined || rawValue === null) return '';
+          return rawValue;
+        },
+
+        collectConfigSectionFromForm(section, options = {}) {
+          const fieldKeySet = Array.isArray(options.fieldKeys) && options.fieldKeys.length
+            ? new Set(options.fieldKeys.map(key => String(key)))
+            : null;
+          const collected = this.getConfigFormBindings(section).reduce((acc, binding) => {
+            if (fieldKeySet && !fieldKeySet.has(binding.key)) return acc;
+            const value = this.readConfigBindingFromState(binding);
+            if (value !== undefined) acc[binding.key] = value;
+            return acc;
+          }, {});
+          if (section === 'security' && (!fieldKeySet || fieldKeySet.has('geoAllowlist') || fieldKeySet.has('geoBlocklist'))) {
+            const geoMode = String(this.settingsForm?.geoMode || 'allowlist').trim().toLowerCase() === 'blocklist' ? 'blocklist' : 'allowlist';
+            const geoRegions = normalizeRegionCodeCsv(this.settingsForm?.geoRegions || '');
+            const geoConflictState = this.settingsGeoConflictState && typeof this.settingsGeoConflictState === 'object'
+              ? this.settingsGeoConflictState
+              : createGeoFirewallConflictState();
+            if (geoConflictState.active === true) {
+              const baselineMode = String(geoConflictState.baselineMode || 'allowlist').trim().toLowerCase() === 'blocklist' ? 'blocklist' : 'allowlist';
+              const baselineRegions = normalizeRegionCodeCsv(geoConflictState.baselineRegions || '');
+              if (geoMode === baselineMode && geoRegions === baselineRegions) {
+                collected.geoAllowlist = normalizeRegionCodeCsv(geoConflictState.allowlist || '');
+                collected.geoBlocklist = normalizeRegionCodeCsv(geoConflictState.blocklist || '');
+                return collected;
+              }
+            }
+            collected.geoAllowlist = geoMode === 'allowlist' ? geoRegions : '';
+            collected.geoBlocklist = geoMode === 'blocklist' ? geoRegions : '';
+          }
+          return collected;
+        },
+
+        formatConfigPreviewValue(key, value) {
+          if (Array.isArray(value)) return value.length ? value.join(', ') : '空';
+          if (typeof value === 'boolean') return value ? '开启' : '关闭';
+          if (value === undefined || value === null || value === '') return '空';
+          return String(value);
+        },
+
+        getSettingsRiskHints(section, nextConfig) {
+          const hints = [];
+          if ((section === 'proxy' || section === 'all') && nextConfig.enableH2 === true && nextConfig.enableH3 === true && nextConfig.peakDowngrade === false) {
+            hints.push('H2/H3 同时开启且关闭晚高峰降级，在复杂链路下更容易放大协议抖动。');
+          }
+          if ((section === 'proxy' || section === 'all') && Number(nextConfig.upstreamTimeoutMs) > 0 && Number(nextConfig.upstreamTimeoutMs) < 5000) {
+            hints.push('上游握手超时低于 5000 毫秒，慢源或弱网容易被过早判定失败。');
+          }
+          if ((section === 'logs' || section === 'all') && Number(nextConfig.logBatchRetryCount) === 0) {
+            hints.push('D1 重试次数为 0，瞬时抖动时会直接丢弃日志批次。');
+          }
+          if ((section === 'logs' || section === 'all') && normalizeLogSearchMode(nextConfig.logSearchMode) === 'fts') {
+            hints.push('FTS 模式首次启用前需要先在日志页完成 FTS5 虚拟表初始化。');
+          }
+          if ((section === 'logs' || section === 'all') && Number(nextConfig.scheduledLeaseMs) > 0 && Number(nextConfig.scheduledLeaseMs) < 60000) {
+            hints.push('定时任务租约低于 60 秒，慢清理或网络抖动时更容易出现并发重入。');
+          }
+          if ((section === 'monitoring' || section === 'all') && nextConfig.tgAlertOnScheduledFailure === true && (!String(nextConfig.tgBotToken || '').trim() || !String(nextConfig.tgChatId || '').trim())) {
+            hints.push('已启用 Telegram 异常告警，但 Bot Token / Chat ID 还未完整配置。');
+          }
+          return hints;
+        },
+
+        buildConfigChangePreview(section, prevConfig, nextConfig, labelSection = section) {
+          const fields = this.getConfigPanelFieldKeys(labelSection, section).length
+            ? this.getConfigPanelFieldKeys(labelSection, section)
+            : [...new Set([...Object.keys(prevConfig || {}), ...Object.keys(nextConfig || {})])];
+          const diffLines = [];
+          fields.forEach(key => {
+            const before = JSON.stringify(prevConfig?.[key]);
+            const after = JSON.stringify(nextConfig?.[key]);
+            if (before === after) return;
+            diffLines.push('• ' + this.getConfigFieldLabel(key) + ': ' + this.formatConfigPreviewValue(key, prevConfig?.[key]) + ' -> ' + this.formatConfigPreviewValue(key, nextConfig?.[key]));
+          });
+          if (!diffLines.length) {
+            return {
+              hasChanges: false,
+              message: '当前分区没有检测到变更，无需保存。'
+            };
+          }
+          const riskHints = this.getSettingsRiskHints(labelSection, nextConfig);
+          let message = '即将保存「' + this.getSettingsSectionLabel(labelSection) + '」以下变更：\\n\\n' + diffLines.join('\\n');
+          if (riskHints.length) {
+            message += '\\n\\n风险提示：\\n' + riskHints.map(item => '• ' + item).join('\\n');
+          }
+          message += '\\n\\n是否继续？';
+          return { hasChanges: true, message, riskHints };
+        },
+
+        clampPreviewValue(value, fallback, min, max, integer = false) {
+          let next = Number.isFinite(Number(value)) ? Number(value) : Number(fallback);
+          if (integer) next = Math.trunc(next);
+          if (Number.isFinite(min)) next = Math.max(min, next);
+          if (Number.isFinite(max)) next = Math.min(max, next);
+          return next;
+        },
+
+        sanitizeConfigByRules(input, rules) {
+          let config = input && typeof input === 'object' && !Array.isArray(input) ? { ...input } : {};
+          Object.entries(rules?.aliasFields || {}).forEach(([targetKey, sourceKeys]) => {
+            if (config[targetKey] !== undefined && config[targetKey] !== null) return;
+            if (!Array.isArray(sourceKeys)) return;
+            for (const sourceKey of sourceKeys) {
+              if (config[sourceKey] === undefined || config[sourceKey] === null) continue;
+              config[targetKey] = config[sourceKey];
+              break;
+            }
+          });
+          (rules?.trimFields || []).forEach(key => {
+            if (config[key] === undefined || config[key] === null) return;
+            config[key] = String(config[key]).trim();
+          });
+          Object.entries(rules?.arrayNormalizers || {}).forEach(([key, normalizerName]) => {
+            if (!Array.isArray(config[key])) return;
+            if (normalizerName === 'nodeNameList') config[key] = this.normalizeNodeNameList(config[key]);
+          });
+          Object.entries(rules?.integerFields || {}).forEach(([key, rule]) => {
+            config[key] = this.clampPreviewValue(config[key], rule.fallback, rule.min, rule.max, true);
+          });
+          Object.entries(rules?.numberFields || {}).forEach(([key, rule]) => {
+            config[key] = this.clampPreviewValue(config[key], rule.fallback, rule.min, rule.max, false);
+          });
+          (rules?.booleanTrueFields || []).forEach(key => {
+            config[key] = config[key] !== false;
+          });
+          (rules?.booleanFalseFields || []).forEach(key => {
+            config[key] = config[key] === true;
+          });
+          const allowedFields = Array.isArray(rules?.allowedFields) ? rules.allowedFields : [];
+          if (allowedFields.length) {
+            const filtered = {};
+            allowedFields.forEach(key => {
+              if (!Object.prototype.hasOwnProperty.call(config, key)) return;
+              filtered[key] = config[key];
+            });
+            config = filtered;
+          }
+          return config;
+        },
+
+        sanitizeConfigPreviewCompat(input) {
+          return this.sanitizeConfigByRules(input, CONFIG_PREVIEW_SANITIZE_RULES);
+        },
+
+        async finalizePersistedSettings(savedConfig, options = {}) {
+          const appliedConfig = savedConfig && typeof savedConfig === 'object' && !Array.isArray(savedConfig) ? savedConfig : {};
+          this.applyRuntimeConfig(appliedConfig);
+          try {
+            await this.loadSettings();
+            this.showMessage(options.successMessage || '设置已保存，立即生效', { tone: 'success' });
+          } catch (err) {
+            console.error(options.refreshErrorLog || 'reload settings after persist failed', err);
+            this.showMessage((options.partialSuccessPrefix || '设置已保存，但设置面板刷新失败: ') + (err?.message || '未知错误'), { tone: 'warning', modal: true });
+          }
+        },
+
+        async prepareConfigChangePreview(section, prevConfig, rawNextConfig, labelSection = section) {
+          let sanitizedConfig;
+          try {
+            const previewRes = await this.apiCall('previewConfig', { config: rawNextConfig });
+            if (!previewRes?.config || typeof previewRes.config !== 'object' || Array.isArray(previewRes.config)) {
+              throw new Error('配置预览返回格式无效');
+            }
+            sanitizedConfig = previewRes.config;
+          } catch (err) {
+            if (err?.code === 'INVALID_ACTION' && err?.status === 400) {
+              sanitizedConfig = this.sanitizeConfigPreviewCompat(rawNextConfig);
+            } else {
+              const detail = String(err?.message || '未知错误');
+              throw new Error(detail.startsWith('配置预览失败') ? detail : ('配置预览失败: ' + detail));
+            }
+          }
+          return {
+            sanitizedConfig,
+            preview: this.buildConfigChangePreview(section, prevConfig, sanitizedConfig, labelSection)
+          };
+        },
+
+        formatSnapshotReason(snapshot) {
+          const reasonLabel = SNAPSHOT_REASON_LABELS[snapshot?.reason] || (snapshot?.reason || '未知来源');
+          const section = String(snapshot?.section || 'all');
+          return section && section !== 'all'
+            ? (reasonLabel + ' · ' + this.getSettingsSectionLabel(section))
+            : reasonLabel;
+        },
+
+        getConfigSnapshotChangedKeysText(snapshot) {
+          const changedKeys = Array.isArray(snapshot?.changedKeys)
+            ? snapshot.changedKeys.slice(0, 4).map(key => this.getConfigFieldLabel(key)).join(' / ')
+            : '';
+          const overflow = Array.isArray(snapshot?.changedKeys) && snapshot.changedKeys.length > 4
+            ? (' +' + (snapshot.changedKeys.length - 4) + ' 项')
+            : '';
+          return (changedKeys || '未记录') + overflow;
+        },
+
+        applyConfigSnapshotsState(snapshots) {
+          this.configSnapshots = Array.isArray(snapshots) ? snapshots : [];
+          return this.configSnapshots;
+        },
+
+        async loadConfigSnapshots() {
+          const res = await this.apiCall('getConfigSnapshots');
+          this.applyConfigSnapshotsState(res.snapshots || []);
+        },
+
+        async clearConfigSnapshots() {
+          if (!await this.askConfirm('清理后将删除当前保存的全部设置快照，且不能恢复。是否继续？', { title: '清理设置快照', tone: 'danger', confirmText: '继续' })) return;
+          const res = await this.apiCall('clearConfigSnapshots');
+          this.applyConfigSnapshotsState(res.snapshots || []);
+          this.showMessage('设置快照已清理。', { tone: 'success' });
+        },
+
+        async restoreConfigSnapshot(snapshotId) {
+          if (!snapshotId) return;
+          if (!await this.askConfirm('恢复该快照后，当前全局设置会立即被替换。系统会先自动记录当前配置，是否继续？', { title: '恢复设置快照', tone: 'warning', confirmText: '恢复' })) return;
+          const res = await this.apiCall('restoreConfigSnapshot', { id: snapshotId });
+          this.applyRuntimeConfig(res.config || {});
           await this.loadSettings();
-          this.showMessage(options.successMessage || '设置已保存，立即生效', { tone: 'success' });
-        } catch (err) {
-          console.error(options.refreshErrorLog || 'reload settings after persist failed', err);
-          this.showMessage((options.partialSuccessPrefix || '设置已保存，但设置面板刷新失败: ') + (err?.message || '未知错误'), { tone: 'warning', modal: true });
+          this.showMessage('配置快照已恢复并立即生效。', { tone: 'success' });
         }
-      },
+      };
+    }
 
-      async prepareConfigChangePreview(section, prevConfig, rawNextConfig) {
-        let sanitizedConfig;
-        try {
-          const previewRes = await this.apiCall('previewConfig', { config: rawNextConfig });
-          if (!previewRes?.config || typeof previewRes.config !== 'object' || Array.isArray(previewRes.config)) {
-            throw new Error('配置预览返回格式无效');
-          }
-          sanitizedConfig = previewRes.config;
-        } catch (err) {
-          if (err?.code === 'INVALID_ACTION' && err?.status === 400) {
-            sanitizedConfig = this.sanitizeConfigPreviewCompat(rawNextConfig);
-          } else {
-            const detail = String(err?.message || '未知错误');
-            throw new Error(detail.startsWith('配置预览失败') ? detail : ('配置预览失败: ' + detail));
-          }
-        }
-        return {
-          sanitizedConfig,
-          preview: this.buildConfigChangePreview(section, prevConfig, sanitizedConfig)
-        };
-      },
+    const UiBridge = Object.assign(
+      {},
+      createUiFoundationStore(),
+      createUiDashboardStore(),
+      createUiDialogStore(),
+      createUiNodeModalStore(),
+      createUiConfigStore(),
+      createUiNodesStore()
+    );
 
-      formatSnapshotReason(snapshot) {
-        const reasonLabel = SNAPSHOT_REASON_LABELS[snapshot?.reason] || (snapshot?.reason || '未知来源');
-        const section = String(snapshot?.section || 'all');
-        return section && section !== 'all'
-          ? (reasonLabel + ' · ' + this.getSettingsSectionLabel(section))
-          : reasonLabel;
-      },
-
-      getConfigSnapshotChangedKeysText(snapshot) {
-        const changedKeys = Array.isArray(snapshot?.changedKeys)
-          ? snapshot.changedKeys.slice(0, 4).map(key => this.getConfigFieldLabel(key)).join(' / ')
-          : '';
-        const overflow = Array.isArray(snapshot?.changedKeys) && snapshot.changedKeys.length > 4
-          ? (' +' + (snapshot.changedKeys.length - 4) + ' 项')
-          : '';
-        return (changedKeys || '未记录') + overflow;
-      },
-
-      applyConfigSnapshotsState(snapshots) {
-        this.configSnapshots = Array.isArray(snapshots) ? snapshots : [];
-        return this.configSnapshots;
-      },
-
-      async loadConfigSnapshots() {
-        const res = await this.apiCall('getConfigSnapshots');
-        this.applyConfigSnapshotsState(res.snapshots || []);
-      },
-
-      async clearConfigSnapshots() {
-        if (!await this.askConfirm('清理后将删除当前保存的全部设置快照，且不能恢复。是否继续？', { title: '清理设置快照', tone: 'danger', confirmText: '继续' })) return;
-        const res = await this.apiCall('clearConfigSnapshots');
-        this.applyConfigSnapshotsState(res.snapshots || []);
-        this.showMessage('设置快照已清理。', { tone: 'success' });
-      },
-
-      async restoreConfigSnapshot(snapshotId) {
-        if (!snapshotId) return;
-        if (!await this.askConfirm('恢复该快照后，当前全局设置会立即被替换。系统会先自动记录当前配置，是否继续？', { title: '恢复设置快照', tone: 'warning', confirmText: '恢复' })) return;
-        const res = await this.apiCall('restoreConfigSnapshot', { id: snapshotId });
-        this.applyRuntimeConfig(res.config || {});
-        await this.loadSettings();
-        this.showMessage('配置快照已恢复并立即生效。', { tone: 'success' });
-      },
-
+    function createUiNodesStore() {
+      return {
       simpleHash(str) {
         const input = String(str || "");
         let hash = 0;
@@ -6774,6 +7933,151 @@ const UI_HTML = `<!DOCTYPE html>
           result.push(name);
         });
         return result;
+      },
+      normalizeNodeTagFilterValue(value = '') {
+        const rawValue = String(value || '').trim();
+        if (rawValue === '__untagged__') return rawValue;
+        return this.normalizeNodeKey(rawValue);
+      },
+      buildNodeTagFilterOptions(nodes = []) {
+        const tagMap = new Map();
+        let untaggedCount = 0;
+        (Array.isArray(nodes) ? nodes : [])
+          .map(node => this.hydrateNode(node))
+          .filter(node => node && typeof node === 'object')
+          .forEach(node => {
+            const tagLabel = String(node?.tag || '').trim();
+            if (!tagLabel) {
+              untaggedCount += 1;
+              return;
+            }
+            const tagKey = this.normalizeNodeKey(tagLabel);
+            if (!tagKey) {
+              untaggedCount += 1;
+              return;
+            }
+            const current = tagMap.get(tagKey);
+            if (current) {
+              current.count += 1;
+              return;
+            }
+            tagMap.set(tagKey, {
+              value: tagKey,
+              label: tagLabel,
+              count: 1,
+              colorKey: this.normalizeNodeKey(node?.tagColor || '') || 'amber'
+            });
+          });
+        const options = Array.from(tagMap.values())
+          .sort((left, right) => String(left?.label || '').localeCompare(String(right?.label || ''), 'zh-Hans-CN', { sensitivity: 'base' }));
+        if (untaggedCount > 0) {
+          options.push({
+            value: '__untagged__',
+            label: '无标签',
+            count: untaggedCount,
+            colorKey: 'slate'
+          });
+        }
+        return options;
+      },
+      applyNodeTagFilterOptions(nodes = []) {
+        const nextOptions = this.buildNodeTagFilterOptions(nodes);
+        this.nodeTagFilterOptions = nextOptions;
+        const activeValue = this.normalizeNodeTagFilterValue(this.activeNodeTagFilter);
+        if (!activeValue) return nextOptions;
+        const stillExists = nextOptions.some(option => String(option?.value || '') === activeValue);
+        if (!stillExists) this.activeNodeTagFilter = '';
+        return nextOptions;
+      },
+      getNodeTagFilterOptions() {
+        return Array.isArray(this.nodeTagFilterOptions) ? this.nodeTagFilterOptions : [];
+      },
+      hasNodeTagFilterOptions() {
+        return this.getNodeTagFilterOptions().length > 0;
+      },
+      hasActiveNodeTagFilter() {
+        return !!this.normalizeNodeTagFilterValue(this.activeNodeTagFilter);
+      },
+      getActiveNodeTagFilterOption() {
+        const activeValue = this.normalizeNodeTagFilterValue(this.activeNodeTagFilter);
+        if (!activeValue) return null;
+        return this.getNodeTagFilterOptions().find(option => String(option?.value || '') === activeValue) || null;
+      },
+      getNodeTagFilterTriggerText() {
+        return this.getActiveNodeTagFilterOption()?.label || '标签筛选';
+      },
+      getNodeTagFilterCounterText() {
+        if (this.hasActiveNodeTagFilter()) return '已选';
+        const total = this.getNodeTagFilterOptions().length;
+        return total > 0 ? (total + ' 项') : '空';
+      },
+      getNodeTagFilterCounterClass() {
+        return this.hasActiveNodeTagFilter()
+          ? 'bg-brand-100 text-brand-600 dark:bg-brand-500/10 dark:text-brand-300'
+          : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-300';
+      },
+      getNodeTagFilterTriggerClass() {
+        return this.nodeTagFilterPanelOpen || this.hasActiveNodeTagFilter()
+          ? 'border-brand-200 bg-brand-50/90 text-brand-700 dark:border-brand-500/20 dark:bg-brand-500/10 dark:text-brand-300'
+          : 'hover:text-slate-900 dark:hover:text-white';
+      },
+      getNodeTagFilterAllCount() {
+        return Array.isArray(this.nodes) ? this.nodes.length : 0;
+      },
+      getNodeTagFilterChipClass(value = '') {
+        const activeValue = this.normalizeNodeTagFilterValue(this.activeNodeTagFilter);
+        const chipValue = this.normalizeNodeTagFilterValue(value);
+        if (activeValue && activeValue === chipValue) {
+          return 'border-brand-200 bg-brand-50 text-brand-700 shadow-[0_6px_16px_rgba(59,130,246,0.08)] dark:border-brand-500/20 dark:bg-brand-500/10 dark:text-brand-300';
+        }
+        if (!activeValue && !chipValue) {
+          return 'border-slate-300 bg-slate-100 text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200';
+        }
+        return 'border-slate-200 bg-white text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300';
+      },
+      getNodeTagFilterChipCountClass(value = '') {
+        const activeValue = this.normalizeNodeTagFilterValue(this.activeNodeTagFilter);
+        const chipValue = this.normalizeNodeTagFilterValue(value);
+        if (activeValue && activeValue === chipValue) {
+          return 'bg-white/80 text-brand-600 dark:bg-brand-500/10 dark:text-brand-200';
+        }
+        if (!activeValue && !chipValue) {
+          return 'bg-white/80 text-slate-500 dark:bg-slate-900 dark:text-slate-300';
+        }
+        return 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400';
+      },
+      getNodeTagFilterDotClass(colorKey = 'slate') {
+        const palette = {
+          amber: 'bg-amber-400',
+          emerald: 'bg-emerald-400',
+          sky: 'bg-sky-400',
+          violet: 'bg-violet-400',
+          rose: 'bg-rose-400',
+          slate: 'bg-slate-400'
+        };
+        return palette[this.normalizeNodeKey(colorKey || '')] || palette.slate;
+      },
+      toggleNodeTagFilterPanel() {
+        if (!this.hasNodeTagFilterOptions()) return;
+        this.nodeTagFilterPanelOpen = this.nodeTagFilterPanelOpen !== true;
+      },
+      clearNodeTagFilter() {
+        if (!this.hasActiveNodeTagFilter()) return;
+        this.activeNodeTagFilter = '';
+        this.syncFilteredNodes();
+      },
+      setNodeTagFilter(value = '') {
+        const nextValue = this.normalizeNodeTagFilterValue(value);
+        const currentValue = this.normalizeNodeTagFilterValue(this.activeNodeTagFilter);
+        this.activeNodeTagFilter = currentValue && currentValue === nextValue ? '' : nextValue;
+        this.syncFilteredNodes();
+      },
+      doesNodeMatchActiveTagFilter(node) {
+        const activeValue = this.normalizeNodeTagFilterValue(this.activeNodeTagFilter);
+        if (!activeValue) return true;
+        const tagLabel = String(node?.tag || '').trim();
+        if (activeValue === '__untagged__') return !tagLabel;
+        return this.normalizeNodeKey(tagLabel) === activeValue;
       },
       markNodeMutation(names) {
         const mutationId = ++this.nodeMutationSeq;
@@ -6889,6 +8193,27 @@ const UI_HTML = `<!DOCTYPE html>
         const activeLineId = this.resolveActiveLineId(node?.activeLineId, lines);
         return lines.find(line => line.id === activeLineId) || lines[0];
       },
+      decorateNodeSyncState(node, state = '', errorMessage = '') {
+        const base = node && typeof node === 'object' ? { ...node } : {};
+        const nextState = this.normalizeNodeKey(state);
+        if (nextState === 'syncing') {
+          return {
+            ...base,
+            _syncState: 'syncing',
+            _syncError: ''
+          };
+        }
+        if (nextState === 'failed') {
+          return {
+            ...base,
+            _syncState: 'failed',
+            _syncError: String(errorMessage || '').trim()
+          };
+        }
+        delete base._syncState;
+        delete base._syncError;
+        return base;
+      },
       hydrateNode(node) {
         if (!node || typeof node !== 'object') return node;
         const lines = this.getNodeLines(node);
@@ -6942,6 +8267,7 @@ const UI_HTML = `<!DOCTYPE html>
       applyNodesState(nodes, options = {}) {
         const nextNodes = this.normalizeNodeCollection(nodes);
         this.nodes = nextNodes;
+        this.applyNodeTagFilterOptions(nextNodes);
         const validKeys = new Set(nextNodes.map(node => this.normalizeNodeKey(node?.name)).filter(Boolean));
         this.nodeHealth = Object.fromEntries(Object.entries(this.nodeHealth || {}).filter(([key]) => validKeys.has(this.normalizeNodeKey(key))));
         this.syncFilteredNodes();
@@ -6959,6 +8285,7 @@ const UI_HTML = `<!DOCTYPE html>
           .map(node => this.hydrateNode(node))
           .filter(node => node && typeof node === 'object')
           .filter(n => {
+            if (!this.doesNodeMatchActiveTagFilter(n)) return false;
             const nodeName = String(n.name || '').trim();
             const displayName = String(n.displayName || n.name || '').trim();
             const tagText = String(n.tag || '').trim();
@@ -6989,6 +8316,13 @@ const UI_HTML = `<!DOCTYPE html>
         nextNodes.push(hydratedNode);
         const renameMap = previousKey && previousKey !== nextKey ? { [previousKey]: hydratedNode.name } : null;
         this.applyNodesState(nextNodes, { renameMap });
+      },
+      findNodeByAnyName(names = []) {
+        const keys = this.normalizeNodeNameList(names)
+          .map(name => this.normalizeNodeKey(name))
+          .filter(Boolean);
+        if (!keys.length) return null;
+        return (Array.isArray(this.nodes) ? this.nodes : []).find(node => keys.includes(this.normalizeNodeKey(node?.name))) || null;
       },
       formatLatency(ms) {
         const latency = Number(ms);
@@ -7308,6 +8642,11 @@ const UI_HTML = `<!DOCTYPE html>
         this.nodeModalOpen = false;
       },
       
+      };
+    }
+
+    Object.assign(UiBridge, {
+
       init() {
         const defaultLogRange = getDefaultLogDateRange();
         if (!this.logStartDate) this.logStartDate = defaultLogRange.startDate;
@@ -7327,12 +8666,25 @@ const UI_HTML = `<!DOCTYPE html>
         const nextHash = String(hash || '').trim() || '#dashboard';
         if (String(this.currentHash || '#dashboard') === nextHash && this.getCurrentRouteHash() === nextHash) {
           this.route(nextHash);
-          return;
+          return Promise.resolve(true);
         }
-        this.route(nextHash);
-        if (this.getCurrentRouteHash() !== nextHash) {
-          uiBrowserBridge.writeHash(nextHash);
-        }
+        return Promise.resolve().then(() => {
+          this.route(nextHash);
+          if (this.getCurrentRouteHash() !== nextHash) {
+            uiBrowserBridge.writeHash(nextHash);
+          }
+          return true;
+        });
+      },
+
+      handleExternalHashNavigation(nextHash) {
+        const targetHash = String(nextHash || '').trim() || '#dashboard';
+        const currentHash = String(this.currentHash || '#dashboard');
+        if (targetHash === currentHash) return Promise.resolve(true);
+        return Promise.resolve().then(() => {
+          this.route(targetHash);
+          return true;
+        });
       },
 
       runRouteLoader(hash, loader, failurePrefix) {
@@ -7405,6 +8757,7 @@ const UI_HTML = `<!DOCTYPE html>
         if (source === 'workers_usage') return { label: '请求口径: Workers Usage', tone: 'emerald' };
         if (source === 'zone_analytics') return { label: '请求口径: Zone Analytics', tone: 'blue' };
         if (source === 'd1_logs') return { label: '请求口径: D1 兜底', tone: 'amber' };
+        if (source === 'unconfigured') return { label: '请求口径: 未配置', tone: 'amber' };
         return { label: '请求口径: 待确认', tone: 'slate' };
       },
 
@@ -7434,6 +8787,21 @@ const UI_HTML = `<!DOCTYPE html>
 
       formatRuntimeStateText(status) {
         return this.getRuntimeStatusMeta(status).label;
+      },
+
+      getRuntimeStatusTimestamp(state) {
+        const data = state && typeof state === 'object' ? state : {};
+        const status = String(data.status || '').toLowerCase();
+        if (status === 'failed' || status === 'partial_failure') return data.lastErrorAt || data.lastSuccessAt || data.lastSkippedAt || '';
+        if (status === 'skipped') return data.lastSkippedAt || data.lastSuccessAt || data.lastErrorAt || '';
+        return data.lastSuccessAt || data.lastSkippedAt || data.lastErrorAt || '';
+      },
+
+      formatRuntimeSectionLine(label, state) {
+        const data = state && typeof state === 'object' ? state : {};
+        if (!data.status) return '';
+        const timestamp = this.getRuntimeStatusTimestamp(data);
+        return label + this.formatRuntimeStateText(data.status) + (timestamp ? ('（' + this.formatLocalDateTime(timestamp) + '）') : '');
       },
 
       buildRuntimeStatusCard(title, status, summary, lines = [], detail = '') {
@@ -7470,9 +8838,9 @@ const UI_HTML = `<!DOCTYPE html>
         const scheduledLines = [
           scheduled.lastStartedAt ? ('最近开始：' + this.formatLocalDateTime(scheduled.lastStartedAt)) : '',
           scheduled.lastFinishedAt ? ('最近结束：' + this.formatLocalDateTime(scheduled.lastFinishedAt)) : '',
-          cleanup.status ? ('日志清理：' + this.formatRuntimeStateText(cleanup.status) + (cleanup.lastSuccessAt ? '（' + this.formatLocalDateTime(cleanup.lastSuccessAt) + '）' : cleanup.lastSkippedAt ? '（' + this.formatLocalDateTime(cleanup.lastSkippedAt) + '）' : cleanup.lastErrorAt ? '（' + this.formatLocalDateTime(cleanup.lastErrorAt) + '）' : '')) : '',
-          report.status ? ('日报发送：' + this.formatRuntimeStateText(report.status) + (report.lastSuccessAt ? '（' + this.formatLocalDateTime(report.lastSuccessAt) + '）' : report.lastSkippedAt ? '（' + this.formatLocalDateTime(report.lastSkippedAt) + '）' : report.lastErrorAt ? '（' + this.formatLocalDateTime(report.lastErrorAt) + '）' : '')) : '',
-          alerts.status ? ('异常告警：' + this.formatRuntimeStateText(alerts.status) + (alerts.lastSuccessAt ? '（' + this.formatLocalDateTime(alerts.lastSuccessAt) + '）' : alerts.lastSkippedAt ? '（' + this.formatLocalDateTime(alerts.lastSkippedAt) + '）' : alerts.lastErrorAt ? '（' + this.formatLocalDateTime(alerts.lastErrorAt) + '）' : '')) : ''
+          this.formatRuntimeSectionLine('日志清理：', cleanup),
+          this.formatRuntimeSectionLine('日报发送：', report),
+          this.formatRuntimeSectionLine('异常告警：', alerts)
         ].filter(Boolean);
         const scheduledDetail = scheduled.lastError || cleanup.lastError || report.lastError || alerts.lastError
           ? ('最近调度错误：' + (scheduled.lastError || cleanup.lastError || report.lastError || alerts.lastError))
@@ -7490,6 +8858,7 @@ const UI_HTML = `<!DOCTYPE html>
       async apiCall(action, payload={}) {
           const headers = {'Content-Type': 'application/json'};
           if (String(action || '') === 'updateDnsRecord') headers['X-Admin-Confirm'] = 'updateDnsRecord';
+          if (String(action || '') === 'saveDnsRecords') headers['X-Admin-Confirm'] = 'saveDnsRecords';
           const requestInit = {
               method: 'POST',
               credentials: 'same-origin',
@@ -7536,20 +8905,59 @@ const UI_HTML = `<!DOCTYPE html>
         this.settingsScrollResetKey += 1;
       },
 
+      normalizeSettingsExperienceMode(mode = 'novice') {
+        return String(mode || '').trim().toLowerCase() === 'expert' ? 'expert' : 'novice';
+      },
+
+      isSettingsExpertMode() {
+        return this.normalizeSettingsExperienceMode(this.settingsExperienceMode) === 'expert';
+      },
+
+      isSettingsTabVisible(id) {
+        const tabId = String(id || '').trim();
+        if (!tabId) return false;
+        if (this.isSettingsExpertMode()) return true;
+        return tabId !== 'proxy' && tabId !== 'cache' && tabId !== 'security';
+      },
+
+      getSettingsModeButtonClass(mode = 'novice') {
+        const normalizedMode = this.normalizeSettingsExperienceMode(mode);
+        const active = normalizedMode === this.normalizeSettingsExperienceMode(this.settingsExperienceMode);
+        return active
+          ? 'border-brand-300 bg-brand-50 text-brand-700 dark:border-slate-600 dark:bg-slate-800 dark:text-white'
+          : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:bg-slate-800 dark:hover:text-white';
+      },
+
+      setSettingsExperienceMode(mode = 'novice') {
+        const nextMode = this.normalizeSettingsExperienceMode(mode);
+        if (this.settingsExperienceMode === nextMode) return;
+        this.settingsExperienceMode = nextMode;
+        this.settingsForm = {
+          ...this.settingsForm,
+          settingsExperienceMode: nextMode
+        };
+        if (!this.isSettingsTabVisible(this.activeSettingsTab)) this.activeSettingsTab = 'ui';
+        if (nextMode !== 'expert') this.logsPlaybackModeFilter = '';
+        this.settingsScrollResetKey += 1;
+      },
+
       getSettingsTabClass(id) {
         return this.activeSettingsTab === id
-          ? 'border-brand-200/80 bg-brand-50 text-brand-600 dark:border-brand-500/20 dark:bg-brand-500/10 dark:text-brand-400'
-          : 'border-transparent bg-transparent text-slate-500 dark:text-slate-400 hover:bg-slate-100 hover:border-slate-200 hover:text-slate-900 dark:hover:bg-slate-900 dark:hover:border-slate-700 dark:hover:text-white';
+          ? 'border-brand-300 bg-brand-50 text-brand-700 dark:border-slate-600 dark:bg-slate-800 dark:text-white'
+          : 'border-transparent bg-transparent text-slate-700 dark:text-slate-200 hover:bg-slate-100 hover:border-slate-200 hover:text-slate-900 dark:hover:bg-slate-800 dark:hover:border-slate-600 dark:hover:text-white';
       },
 
       switchSetTab(id) {
-        this.activeSettingsTab = id;
+        const nextTab = String(id || '').trim();
+        if (!this.isSettingsTabVisible(nextTab)) return;
+        if (!nextTab || this.activeSettingsTab === nextTab) return;
+        this.activeSettingsTab = nextTab;
         this.settingsScrollResetKey += 1;
       },
 
       applyDashboardStatsState(data) {
          const requestTitle = [data.requestSourceText || '', data.cfAnalyticsDetail || ''].filter(Boolean).join(' | ');
-         this.dashboardView.requests.count = String(data.todayRequests || 0);
+         this.dashboardView.requests.count = String(data.requestCountDisplay || '').trim() || (data.todayRequests === null ? (String(data.requestSource || '').toLowerCase() === 'unconfigured' ? '未配置' : '暂不可用') : String(data.todayRequests || 0));
          this.dashboardView.requests.hint = data.requestSourceText || '今日请求量口径：未知';
          this.dashboardView.requests.title = requestTitle;
          this.dashboardView.requests.badges = this.buildDashboardBadges([
@@ -7638,36 +9046,44 @@ const UI_HTML = `<!DOCTYPE html>
           return cfg;
       },
 
-      applyRecommendedSettings(section) {
+      applyRecommendedSettings(section, labelSection = section) {
           const recommended = RECOMMENDED_SECTION_VALUES[section];
           if (!recommended) return;
-          this.applyConfigSectionToForm(section, recommended, { onlyPresent: true });
+          const fieldKeys = this.getConfigPanelFieldKeys(labelSection, section);
+          const nextRecommended = fieldKeys.length
+            ? fieldKeys.reduce((acc, key) => {
+                if (Object.prototype.hasOwnProperty.call(recommended, key)) acc[key] = recommended[key];
+                return acc;
+              }, {})
+            : recommended;
+          this.applyConfigSectionToForm(section, nextRecommended, { onlyPresent: true });
           this.normalizeSettingsNumberInputs();
           if (section === 'proxy') this.syncProxySettingsGuardrails();
           this.showMessage('推荐生产值已回填到表单，请确认后再点击保存。', { tone: 'success' });
       },
 
-      async saveSettings(section) {
+      async saveSettings(section, labelSection = section) {
           try {
               const res = await this.apiCall('loadConfig');
               const currentConfig = res.config || {};
               let newConfig = { ...currentConfig };
+              const fieldKeys = this.getConfigPanelFieldKeys(labelSection, section);
               
               if (CONFIG_FORM_BINDINGS[section]) {
-                  newConfig = { ...newConfig, ...this.collectConfigSectionFromForm(section) };
-                  if (section === 'proxy') {
+                  newConfig = { ...newConfig, ...this.collectConfigSectionFromForm(section, { fieldKeys }) };
+                  if (section === 'proxy' && (!fieldKeys.length || fieldKeys.includes('sourceDirectNodes'))) {
                       newConfig.sourceDirectNodes = this.normalizeNodeNameList(this.settingsSourceDirectNodes);
                   }
               }
 
-              const { sanitizedConfig, preview } = await this.prepareConfigChangePreview(section, currentConfig, newConfig);
+              const { sanitizedConfig, preview } = await this.prepareConfigChangePreview(section, currentConfig, newConfig, labelSection);
               if (!preview.hasChanges) {
                   this.showMessage(preview.message, { tone: 'info', modal: true });
                   return;
               }
               if (!await this.askConfirm(preview.message, { title: '保存设置', tone: 'warning', confirmText: '保存' })) return;
 
-              const saveRes = await this.apiCall('saveConfig', { config: sanitizedConfig, meta: { section, source: 'ui' } });
+              const saveRes = await this.apiCall('saveConfig', { config: sanitizedConfig, meta: { section: labelSection, source: 'ui' } });
               await this.finalizePersistedSettings(saveRes.config || sanitizedConfig, {
                   successMessage: '设置已保存，立即生效',
                   partialSuccessPrefix: '设置已保存，但设置面板刷新失败: ',
@@ -7733,20 +9149,36 @@ const UI_HTML = `<!DOCTYPE html>
           this.showMessage('KV 整理完成：重建 ' + (summary.rebuiltNodeCount || 0) + ' 个节点索引，清理 ' + (summary.deletedCacheKeyCount || 0) + ' 个缓存键' + extraLockText + malformedText, { tone: 'success', modal: true });
       },
 
-      async initLogsDbFromUi() {
-          await this.apiCall('initLogsDb');
-          this.showMessage('初始化完成', { tone: 'success' });
-      },
+	      async initLogsDbFromUi() {
+	          try {
+	              const res = await this.apiCall('initLogsDb');
+	              this.showMessage(res?.ftsReady ? '日志表初始化完成，当前已检测到 FTS5 虚拟表' : '日志表初始化完成', { tone: 'success' });
+	          } catch (err) {
+	              console.error('initLogsDbFromUi failed', err);
+	              this.showMessage('日志表初始化失败: ' + (err?.message || '未知错误'), { tone: 'error', modal: true });
+	          }
+	      },
 
-      async clearLogsFromUi() {
-          if (!await this.askConfirm('确定清空所有日志?', { title: '清空日志', tone: 'danger', confirmText: '清空' })) return;
-          try {
-              const res = await this.apiCall('clearLogs');
-              await this.loadLogs(1);
-              this.showMessage(res?.vacuumed ? '日志已清空，并已完成 VACUUM 整理' : '日志已清空', { tone: 'success' });
-          } catch (err) {
-              console.error('clearLogsFromUi failed', err);
-              this.showMessage('日志清理失败: ' + (err?.message || '未知错误'), { tone: 'error', modal: true });
+	      async initLogsFtsFromUi() {
+	          try {
+	              const res = await this.apiCall('initLogsFts');
+	              const migratedRows = Number(res?.migratedRows) || 0;
+	              this.showMessage('FTS5 虚拟表初始化完成，已迁移 ' + migratedRows + ' 条历史日志', { tone: 'success', modal: true });
+	          } catch (err) {
+	              console.error('initLogsFtsFromUi failed', err);
+	              this.showMessage('FTS5 初始化失败: ' + (err?.message || '未知错误'), { tone: 'error', modal: true });
+	          }
+	      },
+
+	      async clearLogsFromUi() {
+	          if (!await this.askConfirm('确定清空所有日志?', { title: '清空日志', tone: 'danger', confirmText: '清空' })) return;
+	          try {
+	              const res = await this.apiCall('clearLogs');
+	              await this.loadLogs(1);
+	              this.showMessage(res?.ftsRebuilt ? '日志已清空，并已同步重建 FTS 索引' : '日志已清空', { tone: 'success' });
+	          } catch (err) {
+	              console.error('clearLogsFromUi failed', err);
+	              this.showMessage('日志清理失败: ' + (err?.message || '未知错误'), { tone: 'error', modal: true });
           }
       },
 
@@ -8011,7 +9443,7 @@ const UI_HTML = `<!DOCTYPE html>
           const modalDraft = this.captureNodeModalDraft();
           const affectedNames = Array.from(new Set([payload.originalName, payload.name].map(name => String(name || '').trim()).filter(Boolean)));
           const mutationId = this.markNodeMutation(affectedNames);
-          const optimisticNode = this.hydrateNode(payload);
+          const optimisticNode = this.hydrateNode(this.decorateNodeSyncState(payload, 'syncing'));
           this.upsertNode(optimisticNode, { previousName: payload.originalName });
           this.closeNodeModal();
           this.showMessage(payload.originalName ? '节点已在本地更新，正在同步到 KV...' : '节点已在本地创建，正在同步到 KV...', { tone: 'info' });
@@ -8027,19 +9459,28 @@ const UI_HTML = `<!DOCTYPE html>
           } catch (err) {
               console.error('saveNode failed', err);
               if (!this.isNodeMutationCurrent(affectedNames, mutationId)) return;
+              const syncErrorDetail = String(err?.message || '未知错误');
+              const errorMessage = '节点保存失败: ' + syncErrorDetail;
               try {
                   await this.loadNodes();
               } catch (rollbackErr) {
                   console.error('loadNodes rollback after save failed', rollbackErr);
-                  this.showMessage('节点保存失败，且自动回滚失败，请手动刷新页面后重试', { tone: 'error', modal: true });
+                  const failedNode = this.decorateNodeSyncState(this.findNodeByAnyName(affectedNames) || payload, 'failed', syncErrorDetail);
+                  this.upsertNode(failedNode, { previousName: payload.originalName });
+                  this.restoreNodeModalDraft(modalDraft, {
+                    feedbackMessage: errorMessage,
+                    feedbackTone: 'error'
+                  });
+                  this.showMessage('节点保存失败，已保留本地卡片并标记失败原因；自动回滚也失败了，请检查网络后重试', { tone: 'error', modal: true });
                   return;
               }
-              const errorMessage = '节点保存失败: ' + (err?.message || '未知错误');
+              const rollbackNode = this.findNodeByAnyName([payload.originalName, payload.name]) || payload;
+              this.upsertNode(this.decorateNodeSyncState(rollbackNode, 'failed', syncErrorDetail), { previousName: payload.originalName });
               this.restoreNodeModalDraft(modalDraft, {
                 feedbackMessage: errorMessage,
                 feedbackTone: 'error'
               });
-              this.showMessage('后台保存失败，已回滚本地节点列表', { tone: 'error' });
+              this.showMessage('后台保存失败，失败原因已同步到节点卡片', { tone: 'error' });
           }
       },
       
@@ -8169,13 +9610,60 @@ const UI_HTML = `<!DOCTYPE html>
               title: hint,
               className: 'cursor-help border-b border-dashed border-red-400/70 pb-[1px]'
           };
-      },
-      getLogPathTitle(log) {
-          return log?.error_detail ? (String(log.request_path || '') + '\\n[诊断] ' + log.error_detail) : String(log?.request_path || '');
-      },
-      getLogsPlaybackFilterClass(mode = '') {
-          const active = String(mode || '') === String(this.logsPlaybackModeFilter || '');
-          return active
+	      },
+	      getLogPathTitle(log) {
+	          return log?.error_detail ? (String(log.request_path || '') + '\\n[诊断] ' + log.error_detail) : String(log?.request_path || '');
+	      },
+	      getRuntimeLogSearchMode() {
+	          return normalizeLogSearchMode(this.runtimeConfig?.logSearchMode || UI_DEFAULTS.logSearchMode);
+	      },
+	      getSettingsLogSearchMode() {
+	          return normalizeLogSearchMode(this.settingsForm?.logSearchMode || this.runtimeConfig?.logSearchMode || UI_DEFAULTS.logSearchMode);
+	      },
+	      getLogSearchInputPlaceholder() {
+	          return this.getRuntimeLogSearchMode() === 'fts'
+	            ? 'FTS 语法查询，如: transcode AND playback；状态码/IP 仍可直接输入'
+	            : '搜索节点、IP、路径或状态码(如200)...';
+	      },
+	      getRuntimeLogSearchModeHint() {
+	          if (this.getRuntimeLogSearchMode() === 'fts') {
+	            return this.isSettingsExpertMode()
+	              ? '当前搜索模式：FTS5 语法查询。支持布尔表达式、短语和前缀；首次启用前请先点击右上角“初始化 FTS5”。'
+	              : '当前搜索模式：FTS5 语法查询。若需初始化 FTS5 或调整搜索模式，请先切换到高手模式。';
+	          }
+	          return '当前搜索模式：LIKE 模糊匹配。无需额外初始化，适合新手模式直接使用。';
+	      },
+	      getSettingsLogSearchModeHint() {
+	          return this.getSettingsLogSearchMode() === 'fts'
+	            ? '当前准备保存为 FTS5 语法查询。首次启用前请先到日志页点击“初始化 FTS5”，否则关键词搜索会直接报未初始化。'
+	            : '当前准备保存为 LIKE 模糊匹配。兼容性最好，无需额外初始化虚拟表。';
+	      },
+	      getSettingsLogSearchModeButtonClass(mode = 'like') {
+	          const active = normalizeLogSearchMode(mode) === this.getSettingsLogSearchMode();
+	          return active
+	            ? 'border-brand-200 bg-brand-50 text-brand-600 dark:border-brand-500/40 dark:bg-brand-500/10 dark:text-brand-300'
+	            : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400 dark:hover:bg-slate-800';
+	      },
+	      setSettingsLogSearchMode(mode = 'like') {
+	          this.settingsForm.logSearchMode = normalizeLogSearchMode(mode);
+	      },
+	      getGeoMode() {
+	          return String(this.settingsForm?.geoMode || 'allowlist').trim().toLowerCase() === 'blocklist' ? 'blocklist' : 'allowlist';
+	      },
+	      setGeoMode(mode = 'allowlist') {
+	          this.settingsForm.geoMode = String(mode || '').trim().toLowerCase() === 'blocklist' ? 'blocklist' : 'allowlist';
+	      },
+	      getGeoModeButtonClass(mode = 'allowlist') {
+	          const normalizedMode = String(mode || '').trim().toLowerCase() === 'blocklist' ? 'blocklist' : 'allowlist';
+	          const active = normalizedMode === this.getGeoMode();
+	          if (!active) return 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400 dark:hover:bg-slate-800';
+	          return normalizedMode === 'blocklist'
+	            ? 'border-rose-200 bg-rose-50 text-rose-600 dark:border-rose-500/40 dark:bg-rose-500/10 dark:text-rose-300'
+	            : 'border-emerald-200 bg-emerald-50 text-emerald-600 dark:border-emerald-500/40 dark:bg-emerald-500/10 dark:text-emerald-300';
+	      },
+	      getLogsPlaybackFilterClass(mode = '') {
+	          const active = String(mode || '') === String(this.logsPlaybackModeFilter || '');
+	          return active
             ? 'bg-brand-50 text-brand-600 dark:bg-brand-500/10 dark:text-brand-400'
             : 'text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800';
       },
@@ -8205,20 +9693,11 @@ const UI_HTML = `<!DOCTYPE html>
       },
 
       // ============================================================================
-      // DNS 编辑：读取 / 受限修改（不支持增删）
+      // DNS 编辑：双模式草稿（CNAME / A）
       // ============================================================================
       isDnsTypeAllowed(type) {
           const upper = String(type || '').toUpperCase();
           return upper === 'A' || upper === 'AAAA' || upper === 'CNAME';
-      },
-
-      isDnsRecordDirty(record) {
-          if (!record) return false;
-          const type = String(record.type || '').toUpperCase();
-          const content = String(record.content || '');
-          const originalType = String(record._originalType || '').toUpperCase();
-          const originalContent = String(record._originalContent || '');
-          return type !== originalType || content !== originalContent;
       },
 
       normalizeDnsHistoryEntries(entries = []) {
@@ -8227,7 +9706,7 @@ const UI_HTML = `<!DOCTYPE html>
           for (const rawEntry of Array.isArray(entries) ? entries : []) {
               const type = String(rawEntry?.type || '').trim().toUpperCase();
               const content = String(rawEntry?.content || '').trim();
-              if (!type || !content) continue;
+              if (type !== 'CNAME' || !content) continue;
               const dedupeKey = type + '::' + content.toLowerCase();
               if (seen.has(dedupeKey)) continue;
               seen.add(dedupeKey);
@@ -8260,13 +9739,9 @@ const UI_HTML = `<!DOCTYPE html>
           }).replace(',', '');
       },
 
-      getDnsHistoryEntryKey(record, entry, index = 0) {
+      getDnsHistoryEntryKey(entry, index = 0) {
           return String(entry?.id || (
-            String(record?.id || 'dns')
-            + ':' + String(entry?.type || '')
-            + ':' + String(entry?.content || '')
-            + ':' + String(entry?.savedAt || '')
-            + ':' + String(index)
+            'dns-history:' + String(entry?.type || '') + ':' + String(entry?.content || '') + ':' + String(entry?.savedAt || '') + ':' + String(index)
           ));
       },
 
@@ -8281,20 +9756,89 @@ const UI_HTML = `<!DOCTYPE html>
           return titleLines.join('\\n');
       },
 
-      isDnsHistoryEntryCurrent(record, entry) {
-          if (!record || !entry) return false;
-          return String(record._originalType || '').toUpperCase() === String(entry.type || '').toUpperCase()
-            && String(record._originalContent || '').trim() === String(entry.content || '').trim();
+      isDnsHistoryEntryCurrent(entry) {
+          if (!entry) return false;
+          return normalizeDnsEditorMode(this.dnsEditMode) === 'cname'
+            && String(this.dnsDraftCname?.content || '').trim().toLowerCase() === String(entry.content || '').trim().toLowerCase();
       },
 
-      applyDnsHistoryEntry(recordId, entry) {
-          const records = Array.isArray(this.dnsRecords) ? this.dnsRecords : [];
-          const record = records.find(item => String(item?.id || '') === String(recordId || ''));
-          if (!record || !record.editable || !entry) return;
-          record.type = String(entry.type || record.type || '').toUpperCase();
-          record.content = String(entry.content || record.content || '');
+      applyDnsHistoryEntry(entry) {
+          if (!entry || this.dnsBatchSaving) return;
+          this.switchDnsEditMode('cname');
+          this.dnsDraftCname = this.normalizeDnsRecordForState({
+            ...this.dnsDraftCname,
+            type: 'CNAME',
+            name: this.getDnsEditorHostLabel(),
+            content: String(entry.content || '').trim()
+          }, 'CNAME');
           this.updateDnsSaveAllButtonState();
-          this.showToast('已回填历史值，点击保存即可生效', 'info', 1800);
+          this.showToast('已回填历史 CNAME，点击保存即可生效', 'info', 1800);
+      },
+
+      getDnsHistoryCards() {
+          return this.normalizeDnsHistoryEntries(this.dnsHistoryEntries).map((entry, index) => ({ entry, index }));
+      },
+
+      hasDnsHistoryCards() {
+          return this.getDnsHistoryCards().length > 0;
+      },
+
+      getDnsHistoryCardClass(entry) {
+          if (this.isDnsHistoryEntryCurrent(entry)) {
+              return 'border-brand-200 bg-brand-50 text-brand-600 shadow-[0_6px_16px_rgba(59,130,246,0.08)] dark:border-brand-500/30 dark:bg-brand-500/10 dark:text-brand-300';
+          }
+          return 'border-slate-200 bg-white/80 text-slate-700 hover:bg-brand-50/80 hover:border-brand-200 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-200 dark:hover:bg-brand-500/10 dark:hover:border-brand-500/20';
+      },
+
+      getDnsRecommendedDomains() {
+          return DNS_RECOMMENDED_CNAME_OPTIONS.slice();
+      },
+
+      canUseDnsRecommendedDomains() {
+          return !!String(this.getDnsEditorHostLabel() || '').trim();
+      },
+
+      getDnsRecommendedDomainHint() {
+          const hostLabel = this.getDnsEditorHostLabel();
+          if (!hostLabel) return '当前站点未识别，暂时无法快捷回填 CNAME。';
+          return '点击任一优选域名后，会自动切换到 CNAME 模式并回填 ' + hostLabel + ' 的 CNAME 内容，仍需点击“保存 DNS”后才会生效。';
+      },
+
+      getDnsRecommendedDomainClass(domain = '') {
+          const normalizedDomain = String(domain || '').trim().toLowerCase();
+          const currentContent = String(this.dnsDraftCname?.content || '').trim().toLowerCase();
+          if (normalizedDomain && normalizedDomain === currentContent && normalizeDnsEditorMode(this.dnsEditMode) === 'cname') {
+              return 'border-brand-200 bg-brand-50 text-brand-700 shadow-[0_6px_16px_rgba(59,130,246,0.08)] dark:border-brand-500/20 dark:bg-brand-500/10 dark:text-brand-300';
+          }
+          return 'border-slate-200 bg-white/80 text-slate-700 hover:bg-brand-50/80 hover:border-brand-200 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-200 dark:hover:bg-brand-500/10 dark:hover:border-brand-500/20';
+      },
+
+      applyDnsRecommendedDomain(domain = '') {
+          const targetDomain = String(domain || '').trim();
+          if (!targetDomain) return;
+          if (!this.canUseDnsRecommendedDomains()) {
+              this.showMessage('当前站点未识别，暂时无法快捷回填 CNAME。', { tone: 'warning', modal: true });
+              return;
+          }
+          const previousMode = normalizeDnsEditorMode(this.dnsEditMode);
+          const previousContent = String(this.dnsDraftCname?.content || '').trim().toLowerCase();
+          this.switchDnsEditMode('cname');
+          this.dnsDraftCname = this.normalizeDnsRecordForState({
+            ...this.dnsDraftCname,
+            type: 'CNAME',
+            name: this.getDnsEditorHostLabel(),
+            content: targetDomain
+          }, 'CNAME');
+          this.updateDnsSaveAllButtonState();
+          if (previousMode === 'cname' && previousContent === targetDomain.toLowerCase()) {
+              this.showToast(this.getDnsEditorHostLabel() + ' 的 CNAME 已经是 ' + targetDomain + '。', 'info', 1800);
+              return;
+          }
+          if (this.isDnsHistoryEntryCurrent({ content: targetDomain })) {
+              this.showToast(this.getDnsEditorHostLabel() + ' 的 CNAME 已回填为 ' + targetDomain + '，请点击保存。', 'info', 2200);
+              return;
+          }
+          this.showToast(this.getDnsEditorHostLabel() + ' 的 CNAME 已回填为 ' + targetDomain + '，请点击保存。', 'info', 2200);
       },
 
       inferZoneNameFromRecordNames(names = []) {
@@ -8321,15 +9865,151 @@ const UI_HTML = `<!DOCTYPE html>
           return zoneParts.join('.');
       },
 
+      normalizeDnsRecordForState(record = {}, fallbackType = 'A') {
+          const normalized = cloneDnsEditorDraftRecord({
+            ...record,
+            type: normalizeDnsDraftType(record?.type, fallbackType),
+            name: String(record?.name || this.dnsCurrentHost || '').trim()
+          }, fallbackType);
+          if (!normalized.name) normalized.name = String(this.dnsCurrentHost || '').trim();
+          return normalized;
+      },
+
+      cloneDnsRecordForState(record = {}, fallbackType = 'A') {
+          return this.normalizeDnsRecordForState(record, fallbackType);
+      },
+
+      resetDnsDraftState() {
+          this.dnsRecords = [];
+          this.dnsEditMode = 'cname';
+          this.dnsOriginalEditMode = 'cname';
+          this.dnsDraftCname = createDnsEditorDraftRecord('CNAME');
+          this.dnsOriginalCname = createDnsEditorDraftRecord('CNAME');
+          this.dnsAddressDrafts = [createDnsEditorDraftRecord('A')];
+          this.dnsOriginalAddressDrafts = [];
+          this.dnsHistoryEntries = [];
+      },
+
+      getDnsEditorHostLabel() {
+          return String(
+            this.dnsCurrentHost
+            || this.dnsDraftCname?.name
+            || this.dnsAddressDrafts?.[0]?.name
+            || this.dnsZone?.currentHost
+            || ''
+          ).trim();
+      },
+
+      getDnsEditModeButtonClass(mode = 'cname') {
+          const normalizedMode = normalizeDnsEditorMode(mode);
+          const active = normalizedMode === normalizeDnsEditorMode(this.dnsEditMode);
+          if (!active) return 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400 dark:hover:bg-slate-800';
+          return normalizedMode === 'a'
+            ? 'border-emerald-200 bg-emerald-50 text-emerald-600 dark:border-emerald-500/40 dark:bg-emerald-500/10 dark:text-emerald-300'
+            : 'border-brand-200 bg-brand-50 text-brand-600 dark:border-brand-500/40 dark:bg-brand-500/10 dark:text-brand-300';
+      },
+
+      switchDnsEditMode(mode = 'cname') {
+          const currentMode = normalizeDnsEditorMode(this.dnsEditMode);
+          const nextMode = normalizeDnsEditorMode(mode);
+          if (currentMode === nextMode) return;
+          this.dnsEditMode = nextMode;
+          if (nextMode === 'cname') {
+              this.dnsDraftCname = this.normalizeDnsRecordForState({
+                ...this.dnsDraftCname,
+                type: 'CNAME',
+                name: this.getDnsEditorHostLabel(),
+                content: String(this.dnsDraftCname?.content || '').trim() || DNS_RECOMMENDED_CNAME_OPTIONS[0]
+              }, 'CNAME');
+          } else {
+              this.ensureDnsAddressDrafts();
+          }
+          this.updateDnsSaveAllButtonState();
+      },
+
+      ensureDnsAddressDrafts(minCount = 1) {
+          const drafts = (Array.isArray(this.dnsAddressDrafts) ? this.dnsAddressDrafts : [])
+            .map(record => this.normalizeDnsRecordForState(record, record?.type || 'A'))
+            .filter(record => record && (record.type === 'A' || record.type === 'AAAA'));
+          while (drafts.length < Math.max(1, Number(minCount) || 1)) {
+              drafts.push(this.normalizeDnsRecordForState({ type: 'A', name: this.getDnsEditorHostLabel() }, 'A'));
+          }
+          this.dnsAddressDrafts = drafts;
+          return drafts;
+      },
+
+      addDnsAddressDraft(type = 'A') {
+          if (this.dnsBatchSaving) return;
+          this.ensureDnsAddressDrafts();
+          this.dnsAddressDrafts.push(this.normalizeDnsRecordForState({ type, name: this.getDnsEditorHostLabel() }, type));
+          this.updateDnsSaveAllButtonState();
+      },
+
+      canRemoveDnsAddressDraft() {
+          return Array.isArray(this.dnsAddressDrafts) && this.dnsAddressDrafts.length > 1;
+      },
+
+      removeDnsAddressDraft(index = -1) {
+          if (this.dnsBatchSaving) return;
+          this.ensureDnsAddressDrafts();
+          if (!this.canRemoveDnsAddressDraft()) {
+              this.showToast('A 模式至少保留 1 条记录', 'info', 1800);
+              return;
+          }
+          this.dnsAddressDrafts.splice(index, 1);
+          this.ensureDnsAddressDrafts();
+          this.updateDnsSaveAllButtonState();
+      },
+
+      getDnsComparableStateSignature(mode = this.dnsEditMode, cnameDraft = this.dnsDraftCname, addressDrafts = this.dnsAddressDrafts) {
+          const normalizedMode = normalizeDnsEditorMode(mode);
+          if (normalizedMode === 'cname') {
+              return JSON.stringify({
+                mode: 'cname',
+                records: [{ type: 'CNAME', content: String(cnameDraft?.content || '').trim() }]
+              });
+          }
+          const normalizedRecords = (Array.isArray(addressDrafts) ? addressDrafts : [])
+            .map(record => ({
+              type: normalizeDnsDraftType(record?.type, 'A'),
+              content: String(record?.content || '').trim()
+            }))
+            .filter(record => record.content)
+            .sort((left, right) => (left.type.localeCompare(right.type) || left.content.localeCompare(right.content)));
+          return JSON.stringify({ mode: 'a', records: normalizedRecords });
+      },
+
+      hasDnsPendingChanges() {
+          return this.getDnsComparableStateSignature(this.dnsEditMode, this.dnsDraftCname, this.dnsAddressDrafts)
+            !== this.getDnsComparableStateSignature(this.dnsOriginalEditMode, this.dnsOriginalCname, this.dnsOriginalAddressDrafts);
+      },
+
+      getDnsModeHintText() {
+          return normalizeDnsEditorMode(this.dnsEditMode) === 'a'
+            ? 'A 模式可混合 A / AAAA，保存后会移除当前站点的 CNAME'
+            : 'CNAME 模式只保留 1 条 CNAME，保存后会移除当前站点的 A / AAAA';
+      },
+
+      getDnsEditorFooterHint() {
+          if (normalizeDnsEditorMode(this.dnsEditMode) === 'a') {
+              return 'A 模式最少保留 1 条记录，可按需新增或删除 A / AAAA 条目。';
+          }
+          return '切换到 CNAME 模式后会默认回填 saas.sin.fan，也可直接点击下方推荐优选域名。';
+      },
+
       updateDnsSaveAllButtonState() {
-          const records = Array.isArray(this.dnsRecords) ? this.dnsRecords : [];
-          const dirtyCount = records.filter(r => r && r.editable && this.isDnsRecordDirty(r) && !r._saving).length;
-          const anySaving = records.some(r => r && r._saving) || this.dnsBatchSaving;
+          const anySaving = this.dnsBatchSaving;
+          const dirty = this.hasDnsPendingChanges();
+          const mode = normalizeDnsEditorMode(this.dnsEditMode);
           return {
-            dirtyCount,
+            dirtyCount: dirty ? 1 : 0,
             anySaving,
-            disabled: anySaving || dirtyCount === 0,
-            title: anySaving ? '正在保存中...' : (dirtyCount ? ('将保存 ' + dirtyCount + ' 条变更') : '没有可保存的变更')
+            disabled: anySaving || !dirty,
+            title: anySaving
+              ? '正在保存 DNS...'
+              : dirty
+                ? (mode === 'a' ? '将同步 A / AAAA 记录并移除当前站点的 CNAME' : '将同步 CNAME 记录并移除当前站点的 A / AAAA')
+                : '没有可保存的变更'
           };
       },
       isDnsSaveAllDisabled() {
@@ -8340,7 +10020,7 @@ const UI_HTML = `<!DOCTYPE html>
       },
       getDnsSaveAllButtonText() {
           const state = this.updateDnsSaveAllButtonState();
-          return state.anySaving ? '保存中...' : '保存全部';
+          return state.anySaving ? '保存中...' : '保存 DNS';
       },
 
       isValidIpv4(value) {
@@ -8361,7 +10041,6 @@ const UI_HTML = `<!DOCTYPE html>
           if (!v.includes(':')) return false;
           if (/[\\s]/.test(v)) return false;
           try {
-              // 利用 URL 解析做一个轻量校验（浏览器原生）
               new URL('http://[' + v + ']/');
               return true;
           } catch {
@@ -8369,10 +10048,12 @@ const UI_HTML = `<!DOCTYPE html>
           }
       },
 
-      validateDnsRecordForSave(record) {
+      validateDnsRecordForSave(record, options = {}) {
           const type = String(record?.type || '').toUpperCase();
           const content = String(record?.content || '').trim();
+          const allowCname = options.allowCname !== false;
           if (!this.isDnsTypeAllowed(type)) return 'Type 仅允许 A / AAAA / CNAME';
+          if (!allowCname && type === 'CNAME') return 'A 模式仅允许 A / AAAA';
           if (!content) return 'Content 不能为空';
           if (type === 'A' && !this.isValidIpv4(content)) return 'A 记录 Content 必须是合法 IPv4 地址';
           if (type === 'AAAA' && !this.isValidIpv6(content)) return 'AAAA 记录 Content 必须是合法 IPv6 地址';
@@ -8381,6 +10062,79 @@ const UI_HTML = `<!DOCTYPE html>
               if (content.length > 255) return 'CNAME 记录 Content 过长';
           }
           return '';
+      },
+
+      getDnsDraftPayload() {
+          if (normalizeDnsEditorMode(this.dnsEditMode) === 'cname') {
+              return [{
+                type: 'CNAME',
+                content: String(this.dnsDraftCname?.content || '').trim()
+              }];
+          }
+          return (Array.isArray(this.dnsAddressDrafts) ? this.dnsAddressDrafts : [])
+            .map(record => ({
+              type: normalizeDnsDraftType(record?.type, 'A'),
+              content: String(record?.content || '').trim()
+            }))
+            .filter(record => record.content);
+      },
+
+      validateDnsDraftsForSave() {
+          if (!this.getDnsEditorHostLabel()) return '当前站点未识别，无法保存 DNS';
+          if (normalizeDnsEditorMode(this.dnsEditMode) === 'cname') {
+              return this.validateDnsRecordForSave({ type: 'CNAME', content: this.dnsDraftCname?.content || '' });
+          }
+          const records = this.getDnsDraftPayload();
+          if (!records.length) return 'A 模式至少保留 1 条 A / AAAA 记录';
+          for (const record of records) {
+              const validationError = this.validateDnsRecordForSave(record, { allowCname: false });
+              if (validationError) return validationError;
+          }
+          return '';
+      },
+
+      applyDnsResponse(res = {}) {
+          const zoneName = res.zoneName || res.zone?.name || '';
+          const zoneId = res.zoneId || res.zone?.id || '';
+          this.dnsCurrentHost = String(res.currentHost || '').trim().toLowerCase();
+          this.dnsTotalRecordCount = Math.max(0, Number(res.totalRecords) || 0);
+
+          const rawRecords = Array.isArray(res.records) ? res.records : [];
+          const inferredZoneName = zoneName ? String(zoneName || '') : this.inferZoneNameFromRecordNames(rawRecords.map(item => item?.name));
+          const displayZoneName = String(inferredZoneName || zoneName || '').trim();
+          const zoneText = displayZoneName ? displayZoneName : '未知域名';
+          const visibleCount = rawRecords.length;
+          const totalCount = this.dnsTotalRecordCount || visibleCount;
+          this.dnsZoneHintText = '当前站点：' + (this.dnsCurrentHost || '未识别') + ' · Zone：' + zoneText + ' · 显示 ' + visibleCount + ' / ' + totalCount + ' 条';
+          this.dnsEmptyText = this.dnsCurrentHost
+            ? ('当前站点 ' + this.dnsCurrentHost + ' 暂无 A / AAAA / CNAME 记录，可直接选择模式后保存创建')
+            : '暂无 DNS 记录';
+
+          const records = rawRecords
+            .map(item => this.normalizeDnsRecordForState(item, item?.type || 'A'))
+            .filter(record => record && (record.id || record.name));
+          records.sort((a, b) => (a.name.localeCompare(b.name) || a.type.localeCompare(b.type) || a.id.localeCompare(b.id) || a.content.localeCompare(b.content)));
+          this.dnsRecords = records;
+          this.dnsHistoryEntries = this.normalizeDnsHistoryEntries(res.history);
+
+          const currentMode = normalizeDnsEditorMode(res.mode || (records.some(record => record.type === 'A' || record.type === 'AAAA') ? 'a' : 'cname'));
+          const currentCname = records.find(record => record.type === 'CNAME')
+            || this.normalizeDnsRecordForState({ type: 'CNAME', name: this.dnsCurrentHost, content: '' }, 'CNAME');
+          const currentAddresses = records
+            .filter(record => record.type === 'A' || record.type === 'AAAA')
+            .map(record => this.normalizeDnsRecordForState(record, record.type));
+
+          this.dnsOriginalEditMode = currentMode;
+          this.dnsEditMode = currentMode;
+          this.dnsOriginalCname = this.cloneDnsRecordForState(currentCname, 'CNAME');
+          this.dnsDraftCname = this.cloneDnsRecordForState(currentCname, 'CNAME');
+          this.dnsOriginalAddressDrafts = currentAddresses.map(record => this.cloneDnsRecordForState(record, record.type));
+          this.dnsAddressDrafts = currentAddresses.length
+            ? currentAddresses.map(record => this.cloneDnsRecordForState(record, record.type))
+            : [this.normalizeDnsRecordForState({ type: 'A', name: this.dnsCurrentHost, content: '' }, 'A')];
+          this.ensureDnsAddressDrafts();
+          this.dnsZone = zoneId || displayZoneName ? { id: zoneId, name: displayZoneName, currentHost: this.dnsCurrentHost } : null;
+          this.updateDnsSaveAllButtonState();
       },
 
       async loadDnsRecords() {
@@ -8393,49 +10147,12 @@ const UI_HTML = `<!DOCTYPE html>
           try {
               const res = await this.apiCall('listDnsRecords');
               if (loadSeq !== this.dnsLoadSeq) return;
-
-              const zoneName = res.zoneName || res.zone?.name || '';
-              const zoneId = res.zoneId || res.zone?.id || '';
-              this.dnsCurrentHost = String(res.currentHost || '').trim().toLowerCase();
-              this.dnsTotalRecordCount = Math.max(0, Number(res.totalRecords) || 0);
-
-              const rawRecords = Array.isArray(res.records) ? res.records : [];
-              const inferredZoneName = zoneName ? String(zoneName || '') : this.inferZoneNameFromRecordNames(rawRecords.map(item => item?.name));
-              const displayZoneName = String(inferredZoneName || zoneName || '').trim();
-              const zoneText = displayZoneName ? displayZoneName : '未知域名';
-              const visibleCount = rawRecords.length;
-              const totalCount = this.dnsTotalRecordCount || visibleCount;
-              this.dnsZoneHintText = '当前站点：' + (this.dnsCurrentHost || '未识别') + ' · Zone：' + zoneText + ' · 显示 ' + visibleCount + ' / ' + totalCount + ' 条';
-              this.dnsEmptyText = this.dnsCurrentHost
-                ? ('当前站点 ' + this.dnsCurrentHost + ' 暂无 DNS 记录')
-                : '暂无 DNS 记录';
-              const records = rawRecords.map((item) => {
-                  const type = String(item?.type || '').toUpperCase();
-                  const name = String(item?.name || '');
-                  const content = String(item?.content || '');
-                  return {
-                      id: String(item?.id || ''),
-                      type,
-                      name,
-                      content,
-                      ttl: Number(item?.ttl) || 1,
-                      proxied: item?.proxied === true,
-                      editable: this.isDnsTypeAllowed(type),
-                      history: this.normalizeDnsHistoryEntries(item?.history),
-                      _originalType: type,
-                      _originalContent: content,
-                      _saving: false
-                  };
-              }).filter(r => r.id && r.name);
-
-              records.sort((a, b) => (a.name.localeCompare(b.name) || a.type.localeCompare(b.type) || a.id.localeCompare(b.id)));
-              this.dnsRecords = records;
-              this.dnsZone = zoneId || displayZoneName ? { id: zoneId, name: displayZoneName, currentHost: this.dnsCurrentHost } : null;
+              this.applyDnsResponse(res);
           } catch (e) {
               if (loadSeq !== this.dnsLoadSeq) return;
               console.error('loadDnsRecords failed', e);
               this.dnsZoneHintText = '当前站点：加载失败（请检查 CF Zone ID、API 令牌权限）';
-              this.dnsRecords = [];
+              this.resetDnsDraftState();
               this.dnsZone = null;
               this.dnsCurrentHost = '';
               this.dnsTotalRecordCount = 0;
@@ -8445,71 +10162,40 @@ const UI_HTML = `<!DOCTYPE html>
           }
       },
 
-      async saveDnsRecord(recordId, opts = {}) {
-          const records = Array.isArray(this.dnsRecords) ? this.dnsRecords : [];
-          const record = records.find(r => String(r?.id || '') === String(recordId || ''));
-          if (!record) throw new Error('记录不存在');
-
-          if (!record.editable) throw new Error('该记录类型不支持编辑');
-          const dirty = this.isDnsRecordDirty(record);
-          if (!dirty) return;
-
-          const validationError = this.validateDnsRecordForSave(record);
-          if (validationError) throw new Error(validationError);
-
-          record._saving = true;
-          this.updateDnsSaveAllButtonState();
-
-          try {
-              const res = await this.apiCall('updateDnsRecord', { recordId: record.id, type: record.type, content: record.content });
-              const savedRecord = res?.record || {};
-              record.name = String(savedRecord.name || record.name || '');
-              record.type = String(savedRecord.type || record.type || '').toUpperCase();
-              record.content = String(savedRecord.content || record.content || '').trim();
-              record.history = this.normalizeDnsHistoryEntries(res?.history || record.history);
-              record._originalType = String(record.type || '').toUpperCase();
-              record._originalContent = String(record.content || '');
-              if (!opts.silent) this.showMessage('保存成功', { tone: 'success' });
-          } finally {
-              record._saving = false;
-              this.updateDnsSaveAllButtonState();
-          }
-      },
-
       async saveAllDnsRecords() {
-          const records = Array.isArray(this.dnsRecords) ? this.dnsRecords : [];
-          const dirtyRecords = records.filter(r => r && r.editable && this.isDnsRecordDirty(r) && !r._saving);
-          if (!dirtyRecords.length) {
+          if (!this.hasDnsPendingChanges()) {
               this.showMessage('没有需要保存的变更', { tone: 'info' });
               return;
           }
 
-          if (!await this.askConfirm('确定保存 ' + dirtyRecords.length + ' 条 DNS 记录变更？', { title: '保存 DNS 变更', tone: 'warning', confirmText: '保存' })) return;
+          const validationError = this.validateDnsDraftsForSave();
+          if (validationError) {
+              this.showMessage(validationError, { tone: 'warning', modal: true });
+              return;
+          }
+
+          const isAddressMode = normalizeDnsEditorMode(this.dnsEditMode) === 'a';
+          const confirmText = isAddressMode
+            ? '确定保存当前站点的 A / AAAA 配置吗？保存后会移除该站点的 CNAME 记录。'
+            : '确定保存当前站点的 CNAME 配置吗？保存后会移除该站点的 A / AAAA 记录。';
+          if (!await this.askConfirm(confirmText, { title: '保存 DNS 变更', tone: 'warning', confirmText: '保存' })) return;
 
           this.dnsBatchSaving = true;
-          const errors = [];
-          let okCount = 0;
+          this.updateDnsSaveAllButtonState();
           try {
-              for (let i = 0; i < dirtyRecords.length; i++) {
-                  const record = dirtyRecords[i];
-                  try {
-                      await this.saveDnsRecord(record.id, { silent: true });
-                      okCount += 1;
-                  } catch (e) {
-                      errors.push((record.name || record.id) + ': ' + (e && e.message ? e.message : '未知错误'));
-                  }
-              }
+              const res = await this.apiCall('saveDnsRecords', {
+                host: this.getDnsEditorHostLabel(),
+                mode: normalizeDnsEditorMode(this.dnsEditMode),
+                records: this.getDnsDraftPayload()
+              });
+              this.applyDnsResponse(res);
+              this.showMessage('DNS 保存成功', { tone: 'success' });
+          } catch (e) {
+              const message = e && e.message ? e.message : '未知错误';
+              this.showMessage('DNS 保存失败: ' + message, { tone: 'error', modal: true });
           } finally {
               this.dnsBatchSaving = false;
               this.updateDnsSaveAllButtonState();
-          }
-
-          if (errors.length) {
-              const head = '已保存 ' + okCount + '/' + dirtyRecords.length + '，失败 ' + errors.length + ' 条。';
-              const detail = errors.slice(0, 6).join('\\n') + (errors.length > 6 ? '\\n...' : '');
-              this.showMessage(head + '\\n' + detail, { tone: 'warning', modal: true });
-          } else {
-              this.showMessage('已保存 ' + okCount + ' 条 DNS 记录变更', { tone: 'success' });
           }
       },
 
@@ -8517,14 +10203,15 @@ const UI_HTML = `<!DOCTYPE html>
           const keyword = this.logSearchKeyword || '';
           const { startDate, endDate } = this.ensureLogDateRange();
           try {
-              const res = await this.apiCall('getLogs', {
-                page: page,
-                pageSize: 50,
-                filters: {
-                  keyword,
-                  playbackMode: this.logsPlaybackModeFilter || '',
-                  startDate,
-                  endDate
+	              const res = await this.apiCall('getLogs', {
+	                page: page,
+	                pageSize: 50,
+	                filters: {
+	                  keyword,
+	                  searchMode: this.getRuntimeLogSearchMode(),
+	                  playbackMode: this.logsPlaybackModeFilter || '',
+	                  startDate,
+	                  endDate
                 }
               });
               if (res.logs) {
@@ -8614,13 +10301,12 @@ const UI_HTML = `<!DOCTYPE html>
               }
               const currentRes = await this.apiCall('loadConfig');
               const currentConfig = currentRes.config || {};
-              const mergedConfig = { ...currentConfig, ...importedConfig };
-              const { sanitizedConfig, preview } = await this.prepareConfigChangePreview('all', currentConfig, mergedConfig);
+              const { sanitizedConfig, preview } = await this.prepareConfigChangePreview('all', currentConfig, importedConfig);
               if (!preview.hasChanges) {
                 this.showMessage('导入文件与当前全局设置一致，无需导入。', { tone: 'info' });
                 return;
               }
-              const importMessage = preview.message.replace('即将保存「全部分区」以下变更：', '即将导入以下全局设置变更：');
+              const importMessage = preview.message.replace('即将保存「全部分区」以下变更：', '即将导入以下全局设置变更：') + '\\n\\n说明：导入会整体替换当前全局设置，未包含的字段会回退为默认值。';
               if (!await this.askConfirm(importMessage, { title: '导入全局设置', tone: 'warning', confirmText: '导入' })) return;
               const res = await this.apiCall('importSettings', { config: sanitizedConfig, meta: { source: 'settings_file' } });
               await this.finalizePersistedSettings(res.config || sanitizedConfig, {
@@ -8656,7 +10342,7 @@ const UI_HTML = `<!DOCTYPE html>
               else this.showMessage('完整数据导入失败: ' + (err?.message || '未知错误'), { tone: 'error', modal: true });
           }
       }
-    };
+    });
 
     const ADMIN_UI_BOOTSTRAP = globalThis.__ADMIN_BOOTSTRAP__ && typeof globalThis.__ADMIN_BOOTSTRAP__ === 'object'
       ? globalThis.__ADMIN_BOOTSTRAP__
@@ -8997,6 +10683,18 @@ const UI_HTML = `<!DOCTYPE html>
         if (!window?.location) return;
         window.location.hash = String(hash || '').trim() || '#dashboard';
       },
+      replaceHash(hash) {
+        if (!window?.location) return;
+        const nextHash = String(hash || '').trim() || '#dashboard';
+        try {
+          const basePath = String(window.location.pathname || '') + String(window.location.search || '');
+          if (typeof window.history?.replaceState === 'function') {
+            window.history.replaceState(window.history.state, '', basePath + nextHash);
+            return;
+          }
+        } catch {}
+        window.location.hash = nextHash;
+      },
       bindHashChange(handler) {
         if (typeof window?.addEventListener !== 'function' || typeof handler !== 'function') {
           return () => {};
@@ -9299,6 +10997,18 @@ const UI_HTML = `<!DOCTYPE html>
         lineCount() {
           return this.app.getNodeLines(this.hydratedNode).length;
         },
+        syncState() {
+          return this.app.normalizeNodeKey(this.hydratedNode._syncState || '');
+        },
+        isSyncing() {
+          return this.syncState === 'syncing';
+        },
+        syncError() {
+          return String(this.hydratedNode._syncError || '').trim();
+        },
+        hasSyncFailure() {
+          return this.syncState === 'failed' && !!this.syncError;
+        },
         remarkValue() {
           return String(this.hydratedNode.remark || '').trim();
         },
@@ -9364,7 +11074,11 @@ const UI_HTML = `<!DOCTYPE html>
         const handleHashChange = () => {
           const nextHash = uiBrowserBridge.readHash(appState.currentHash || '#dashboard');
           if (String(nextHash || '') === String(appState.currentHash || '')) return;
-          appState.route(nextHash);
+          Promise.resolve(appState.handleExternalHashNavigation(nextHash)).catch(err => {
+            console.error('hash route change failed', err);
+            uiBrowserBridge.replaceHash(appState.currentHash || '#dashboard');
+            appState.showMessage('页面切换失败: ' + (err?.message || '未知错误'), { tone: 'error' });
+          });
         };
         const handleDesktopViewportChange = (event) => {
           appState.syncViewportState(appState.getCurrentRouteHash(), event?.matches === true);
@@ -9449,7 +11163,7 @@ function renderAdminPage(env, initHealth = buildInitHealth(env)) {
     initHealth
   };
   const html = UI_HTML
-    .replace("__ADMIN_BOOTSTRAP__", () => serializeInlineJson(bootstrap))
+    .replace("__ADMIN_BOOTSTRAP_JSON__", () => serializeInlineJson(bootstrap))
     .replace('<div id="app" v-cloak></div>', () => `${buildInitHealthBannerHtml(initHealth)}\n  <div id="app" v-cloak></div>`);
   const headers = new Headers({ 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store, max-age=0' });
   applySecurityHeaders(headers);
@@ -9469,7 +11183,7 @@ function renderLandingPage(env, initHealth = buildInitHealth(env)) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Emby Proxy V18.5</title>
+  <title>Emby Proxy V18.6</title>
   <script src="https://cdn.tailwindcss.com/3.4.17"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen">
@@ -9479,7 +11193,7 @@ function renderLandingPage(env, initHealth = buildInitHealth(env)) {
         <div class="p-8 md:p-10 text-left">
           ${initBanner}
           <div class="inline-flex items-center rounded-full border border-brand-500/30 bg-brand-500/10 px-3 py-1 text-xs font-semibold tracking-[0.16em] uppercase text-brand-300">Headless Edge Relay</div>
-          <h1 class="mt-5 text-3xl md:text-4xl font-bold text-white leading-tight">Emby Proxy V18.5</h1>
+          <h1 class="mt-5 text-3xl md:text-4xl font-bold text-white leading-tight">Emby Proxy V18.6</h1>
           <p class="mt-4 text-sm md:text-base leading-7 text-slate-300">为了极致优化视频代理的性能，当前根路径默认只保留一个无头（Headless）数据中继站；真正的管理界面、节点控制和 DNS 运维都收敛到单独的管理台入口。</p>
           <p class="mt-3 text-sm md:text-base leading-7 text-slate-400">如果你现在需要配置节点、查看运行状态或调整 Cloudflare 相关参数，请直接访问 <span class="font-semibold text-white">${escapeHtml(adminPath)}</span>。</p>
           <div class="mt-8 flex flex-col sm:flex-row gap-3">
@@ -9508,92 +11222,152 @@ function renderLandingPage(env, initHealth = buildInitHealth(env)) {
   return new Response(html, { headers });
 }
 
+function buildEdgeCorsResponse(dynamicCors, body, status = 200, options = {}) {
+  const headers = new Headers(dynamicCors);
+  applySecurityHeaders(headers);
+  if (options.mergeOriginVary === true && headers.get("Access-Control-Allow-Origin") !== "*") {
+    mergeVaryHeader(headers, "Origin");
+  }
+  return new Response(body, { status, headers });
+}
+
+function isLegacyAdminLoginRoute(routeContext) {
+  return routeContext.adminPathLower === "/admin"
+    && routeContext.pathnameLower === "/api/auth/login"
+    && routeContext.root === "api"
+    && routeContext.segments[1] === "auth"
+    && routeContext.segments[2] === "login";
+}
+
+function isAdminPreflightRoute(routeContext) {
+  return pathnameMatchesPrefix(routeContext.pathnameLower, routeContext.adminPathLower)
+    || routeContext.pathnameLower === routeContext.adminLoginPathLower
+    || isLegacyAdminLoginRoute(routeContext);
+}
+
+function buildFetchRouteContext(request, env) {
+  const initHealth = warnInitHealthOnce(env);
+  const dynamicCors = getCorsHeadersForResponse(env, request);
+  const requestUrl = new URL(request.url);
+  const normalizedPathname = sanitizeProxyPath(requestUrl.pathname);
+  const pathnameLower = normalizedPathname.toLowerCase();
+  const adminPath = getAdminPath(env);
+  const adminPathLower = adminPath.toLowerCase();
+  const adminLoginPath = getAdminLoginPath(env);
+  const adminLoginPathLower = adminLoginPath.toLowerCase();
+  let segments;
+  try {
+    segments = normalizedPathname.split("/").filter(Boolean);
+  } catch {
+    return {
+      errorResponse: buildEdgeCorsResponse(dynamicCors, "Bad Request", 400)
+    };
+  }
+  const rootRaw = segments[0] || "";
+  const root = safeDecodeSegment(rootRaw).toLowerCase();
+  return {
+    initHealth,
+    dynamicCors,
+    requestUrl,
+    normalizedPathname,
+    pathnameLower,
+    adminPath,
+    adminPathLower,
+    adminLoginPath,
+    adminLoginPathLower,
+    segments,
+    rootRaw,
+    root
+  };
+}
+
+async function resolveProxyRouteContext(routeContext, env, ctx, request) {
+  if (!routeContext.root) return null;
+  const nodeData = await Database.getNode(routeContext.root, env, ctx);
+  if (!nodeData) return null;
+
+  const secret = nodeData.secret;
+  let valid = true;
+  let prefixLen = 0;
+
+  if (secret) {
+    const secretRaw = routeContext.segments[1] || "";
+    if (safeDecodeSegment(secretRaw) === secret) {
+      prefixLen = 1 + routeContext.rootRaw.length + 1 + secretRaw.length;
+    } else {
+      valid = false;
+    }
+  } else {
+    prefixLen = 1 + routeContext.rootRaw.length;
+  }
+
+  if (!valid) return null;
+
+  let remaining = routeContext.normalizedPathname.substring(prefixLen);
+  if (remaining === "" && !routeContext.normalizedPathname.endsWith("/")) {
+    const redirectUrl = new URL(request.url);
+    redirectUrl.pathname = routeContext.normalizedPathname + "/";
+    const headers = new Headers({ Location: redirectUrl.toString(), "Cache-Control": "no-store" });
+    applySecurityHeaders(headers);
+    const redirectStatus = (request.method === "GET" || request.method === "HEAD") ? 301 : 307;
+    return {
+      response: new Response(null, { status: redirectStatus, headers })
+    };
+  }
+  if (remaining === "") remaining = "/";
+  return {
+    nodeData,
+    secret,
+    remaining: sanitizeProxyPath(remaining)
+  };
+}
+
+async function handleWorkerFetch(request, env, ctx) {
+  const routeContext = buildFetchRouteContext(request, env);
+  if (routeContext.errorResponse) return routeContext.errorResponse;
+
+  if (request.method === "GET" && routeContext.normalizedPathname === "/") {
+    return renderLandingPage(env, routeContext.initHealth);
+  }
+
+  if (request.method === "GET" && routeContext.pathnameLower === routeContext.adminPathLower) {
+    return renderAdminPage(env, routeContext.initHealth);
+  }
+
+  if (request.method === "OPTIONS" && isAdminPreflightRoute(routeContext)) {
+    return buildEdgeCorsResponse(routeContext.dynamicCors, null, 200, { mergeOriginVary: true });
+  }
+
+  if (request.method === "POST" && (
+    routeContext.pathnameLower === routeContext.adminLoginPathLower
+    || isLegacyAdminLoginRoute(routeContext)
+  )) {
+    return Auth.handleLogin(request, env);
+  }
+
+  if (request.method === "POST" && routeContext.pathnameLower === routeContext.adminPathLower) {
+    if (!(await Auth.verifyRequest(request, env))) return jsonError("UNAUTHORIZED", "未授权", 401);
+    try {
+      return await normalizeJsonApiResponse(await Database.handleApi(request, env, ctx));
+    } catch (e) {
+      return jsonError("INTERNAL_ERROR", "Server Error", 500, { reason: e?.message || "unknown_error" });
+    }
+  }
+
+  const proxyRoute = await resolveProxyRouteContext(routeContext, env, ctx, request);
+  if (proxyRoute?.response) return proxyRoute.response;
+  if (proxyRoute?.nodeData) {
+    return Proxy.handle(request, proxyRoute.nodeData, proxyRoute.remaining, routeContext.root, proxyRoute.secret, env, ctx, {
+      requestUrl: routeContext.requestUrl
+    });
+  }
+
+  return buildEdgeCorsResponse(routeContext.dynamicCors, "Not Found", 404, { mergeOriginVary: true });
+}
+
 export default {
   async fetch(request, env, ctx) {
-    const initHealth = warnInitHealthOnce(env);
-    const dynamicCors = getCorsHeadersForResponse(env, request);
-    const requestUrl = new URL(request.url);
-    const normalizedPathname = sanitizeProxyPath(requestUrl.pathname);
-    const pathnameLower = normalizedPathname.toLowerCase();
-    const adminPath = getAdminPath(env);
-    const adminPathLower = adminPath.toLowerCase();
-    const adminLoginPath = getAdminLoginPath(env);
-    const adminLoginPathLower = adminLoginPath.toLowerCase();
-    let segments;
-    try { segments = normalizedPathname.split('/').filter(Boolean); }
-    catch {
-      const headers = new Headers(dynamicCors);
-      applySecurityHeaders(headers);
-      return new Response('Bad Request', { status: 400, headers });
-    }
-
-    const rootRaw = segments[0] || '';
-    const root = safeDecodeSegment(rootRaw).toLowerCase();
-
-    if (request.method === 'GET' && normalizedPathname === '/') return renderLandingPage(env, initHealth);
-
-    if (request.method === 'GET' && pathnameLower === adminPathLower) return renderAdminPage(env, initHealth);
-
-    if (request.method === 'OPTIONS' && (
-      pathnameMatchesPrefix(pathnameLower, adminPathLower)
-      || pathnameLower === adminLoginPathLower
-      || (adminPathLower === '/admin' && pathnameLower === '/api/auth/login')
-    )) {
-      const headers = new Headers(dynamicCors);
-      applySecurityHeaders(headers);
-      if (headers.get('Access-Control-Allow-Origin') !== '*') mergeVaryHeader(headers, 'Origin');
-      return new Response(null, { headers });
-    }
-
-    if (request.method === 'POST' && (pathnameLower === adminLoginPathLower || (adminPathLower === '/admin' && root === 'api' && segments[1] === 'auth' && segments[2] === 'login'))) {
-      return Auth.handleLogin(request, env);
-    }
-
-    if (request.method === 'POST' && pathnameLower === adminPathLower) {
-      if (!(await Auth.verifyRequest(request, env))) return jsonError('UNAUTHORIZED', '未授权', 401);
-      try {
-        return await normalizeJsonApiResponse(await Database.handleApi(request, env, ctx));
-      } catch (e) {
-        return jsonError('INTERNAL_ERROR', 'Server Error', 500, { reason: e?.message || 'unknown_error' });
-      }
-    }
-
-    if (root) {
-      const nodeData = await Database.getNode(root, env, ctx);
-      if (nodeData) {
-        const secret = nodeData.secret;
-        let valid = true;
-        let prefixLen = 0;
-
-        if (secret) {
-          const secretRaw = segments[1] || '';
-          if (safeDecodeSegment(secretRaw) === secret) prefixLen = 1 + rootRaw.length + 1 + secretRaw.length;
-          else valid = false;
-        } else {
-          prefixLen = 1 + rootRaw.length;
-        }
-
-        if (valid) {
-          let remaining = normalizedPathname.substring(prefixLen);
-          if (remaining === '' && !normalizedPathname.endsWith('/')) {
-            const redirectUrl = new URL(request.url);
-            redirectUrl.pathname = normalizedPathname + '/';
-            const headers = new Headers({ 'Location': redirectUrl.toString(), 'Cache-Control': 'no-store' });
-            applySecurityHeaders(headers);
-            const redirectStatus = (request.method === 'GET' || request.method === 'HEAD') ? 301 : 307;
-            return new Response(null, { status: redirectStatus, headers });
-          }
-          if (remaining === '') remaining = '/';
-          remaining = sanitizeProxyPath(remaining);
-          return Proxy.handle(request, nodeData, remaining, root, secret, env, ctx, { requestUrl, corsHeaders: dynamicCors });
-        }
-      }
-    }
-
-    const headers = new Headers(dynamicCors);
-    applySecurityHeaders(headers);
-    if (headers.get('Access-Control-Allow-Origin') !== '*') mergeVaryHeader(headers, 'Origin');
-    return new Response('Not Found', { status: 404, headers });
+    return handleWorkerFetch(request, env, ctx);
   },
 
   async scheduled(event, env, ctx) {
@@ -9692,41 +11466,90 @@ export default {
         const config = runtimeConfig || {};
         const previousScheduledStatus = await Database.getOpsStatusSection(env, "scheduled").catch(() => ({}));
         
-        if (db) {
-          try {
-            await ensureLeaseActive();
-            const rawRetentionDays = Number(config.logRetentionDays);
+	        if (db) {
+	          try {
+	            await ensureLeaseActive();
+	            await Database.ensureLogsBaseSchema(db);
+	            const rawRetentionDays = Number(config.logRetentionDays);
             const retentionDays = Number.isFinite(rawRetentionDays)
               ? Math.min(Config.Defaults.LogRetentionDaysMax, Math.max(1, Math.floor(rawRetentionDays)))
               : Config.Defaults.LogRetentionDays;
             const expireTime = Date.now() - (retentionDays * 24 * 60 * 60 * 1000);
-            await db.prepare("DELETE FROM proxy_logs WHERE timestamp < ?").bind(expireTime).run();
+            const hasExpiredLogs = !!(await db.prepare(`SELECT 1 as hit FROM ${Database.LOGS_TABLE} WHERE timestamp < ? LIMIT 1`).bind(expireTime).first())?.hit;
+            if (hasExpiredLogs) {
+              await db.prepare(`DELETE FROM ${Database.LOGS_TABLE} WHERE timestamp < ?`).bind(expireTime).run();
+            }
             const previousCleanupStatus = previousScheduledStatus?.cleanup && typeof previousScheduledStatus.cleanup === "object"
               ? previousScheduledStatus.cleanup
               : {};
-            let vacuumStatus = "skipped";
-            let vacuumError = null;
-            let lastVacuumAt = typeof previousCleanupStatus.lastVacuumAt === "string" ? previousCleanupStatus.lastVacuumAt : "";
-            if (Database.shouldRunLogsVacuum(lastVacuumAt)) {
-              await ensureLeaseActive();
-              try {
-                await Database.vacuumLogsDb(db);
-                vacuumStatus = "success";
-                lastVacuumAt = new Date().toISOString();
-              } catch (vacuumErr) {
-                vacuumStatus = "failed";
-                vacuumError = vacuumErr?.message || String(vacuumErr);
-                scheduledState.status = "partial_failure";
-                console.error("Scheduled DB VACUUM Error: ", vacuumErr);
+            let ftsRebuildStatus = "skipped";
+            let ftsRebuildError = null;
+            let lastFtsRebuildAt = typeof previousCleanupStatus.lastFtsRebuildAt === "string" ? previousCleanupStatus.lastFtsRebuildAt : "";
+            let ftsRebuildRecovered = false;
+            if (hasExpiredLogs && await Database.hasLogsFtsTable(db)) {
+              if (Database.shouldRunLogsFtsRebuild(lastFtsRebuildAt)) {
+                await ensureLeaseActive();
+                try {
+                  await Database.rebuildLogsFts(db);
+                  ftsRebuildStatus = "success";
+                  lastFtsRebuildAt = new Date().toISOString();
+                } catch (ftsRebuildErr) {
+                  try {
+                    await ensureLeaseActive();
+                    await Database.ensureLogsFtsSchema(db, { forceRecreate: true });
+                    ftsRebuildStatus = "success";
+                    ftsRebuildRecovered = true;
+                    ftsRebuildError = null;
+                    lastFtsRebuildAt = new Date().toISOString();
+                    console.warn("Scheduled FTS rebuild recovered by recreating schema.");
+                  } catch (ftsRepairErr) {
+                    ftsRebuildStatus = "failed";
+                    ftsRebuildError = ftsRepairErr?.message || ftsRebuildErr?.message || String(ftsRepairErr || ftsRebuildErr);
+                    scheduledState.status = "partial_failure";
+                    console.error("Scheduled FTS rebuild Error: ", ftsRebuildErr);
+                    console.error("Scheduled FTS recovery Error: ", ftsRepairErr);
+                  }
+                }
+              } else {
+                ftsRebuildStatus = "deferred";
               }
             }
+            let optimizeStatus = "skipped";
+            let optimizeError = null;
+            const previousLastOptimizeAt = typeof previousCleanupStatus.lastOptimizeAt === "string" ? previousCleanupStatus.lastOptimizeAt : "";
+            let lastOptimizeAt = previousLastOptimizeAt || (typeof previousCleanupStatus.lastVacuumAt === "string" ? previousCleanupStatus.lastVacuumAt : "");
+            if (hasExpiredLogs && Database.shouldRunLogsOptimize(lastOptimizeAt)) {
+              await ensureLeaseActive();
+              try {
+                await Database.optimizeLogsDb(db);
+                optimizeStatus = "success";
+                lastOptimizeAt = new Date().toISOString();
+              } catch (optimizeErr) {
+                optimizeStatus = "failed";
+                optimizeError = optimizeErr?.message || String(optimizeErr);
+                scheduledState.status = "partial_failure";
+                console.error("Scheduled DB optimize Error: ", optimizeErr);
+              }
+            }
+            const cleanupError = optimizeError || ftsRebuildError || "";
+            const cleanupHadFailure = optimizeStatus === "failed" || ftsRebuildStatus === "failed";
+            const didCleanupWork = hasExpiredLogs || optimizeStatus === "success" || ftsRebuildStatus === "success";
+            const cleanupStatus = cleanupHadFailure ? "partial_failure" : (didCleanupWork ? "success" : "skipped");
+            const cleanupFinishedAt = new Date().toISOString();
             scheduledState.cleanup = {
-              status: vacuumStatus === "failed" ? "partial_failure" : "success",
-              lastSuccessAt: new Date().toISOString(),
+              status: cleanupStatus,
+              lastSuccessAt: didCleanupWork ? cleanupFinishedAt : "",
+              lastSkippedAt: cleanupStatus === "skipped" ? cleanupFinishedAt : "",
+              lastErrorAt: cleanupHadFailure ? cleanupFinishedAt : "",
+              lastError: cleanupHadFailure ? cleanupError : "",
               retentionDays,
-              vacuumStatus,
-              lastVacuumAt,
-              vacuumError
+              ftsRebuildStatus,
+              ftsRebuildRecovered,
+              lastFtsRebuildAt,
+              ftsRebuildError,
+              optimizeStatus,
+              lastOptimizeAt,
+              optimizeError
             };
             await ensureLeaseActive();
           } catch (dbErr) {
