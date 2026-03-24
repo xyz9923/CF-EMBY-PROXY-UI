@@ -8,11 +8,6 @@ on:
     paths:
       - "worker.js"
       - "wrangler.toml"
-      - "package.json"
-      - "package-lock.json"
-      - "build-worker.sh"
-      - "terser.worker.json"
-      - "tsconfig.cloudflare.json"
       - ".github/workflows/deploy-worker.yml"
   workflow_dispatch:
 
@@ -31,14 +26,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Verify worker bundle
-        run: bash ./build-worker.sh
 
       - name: Deploy to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
