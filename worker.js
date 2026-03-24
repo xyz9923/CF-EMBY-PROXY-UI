@@ -1,4 +1,4 @@
-// EMBY-PROXY-UI V18.6 (SaaS UI Optimized - Ultimate Fix + Emby Auth Patch)
+// EMBY-PROXY-UI V18.7 (SaaS UI Optimized - Ultimate Fix + Media Auth Compatibility)
 
 /**
  * @typedef {{
@@ -123,8 +123,8 @@ const Config = {
     CleanupBudgetMs: 1,             
     CleanupChunkSize: 64,           
     CleanupMinIntervalMs: 1000,
-    AssetHash: "v18.6",           
-    Version: "18.6"                 
+    AssetHash: "v18.7",           
+    Version: "18.7"                 
   }
 };
 
@@ -185,7 +185,7 @@ const GLOBALS = {
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Emby-Authorization, X-Emby-Token, X-Emby-Client, X-Emby-Device-Id, X-Emby-Device-Name, X-Emby-Client-Version"
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Emby-Authorization, X-Emby-Token, X-Emby-Client, X-Emby-Device-Id, X-Emby-Device-Name, X-Emby-Client-Version, X-MediaBrowser-Authorization, X-MediaBrowser-Token, X-MediaBrowser-Client, X-MediaBrowser-Device-Id, X-MediaBrowser-Device-Name, X-MediaBrowser-Client-Version"
 };
 
 function mergeVaryHeader(headers, value) {
@@ -226,7 +226,7 @@ function getCorsHeadersForResponse(env, request, originOverride = null) {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": corsHeaders["Access-Control-Allow-Methods"],
     "Access-Control-Allow-Headers": reqHeaders,
-    "Access-Control-Expose-Headers": "Content-Length, Content-Range, X-Emby-Auth-Token",
+    "Access-Control-Expose-Headers": "Content-Length, Content-Range, X-Emby-Auth-Token, X-MediaBrowser-Auth-Token",
     "Access-Control-Max-Age": "86400"
   };
 }
@@ -351,6 +351,30 @@ function normalizeTargetBasePath(pathname = "/") {
   const safePath = sanitizeProxyPath(pathname || "/");
   if (safePath === "/") return "";
   return safePath.replace(/\/+$/, "");
+}
+
+function normalizeNodeMediaAuthMode(value = "") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "emby") return "emby";
+  if (normalized === "jellyfin") return "jellyfin";
+  if (normalized === "passthrough") return "passthrough";
+  return "auto";
+}
+
+function normalizeNodeRealClientIpMode(value = "") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "forward") return "forward";
+  if (normalized === "strip") return "strip";
+  if (normalized === "disable" || normalized === "none") return "disable";
+  return "forward";
+}
+
+function getRealClientIpHeaderMode(node) {
+  const nodeMode = normalizeNodeRealClientIpMode(node?.realClientIpMode);
+  if (nodeMode === "forward") return "full";
+  if (nodeMode === "strip") return "real-ip-only";
+  if (nodeMode === "disable") return "none";
+  return "full";
 }
 
 // 保留节点 target 自带的子路径，避免 /node/foo 被错误拼到源站根目录。
@@ -498,11 +522,17 @@ const WORKER_CACHE_DROP_QUERY_PARAMS = new Set([
   "authorization",
   "xembytoken",
   "xembyauthorization",
+  "xmediabrowsertoken",
+  "xmediabrowserauthorization",
   "deviceid",
   "xembydeviceid",
   "xembydevicename",
   "xembyclient",
   "xembyclientversion",
+  "xmediabrowserdeviceid",
+  "xmediabrowserdevicename",
+  "xmediabrowserclient",
+  "xmediabrowserclientversion",
   "client",
   "clientid",
   "devicename",
@@ -2787,6 +2817,12 @@ const Database = {
     if (n.tagColor === undefined) { n.tagColor = ""; changed = true; }
     if (n.remarkColor === undefined) { n.remarkColor = ""; changed = true; }
     if (n.displayName === undefined) { n.displayName = ""; changed = true; }
+    const normalizedMediaAuthMode = normalizeNodeMediaAuthMode(n.mediaAuthMode);
+    if (String(n.mediaAuthMode || "") !== normalizedMediaAuthMode) changed = true;
+    n.mediaAuthMode = normalizedMediaAuthMode;
+    const normalizedRealClientIpMode = normalizeNodeRealClientIpMode(n.realClientIpMode);
+    if (String(n.realClientIpMode || "") !== normalizedRealClientIpMode) changed = true;
+    n.realClientIpMode = normalizedRealClientIpMode;
     const normalizedHeaders = this.sanitizeHeaders(n.headers);
     if (JSON.stringify(normalizedHeaders) !== JSON.stringify(n.headers || {})) changed = true;
     n.headers = normalizedHeaders;
@@ -2823,6 +2859,8 @@ const Database = {
       tagColor: rawNode?.tagColor !== undefined ? String(rawNode.tagColor || "").trim() : (existingNode.tagColor || ""),
       remarkColor: rawNode?.remarkColor !== undefined ? String(rawNode.remarkColor || "").trim() : (existingNode.remarkColor || ""),
       displayName: rawNode?.displayName !== undefined ? String(rawNode.displayName || "").trim() : (existingNode.displayName || ""),
+      mediaAuthMode: rawNode?.mediaAuthMode !== undefined ? normalizeNodeMediaAuthMode(rawNode.mediaAuthMode) : normalizeNodeMediaAuthMode(existingNode.mediaAuthMode),
+      realClientIpMode: rawNode?.realClientIpMode !== undefined ? normalizeNodeRealClientIpMode(rawNode.realClientIpMode) : normalizeNodeRealClientIpMode(existingNode.realClientIpMode),
       headers: this.sanitizeHeaders(parsedHeaders),
       schemaVersion: 3,
       createdAt: existingNode.createdAt || new Date().toISOString(),
@@ -3869,32 +3907,62 @@ const Database = {
 // ============================================================================
 // 3. 代理模块 (PROXY MODULE - 核心缓冲防护与 CORS 重构)
 // ============================================================================
-function normalizeEmbyAuthHeaders(headers, method = "GET", path = "") {
-  // 1. 安全提取并清洗现有 Header
-  const embyAuth = headers.get("X-Emby-Authorization")?.trim();
-  const stdAuth = headers.get("Authorization")?.trim();
-  const isEmbyStd = stdAuth?.toLowerCase().startsWith("emby ");
+function getMediaAuthorizationScheme(value = "") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized.startsWith("emby ")) return "emby";
+  if (normalized.startsWith("mediabrowser ")) return "mediabrowser";
+  return "";
+}
 
-  // 2. 确立单一真相源 (Source of Truth)
-  // 优先级: X-Emby-Auth > 符合规范的 Std Auth > null
-  let finalAuth = embyAuth || (isEmbyStd ? stdAuth : null);
+function rewriteMediaAuthorizationScheme(value = "", scheme = "") {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const suffix = text.replace(/^[^\s]+\s+/i, "").trim();
+  if (!suffix) return text;
+  if (scheme === "emby") return `Emby ${suffix}`;
+  if (scheme === "mediabrowser") return `MediaBrowser ${suffix}`;
+  return text;
+}
 
-  // 3. 登录 API 强制补头兜底
-  if (!finalAuth && method.toUpperCase() === "POST" && path.toLowerCase().includes("/users/authenticatebyname")) {
-      finalAuth = 'Emby Client="Emby Proxy Patch", Device="Browser", DeviceId="proxy-login-patch", Version="1.0.0"';
+function normalizeMediaAuthHeaders(headers, nodeMediaAuthMode = "auto") {
+  const mediaAuthMode = normalizeNodeMediaAuthMode(nodeMediaAuthMode);
+  if (mediaAuthMode === "passthrough") return headers;
+
+  // 优先以标准 Authorization 为真相源；兼容头仅在需要时做同族同步。
+  const standardAuthorization = headers.get("Authorization")?.trim() || "";
+  const legacyEmbyAuthorization = headers.get("X-Emby-Authorization")?.trim() || "";
+  const mediaBrowserAuthorization = headers.get("X-MediaBrowser-Authorization")?.trim() || "";
+  const standardScheme = getMediaAuthorizationScheme(standardAuthorization);
+  const mediaBrowserScheme = getMediaAuthorizationScheme(mediaBrowserAuthorization);
+  const legacyEmbyScheme = getMediaAuthorizationScheme(legacyEmbyAuthorization);
+
+  let canonicalAuthorization = standardScheme
+    ? standardAuthorization
+    : (mediaBrowserScheme
+      ? mediaBrowserAuthorization
+      : (legacyEmbyScheme ? legacyEmbyAuthorization : ""));
+
+  if (!canonicalAuthorization) return headers;
+
+  const targetScheme = mediaAuthMode === "emby"
+    ? "emby"
+    : mediaAuthMode === "jellyfin"
+      ? "mediabrowser"
+      : (standardScheme || mediaBrowserScheme || legacyEmbyScheme || "");
+
+  canonicalAuthorization = rewriteMediaAuthorizationScheme(canonicalAuthorization, targetScheme);
+  headers.set("Authorization", canonicalAuthorization);
+
+  if (targetScheme === "mediabrowser") {
+    headers.set("X-MediaBrowser-Authorization", canonicalAuthorization);
+    headers.delete("X-Emby-Authorization");
+    return headers;
   }
 
-  // 4. 双向同步 (解决冲突与缺失)
-  if (finalAuth) {
-      headers.set("X-Emby-Authorization", finalAuth);
-      
-      // 仅在 Authorization 为空，或确认其也是 Emby 格式时才覆盖
-      // 绝对不覆盖正常的 Bearer/Basic 认证头
-      if (!stdAuth || isEmbyStd) {
-          headers.set("Authorization", finalAuth);
-      }
+  if (targetScheme === "emby") {
+    headers.set("X-Emby-Authorization", canonicalAuthorization);
+    headers.delete("X-MediaBrowser-Authorization");
   }
-  
   return headers;
 }
 const Proxy = {
@@ -4021,10 +4089,15 @@ const Proxy = {
     if (mergedCookie) newHeaders.set("Cookie", mergedCookie);
     else newHeaders.delete("Cookie");
 
-    normalizeEmbyAuthHeaders(newHeaders, request.method, proxyPath);
+    normalizeMediaAuthHeaders(newHeaders, node.mediaAuthMode);
 
-    newHeaders.set("X-Real-IP", clientIp);
-    newHeaders.set("X-Forwarded-For", clientIp);
+    const realClientIpHeaderMode = getRealClientIpHeaderMode(node);
+    if (realClientIpHeaderMode === "full" || realClientIpHeaderMode === "real-ip-only") {
+      newHeaders.set("X-Real-IP", clientIp);
+    }
+    if (realClientIpHeaderMode === "full") {
+      newHeaders.set("X-Forwarded-For", clientIp);
+    }
     newHeaders.set("X-Forwarded-Host", requestUrl.host);
     newHeaders.set("X-Forwarded-Proto", requestUrl.protocol.replace(":", ""));
     if (requestTraits.isWsUpgrade) {
@@ -4201,8 +4274,10 @@ const Proxy = {
     if (srv) hints.push(`Server: ${srv}`);
     const ray = response.headers.get("CF-Ray");
     if (ray) hints.push(`CF-Ray: ${ray}`);
-    const embyErr = response.headers.get("X-Application-Error-Code") || response.headers.get("X-Emby-Error");
-    if (embyErr) hints.push(`Emby-Error: ${embyErr}`);
+    const mediaServerError = response.headers.get("X-Application-Error-Code")
+      || response.headers.get("X-Emby-Error")
+      || response.headers.get("X-MediaBrowser-Error");
+    if (mediaServerError) hints.push(`Media-Server-Error: ${mediaServerError}`);
     const cfCache = response.headers.get("CF-Cache-Status");
     if (cfCache) hints.push(`CF-Cache: ${cfCache}`);
     return hints.length > 0 ? hints.join(" | ") : response.statusText;
@@ -5125,7 +5200,7 @@ const UI_HTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <title>Emby Proxy V18.6 - SaaS Dashboard</title>
+  <title>Emby Proxy V18.7 - SaaS Dashboard</title>
   <script>
     window.__ADMIN_BOOTSTRAP__ = __ADMIN_BOOTSTRAP_JSON__;
     window.__ADMIN_UI_BOOTED__ = false;
@@ -5538,7 +5613,7 @@ const UI_HTML = `<!DOCTYPE html>
       <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-500 to-indigo-600 flex items-center justify-center text-white font-bold text-lg flex-shrink-0">E</div>
       <h1 class="ml-3 font-semibold tracking-tight text-lg flex items-center gap-2">
         Emby Proxy 
-        <span class="px-1.5 py-0.5 rounded bg-brand-100 text-brand-600 dark:bg-brand-500/20 dark:text-brand-400 text-[10px] font-bold mt-0.5">V18.6</span>
+        <span class="px-1.5 py-0.5 rounded bg-brand-100 text-brand-600 dark:bg-brand-500/20 dark:text-brand-400 text-[10px] font-bold mt-0.5">V18.7</span>
       </h1>
     </div>
     <nav class="flex-1 overflow-y-auto py-4 px-3 space-y-1">
@@ -5980,9 +6055,6 @@ const UI_HTML = `<!DOCTYPE html>
                     </select>
                     <p class="text-xs text-slate-500 mb-3 ml-6">“索引”包含播放列表与字幕等轻量元数据，不包含任何视频分片或大文件 Range。</p>
                     <p id="cfg-prewarm-runtime-hint" class="text-xs text-cyan-700 dark:text-cyan-300 mb-3 ml-6">{{ App.proxySettingsGuardrails.prewarmHint }}</p>
-                    <div class="ml-6 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-900 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-100">
-                      <strong>⚠️ 架构师建议：</strong>请确保已在 Cloudflare Cache Rules 中开启“忽略查询字符串（Ignore query string）”，这样视频流缓存才能跨用户共享，真正发挥数据面的缓存能力。
-                    </div>
                   </div>
 
                   <div v-if="App.isSettingsExpertMode()" class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
@@ -6518,7 +6590,31 @@ const UI_HTML = `<!DOCTYPE html>
 		          <div><label class="block text-sm text-slate-500 mb-1">备注</label><input type="text" id="form-remark" v-model="App.nodeModalForm.remark" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white"></div>
 		        </div>
 	        
-	        <div><label class="block text-sm text-slate-500 mb-1">访问鉴权 (Secret, 可留空)</label><input type="text" id="form-secret" v-model="App.nodeModalForm.secret" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white"></div>
+	        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <label class="block text-sm text-slate-500 mb-1">访问鉴权 (Secret, 可留空)</label>
+              <input type="text" id="form-secret" v-model="App.nodeModalForm.secret" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
+            </div>
+            <div>
+              <label class="block text-sm text-slate-500 mb-1">媒体认证头模式</label>
+              <select id="form-media-auth-mode" v-model="App.nodeModalForm.mediaAuthMode" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
+                <option value="auto">自动识别 (推荐)</option>
+                <option value="emby">强制 Emby</option>
+                <option value="jellyfin">强制 Jellyfin</option>
+                <option value="passthrough">完全透传（保留原始认证头）</option>
+              </select>
+              <p class="mt-1 text-xs text-slate-400">用于兼容不同上游的登录与会话请求。自动模式会按请求里已有的媒体认证头家族做规范化；“完全透传”表示保留原始 <code>Authorization</code> / <code>X-Emby-Authorization</code> / <code>X-MediaBrowser-Authorization</code>，不做改写。</p>
+            </div>
+            <div>
+              <label class="block text-sm text-slate-500 mb-1">真实客户端 IP 透传</label>
+              <select id="form-real-client-ip-mode" v-model="App.nodeModalForm.realClientIpMode" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
+                <option value="forward">透传 X-Real-IP 和 X-Forwarded-For (推荐)</option>
+                <option value="strip">仅保留 X-Real-IP</option>
+                <option value="disable">强制不透传【慎用】</option>
+              </select>
+              <p class="mt-1 text-xs text-slate-400">真实客户端 IP 透传由 <code>X-Real-IP</code> 和 <code>X-Forwarded-For</code> 决定。你可以按节点选择透传这两个请求头、仅保留 <code>X-Real-IP</code>，或强制不透传 <code>X-Real-IP</code> 和 <code>X-Forwarded-For</code>。</p>
+            </div>
+          </div>
 	        
 	        <div class="rounded-2xl border p-4" :class="App.getNodeModalLinesPanelClass()">
 	          <div class="flex items-center justify-between gap-3 mb-3">
@@ -6660,6 +6756,11 @@ const UI_HTML = `<!DOCTYPE html>
       tgAlertFlushRetryThreshold: 0,
       tgAlertCooldownMinutes: 30,
       tgAlertOnScheduledFailure: false
+    };
+
+    const UI_STORAGE_KEYS = {
+      theme: 'theme',
+      settingsExperienceMode: 'settingsExperienceMode'
     };
 
     const DNS_RECOMMENDED_CNAME_OPTIONS = [
@@ -6910,6 +7011,37 @@ const UI_HTML = `<!DOCTYPE html>
       };
     }
 
+    function normalizeNodeMediaAuthMode(value = '') {
+      const normalized = String(value || '').trim().toLowerCase();
+      if (normalized === 'emby') return 'emby';
+      if (normalized === 'jellyfin') return 'jellyfin';
+      if (normalized === 'passthrough') return 'passthrough';
+      return 'auto';
+    }
+
+    function normalizeNodeRealClientIpMode(value = '') {
+      const normalized = String(value || '').trim().toLowerCase();
+      if (normalized === 'forward') return 'forward';
+      if (normalized === 'strip') return 'strip';
+      if (normalized === 'disable' || normalized === 'none') return 'disable';
+      return 'forward';
+    }
+
+    function normalizeNodeModalHeaderRows(rawHeaders) {
+      let entries = [];
+      if (Array.isArray(rawHeaders)) {
+        entries = rawHeaders
+          .map(row => [String(row?.key || '').trim(), String(row?.value || '')])
+          .filter(([key]) => key);
+      } else if (rawHeaders && typeof rawHeaders === 'object') {
+        entries = Object.entries(rawHeaders)
+          .map(([key, value]) => [String(key || '').trim(), String(value || '')])
+          .filter(([key]) => key);
+      }
+      const rows = entries.map(([key, value]) => createNodeModalHeaderRow(key, value));
+      return rows.length ? rows : [createNodeModalHeaderRow()];
+    }
+
     function createEmptyNodeModalForm() {
       return {
         originalName: '',
@@ -6919,6 +7051,8 @@ const UI_HTML = `<!DOCTYPE html>
         tagColor: 'amber',
         remark: '',
         secret: '',
+        mediaAuthMode: 'auto',
+        realClientIpMode: 'forward',
         activeLineId: '',
         headers: []
       };
@@ -7384,6 +7518,32 @@ const UI_HTML = `<!DOCTYPE html>
             : 'border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-950/50';
         },
 
+        syncNodeModalDialogVisibility(shouldOpen) {
+          if (typeof document?.getElementById !== 'function') return;
+          const dialog = document.getElementById('node-modal');
+          if (!dialog) return;
+          uiBrowserBridge.syncDialogVisibility(dialog, shouldOpen === true);
+        },
+
+        applyNodeModalState(nextForm) {
+          this.nodeModalForm = nextForm;
+          this.nodeModalLastDisplayName = String(nextForm.displayName || '');
+          this.nodeModalPathManual = !!String(nextForm.name || '') && String(nextForm.name || '') !== String(nextForm.displayName || '');
+          this.syncNodeModalLinesState(nextForm.activeLineId);
+          this.nodeModalOpen = true;
+          uiBrowserBridge.queueTask(() => this.syncNodeModalDialogVisibility(true));
+        },
+
+        reopenNodeModal(nextForm) {
+          const apply = () => this.applyNodeModalState(nextForm);
+          if (this.nodeModalOpen === true) {
+            this.nodeModalOpen = false;
+            uiBrowserBridge.queueTask(apply);
+            return;
+          }
+          apply();
+        },
+
         setNodeModalFeedback(message, tone = 'info') {
           const text = this.normalizeUiMessage(message);
           this.nodeModalFeedback = {
@@ -7493,7 +7653,15 @@ const UI_HTML = `<!DOCTYPE html>
 
         applyRuntimeConfig(cfg) {
           this.runtimeConfig = cfg && typeof cfg === 'object' ? { ...cfg } : {};
-          this.settingsExperienceMode = this.normalizeSettingsExperienceMode(this.runtimeConfig?.settingsExperienceMode);
+          const storedMode = uiBrowserBridge.readStoredSettingsExperienceMode();
+          const runtimeMode = this.normalizeSettingsExperienceMode(this.runtimeConfig?.settingsExperienceMode);
+          const nextMode = storedMode ? this.normalizeSettingsExperienceMode(storedMode) : runtimeMode;
+          this.settingsExperienceMode = nextMode;
+          this.settingsForm = {
+            ...this.settingsForm,
+            settingsExperienceMode: nextMode
+          };
+          uiBrowserBridge.persistSettingsExperienceMode(nextMode);
           this.applyUiRadius();
         },
 
@@ -8936,6 +9104,7 @@ const UI_HTML = `<!DOCTYPE html>
           ...this.settingsForm,
           settingsExperienceMode: nextMode
         };
+        uiBrowserBridge.persistSettingsExperienceMode(nextMode);
         if (!this.isSettingsTabVisible(this.activeSettingsTab)) this.activeSettingsTab = 'ui';
         if (nextMode !== 'expert') this.logsPlaybackModeFilter = '';
         this.settingsScrollResetKey += 1;
@@ -9034,7 +9203,10 @@ const UI_HTML = `<!DOCTYPE html>
           if (Array.isArray(nodesRes.nodes)) this.applyNodesState(nodesRes.nodes);
           this.applyConfigSnapshotsState(snapshotRes.snapshots || []);
 
-          this.applyConfigSectionToForm('ui', cfg);
+          this.applyConfigSectionToForm('ui', {
+              ...cfg,
+              settingsExperienceMode: this.settingsExperienceMode
+          });
           this.applyConfigSectionToForm('proxy', cfg);
           this.normalizeSettingsNumberInputs();
           this.syncProxySettingsGuardrails();
@@ -9277,48 +9449,53 @@ const UI_HTML = `<!DOCTYPE html>
       },
 
       showNodeModal(name='') {
-        this.nodeModalSubmitting = false;
-        this.nodeModalPingAllPending = false;
-        this.nodeModalPingAllText = '一键测试延迟';
-        this.clearNodeModalFeedback();
-        this.clearNodeModalValidation();
-        this.clearNodeLineDragState();
+        try {
+          this.nodeModalSubmitting = false;
+          this.nodeModalPingAllPending = false;
+          this.nodeModalPingAllText = '一键测试延迟';
+          this.clearNodeModalFeedback();
+          this.clearNodeModalValidation();
+          this.clearNodeLineDragState();
 
-        let nextForm = createEmptyNodeModalForm();
-        if (name) {
-            const foundNode = this.nodes.find(x => String(x.name) === String(name));
-            if (foundNode) {
-                const hydratedNode = this.hydrateNode(foundNode);
-                const displayName = String(foundNode.displayName || foundNode.name || '');
-                this.ensureNodeModalLines(hydratedNode.lines, hydratedNode.target);
-                nextForm = {
-                  originalName: String(foundNode.name || ''),
-                  displayName,
-                  name: String(foundNode.name || ''),
-                  tag: String(foundNode.tag || ''),
-                  tagColor: String(foundNode.tagColor || 'amber') || 'amber',
-                  remark: String(foundNode.remark || ''),
-                  secret: String(foundNode.secret || ''),
-                  activeLineId: hydratedNode.activeLineId || this.nodeModalLines[0]?.id || '',
-                  headers: foundNode.headers && typeof foundNode.headers === 'object'
-                    ? Object.entries(foundNode.headers).map(([headerKey, headerValue]) => createNodeModalHeaderRow(headerKey, String(headerValue || '')))
-                    : []
-                };
-            } else {
-                this.ensureNodeModalLines();
-                nextForm.activeLineId = this.nodeModalLines[0]?.id || '';
-            }
-        } else {
-            this.ensureNodeModalLines();
-            nextForm.activeLineId = this.nodeModalLines[0]?.id || '';
-            nextForm.headers = [createNodeModalHeaderRow()];
+          let nextForm = createEmptyNodeModalForm();
+          if (name) {
+              const normalizedName = this.normalizeNodeKey(name);
+              const foundNode = (Array.isArray(this.nodes) ? this.nodes : []).find(x => this.normalizeNodeKey(x?.name) === normalizedName);
+              if (foundNode) {
+                  const hydratedNode = this.hydrateNode(foundNode);
+                  const displayName = String(foundNode.displayName || foundNode.name || '');
+                  this.ensureNodeModalLines(hydratedNode.lines, hydratedNode.target);
+                  nextForm = {
+                    ...createEmptyNodeModalForm(),
+                    originalName: String(foundNode.name || ''),
+                    displayName,
+                    name: String(foundNode.name || ''),
+                    tag: String(foundNode.tag || ''),
+                    tagColor: String(foundNode.tagColor || 'amber') || 'amber',
+                    remark: String(foundNode.remark || ''),
+                    secret: String(foundNode.secret || ''),
+                    mediaAuthMode: normalizeNodeMediaAuthMode(foundNode.mediaAuthMode),
+                    realClientIpMode: normalizeNodeRealClientIpMode(foundNode.realClientIpMode),
+                    activeLineId: hydratedNode.activeLineId || this.nodeModalLines[0]?.id || '',
+                    headers: normalizeNodeModalHeaderRows(foundNode.headers)
+                  };
+              } else {
+                  this.ensureNodeModalLines();
+                  nextForm.activeLineId = this.nodeModalLines[0]?.id || '';
+                  nextForm.headers = [createNodeModalHeaderRow()];
+                  this.showMessage('未找到对应节点数据，已为你打开新建节点面板。', { tone: 'warning' });
+              }
+          } else {
+              this.ensureNodeModalLines();
+              nextForm.activeLineId = this.nodeModalLines[0]?.id || '';
+              nextForm.headers = [createNodeModalHeaderRow()];
+          }
+
+          this.reopenNodeModal(nextForm);
+        } catch (error) {
+          console.error('showNodeModal failed', error);
+          this.showMessage('打开节点编辑面板失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
         }
-
-        this.nodeModalForm = nextForm;
-        this.nodeModalLastDisplayName = String(nextForm.displayName || '');
-        this.nodeModalPathManual = !!String(nextForm.name || '') && String(nextForm.name || '') !== String(nextForm.displayName || '');
-        this.syncNodeModalLinesState(nextForm.activeLineId);
-        this.nodeModalOpen = true;
       },
 
       closeNodeModal() {
@@ -9379,12 +9556,14 @@ const UI_HTML = `<!DOCTYPE html>
           const nodePath = this.normalizeNodePathInput(String(this.nodeModalForm.name || '').trim() || displayName);
           const tagColor = String(this.nodeModalForm.tagColor || 'amber') || 'amber';
           
-          const payload = {
-              originalName: String(this.nodeModalForm.originalName || ''),
-              name: nodePath,
-              displayName,
-              secret: String(this.nodeModalForm.secret || '').trim(),
-              tag: String(this.nodeModalForm.tag || '').trim(),
+	          const payload = {
+	              originalName: String(this.nodeModalForm.originalName || ''),
+	              name: nodePath,
+	              displayName,
+	              secret: String(this.nodeModalForm.secret || '').trim(),
+	              mediaAuthMode: normalizeNodeMediaAuthMode(this.nodeModalForm.mediaAuthMode),
+	              realClientIpMode: normalizeNodeRealClientIpMode(this.nodeModalForm.realClientIpMode),
+	              tag: String(this.nodeModalForm.tag || '').trim(),
               tagColor,
               remark: String(this.nodeModalForm.remark || '').trim(),
               headers: headersObj
@@ -10629,7 +10808,14 @@ const UI_HTML = `<!DOCTYPE html>
       },
       readStoredTheme() {
         try {
-          return localStorage.getItem('theme');
+          return localStorage.getItem(UI_STORAGE_KEYS.theme);
+        } catch {
+          return '';
+        }
+      },
+      readStoredSettingsExperienceMode() {
+        try {
+          return localStorage.getItem(UI_STORAGE_KEYS.settingsExperienceMode);
         } catch {
           return '';
         }
@@ -10646,7 +10832,13 @@ const UI_HTML = `<!DOCTYPE html>
       },
       persistTheme(isDarkTheme) {
         try {
-          localStorage.setItem('theme', isDarkTheme ? 'dark' : 'light');
+          localStorage.setItem(UI_STORAGE_KEYS.theme, isDarkTheme ? 'dark' : 'light');
+        } catch {}
+      },
+      persistSettingsExperienceMode(mode) {
+        const normalizedMode = String(mode || '').trim().toLowerCase() === 'expert' ? 'expert' : 'novice';
+        try {
+          localStorage.setItem(UI_STORAGE_KEYS.settingsExperienceMode, normalizedMode);
         } catch {}
       },
       readLocationOrigin() {
@@ -11183,7 +11375,7 @@ function renderLandingPage(env, initHealth = buildInitHealth(env)) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Emby Proxy V18.6</title>
+  <title>Emby Proxy V18.7</title>
   <script src="https://cdn.tailwindcss.com/3.4.17"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen">
@@ -11193,11 +11385,11 @@ function renderLandingPage(env, initHealth = buildInitHealth(env)) {
         <div class="p-8 md:p-10 text-left">
           ${initBanner}
           <div class="inline-flex items-center rounded-full border border-brand-500/30 bg-brand-500/10 px-3 py-1 text-xs font-semibold tracking-[0.16em] uppercase text-brand-300">Headless Edge Relay</div>
-          <h1 class="mt-5 text-3xl md:text-4xl font-bold text-white leading-tight">Emby Proxy V18.6</h1>
+          <h1 class="mt-5 text-3xl md:text-4xl font-bold text-white leading-tight">Emby Proxy V18.7</h1>
           <p class="mt-4 text-sm md:text-base leading-7 text-slate-300">为了极致优化视频代理的性能，当前根路径默认只保留一个无头（Headless）数据中继站；真正的管理界面、节点控制和 DNS 运维都收敛到单独的管理台入口。</p>
           <p class="mt-3 text-sm md:text-base leading-7 text-slate-400">如果你现在需要配置节点、查看运行状态或调整 Cloudflare 相关参数，请直接访问 <span class="font-semibold text-white">${escapeHtml(adminPath)}</span>。</p>
           <div class="mt-8 flex flex-col sm:flex-row gap-3">
-            <a href="${escapeHtml(adminPath)}" class="inline-flex items-center justify-center rounded-2xl bg-brand-600 px-5 py-3 text-sm font-semibold text-white hover:bg-brand-700 transition">访问 ${escapeHtml(adminPath)}</a>
+            <a href="${escapeHtml(adminPath)}" class="inline-flex items-center justify-center rounded-2xl border border-brand-400/70 bg-brand-600 px-5 py-3 text-sm font-semibold text-white shadow-sm shadow-brand-950/20 transition hover:border-brand-300 hover:bg-brand-700">访问 ${escapeHtml(adminPath)}</a>
             <a href="https://github.com/axuitomo/CF-EMBY-PROXY-UI" target="_blank" rel="noopener noreferrer" class="inline-flex items-center justify-center rounded-2xl border border-slate-700 px-5 py-3 text-sm font-semibold text-slate-200 hover:bg-slate-800 transition">查看项目说明</a>
           </div>
         </div>
